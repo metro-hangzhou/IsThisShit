@@ -107,6 +107,28 @@ git pull origin runtime
 
 而 `NapCatQQ/` 应继续作为独立 checkout 单独维护。
 
+### NapCat 配置约定
+
+仓库会跟踪一组最小且通用的 NapCat 默认配置，用来保证新 clone 后的首次 `/login` 不会退化到只启用 builtin 插件的状态。
+
+当前会跟踪的通用配置包括：
+
+- `NapCat/napcat/config/plugins.json`
+- `NapCat/napcat/config/napcat.json`
+
+仍然保持本地生成、不会进 Git 的内容包括：
+
+- `NapCat/config.json`
+- `NapCat/napcat/config/webui.json`
+- `NapCat/napcat/config/onebot11_*.json`
+- `NapCat/napcat/config/napcat_protocol_*.json`
+- `NapCat/napcat/config/napcat_*.json`
+
+也就是说：
+
+- 通用插件启用状态由仓库提供
+- 账号级、机器级、WebUI 级配置继续由本地运行时生成
+
 ### 许可证边界说明
 
 当前仓库后续如果添加开源协议，协议仅覆盖我们自行开发和明确拥有分发权的部分。

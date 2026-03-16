@@ -69,6 +69,21 @@ python app.py --ui compat
 - `NapCatQQ/` 保持为独立 checkout，方便后续继续合并上游更新
 - 当 QQ 更新导致旧版 `NapCatQQ` 不兼容时，需要在 `NapCatQQ/` 那边单独同步上游并合并到我们的自定义分支
 
+## NapCat 配置说明
+
+仓库会自带最小通用 NapCat 配置，保证新 clone 后默认启用：
+
+- `napcat-plugin-builtin`
+- `napcat-plugin-qq-data-fast`
+
+但账号级和机器级配置仍然是本地生成的，不会跟随 Git 分支同步：
+
+- `NapCat/config.json`
+- `NapCat/napcat/config/webui.json`
+- `NapCat/napcat/config/onebot11_*.json`
+- `NapCat/napcat/config/napcat_protocol_*.json`
+- `NapCat/napcat/config/napcat_*.json`
+
 ## 基本流程
 
 1. `/login`
