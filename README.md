@@ -54,7 +54,21 @@ start_cli_compat.bat
 
 ### 更新方式
 
-如果你已经在本仓库工作目录中：
+首次拉取推荐直接指定 `runtime` 分支：
+
+```powershell
+git clone -b runtime https://github.com/SH7ship24in2022/IsThisShit.git
+```
+
+如果你已经 clone 过仓库，但当前不在 `runtime` 分支：
+
+```powershell
+git fetch origin
+git switch runtime
+git pull origin runtime
+```
+
+如果你已经在本仓库工作目录中，后续更新直接执行：
 
 ```powershell
 git pull origin runtime
@@ -76,6 +90,22 @@ git pull origin runtime
 - vendored `NapCat/` 运行面
 
 而 `NapCatQQ/` 应继续作为独立 checkout 单独维护。
+
+### 许可证边界说明
+
+当前仓库后续如果添加开源协议，协议仅覆盖我们自行开发和明确拥有分发权的部分。
+
+第三方内容继续遵循它们各自原始协议，包括但不限于：
+
+- `NapCatQQ/` 的上游协议
+- vendored `NapCat/` 中第三方组成部分的原始协议
+- `src/pypinyin/` 的原始协议
+
+也就是说：
+
+- 我们不会把第三方代码重新声明为只受我们的协议约束
+- 我们会为自研部分和第三方部分明确划分边界
+- 后续正式公开前，还需要补一份更明确的第三方许可说明清单
 
 ## English
 
@@ -127,6 +157,22 @@ See:
 
 ### Updating
 
+For a fresh clone, use the `runtime` branch directly:
+
+```powershell
+git clone -b runtime https://github.com/SH7ship24in2022/IsThisShit.git
+```
+
+If the repository already exists locally but is not on `runtime`:
+
+```powershell
+git fetch origin
+git switch runtime
+git pull origin runtime
+```
+
+For normal updates inside an existing `runtime` checkout:
+
 ```powershell
 git pull origin runtime
 ```
@@ -136,3 +182,19 @@ git pull origin runtime
 `NapCatQQ/` is intentionally not tracked by this repository.
 
 It must remain a separate upstream-trackable checkout so future upstream merges can still be applied when QQ updates require them.
+
+### License boundary
+
+If an open-source license is added later, it should only apply to the parts we authored and clearly control.
+
+Third-party content must continue to follow its original license terms, including but not limited to:
+
+- the upstream `NapCatQQ/` license
+- original licenses of third-party components inside vendored `NapCat/`
+- the original `pypinyin` license for `src/pypinyin/`
+
+So the correct approach is:
+
+- do not relabel third-party code as if it were covered only by our project license
+- define clear path-level boundaries for our code versus upstream/vendor code
+- add an explicit third-party notice file before any real public open-source release
