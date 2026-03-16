@@ -1,14 +1,17 @@
-# QQ Data Exporter Runtime Branch
+# QQ Data Exporter Main Branch
 
 ## 中文说明
 
-这个分支是面向运行、验证和更新的 `runtime` 分支。
+这个分支是面向运行、验证和更新的 `main` 分支。
 
-它保留了运行 QQ 聊天导出器所需的最小文件集合：
+它保留了运行 QQ 聊天导出器所需的最小文件集合，并额外内置了便携 Python 运行时与精简依赖载荷。
 
 - `app.py`
 - `src/`
 - `NapCat/`
+- `python_runtime/`
+- `runtime_site_packages/`
+- `requirements.txt`
 - 启动脚本
 - 运行说明文档
 
@@ -27,21 +30,28 @@
 - 日常运行导出器
 - 朋友或协作者在线更新
 - release / debug 运行验证
+- 在不额外联网安装 Python 包的前提下直接运行
 
 如果你需要开发、测试、文档、规划和完整工程上下文，请使用维护者本地保留的 `full-dev` 分支。
 
 ### 快速开始
 
-1. 准备 Python 3.13 x64
-2. 如需本地 `.venv`，可执行：
+1. 准备 Python 环境
+2. 保证 `NapCat/` 可正常启动
+3. 启动 CLI
+
+优先级说明：
+
+- 如果仓库内存在开发 `.venv`，启动脚本会优先使用它
+- 否则会自动回退到仓库内置的 `python_runtime/ + runtime_site_packages/`
+- 只有这两者都不存在时，才会尝试本机 `Python 3.13`
+
+如果你不想使用仓库内置运行时，也可以自己建本地虚拟环境：
 
 ```powershell
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
-
-3. 保证 `NapCat/` 可正常启动
-4. 启动 CLI
 
 推荐直接双击：
 
@@ -55,34 +65,44 @@ start_cli.bat
 start_cli_compat.bat
 ```
 
+如果你需要先手动启动 NapCat 服务，并希望自动记录 NapCat service 输出，可使用：
+
+```text
+start_napcat_logged.bat
+```
+
+它会把 NapCat 的 stdout/stderr 写入：
+
+- `state/napcat_logs/`
+- 最新路径写入 `state/napcat_logs/latest.path`
+
 更详细的运行说明见：
 
 - [CLI_USAGE.md](CLI_USAGE.md)
-- [requirements.txt](requirements.txt)
 
 ### 更新方式
 
-首次拉取推荐直接指定 `runtime` 分支：
+首次拉取推荐直接指定 `main` 分支：
 
 ```powershell
-git clone -b runtime https://github.com/SH7ship24in2022/IsThisShit.git
+git clone -b main https://github.com/SH7ship24in2022/IsThisShit.git
 ```
 
-如果你已经 clone 过仓库，但当前不在 `runtime` 分支：
+如果你已经 clone 过仓库，但当前不在 `main` 分支：
 
 ```powershell
 git fetch origin
-git switch runtime
-git pull origin runtime
+git switch main
+git pull origin main
 ```
 
 如果你已经在本仓库工作目录中，后续更新直接执行：
 
 ```powershell
-git pull origin runtime
+git pull origin main
 ```
 
-正常情况下，后续 `git pull origin runtime` 只会增量拉取远端新增或变化的内容，然后自动合并到本地当前分支，不会每次重新下载整个仓库。
+正常情况下，后续 `git pull origin main` 只会增量拉取远端新增或变化的内容，然后自动合并到本地当前分支，不会每次重新下载整个仓库。
 
 需要注意的是：
 
@@ -147,13 +167,16 @@ git pull origin runtime
 
 ## English
 
-This is the `runtime` branch for operating, validating, and updating the exporter.
+This is the `main` branch for operating, validating, and updating the exporter.
 
-It keeps the minimal runtime surface:
+It keeps the minimal runtime surface and also ships a bundled portable Python runtime plus a slim dependency payload.
 
 - `app.py`
 - `src/`
 - `NapCat/`
+- `python_runtime/`
+- `runtime_site_packages/`
+- `requirements.txt`
 - start scripts
 - runtime usage docs
 
@@ -172,6 +195,7 @@ Use this branch for:
 - running the exporter
 - collaborator updates
 - release/debug validation
+- direct operation without installing Python packages from the network
 
 For full development work, tests, planning docs, and complete project context, use the maintainer-only `full-dev` branch kept locally.
 
@@ -189,55 +213,63 @@ If your terminal host is unstable or visually broken, use:
 start_cli_compat.bat
 ```
 
+If you need to start NapCat manually first and also want service output captured automatically, use:
+
+```text
+start_napcat_logged.bat
+```
+
+It writes NapCat stdout/stderr to:
+
+- `state/napcat_logs/`
+- latest path recorded in `state/napcat_logs/latest.path`
+
 See:
 
 - [CLI_USAGE.md](CLI_USAGE.md)
 
-### Updating
+Startup priority:
 
-For a fresh clone, use the `runtime` branch directly:
+- prefer local development `.venv` when present
+- otherwise use bundled `python_runtime/ + runtime_site_packages/`
+- only fall back to a locally installed Python 3.13 when neither bundled runtime path exists
 
-```powershell
-git clone -b runtime https://github.com/SH7ship24in2022/IsThisShit.git
-```
-
-If the repository already exists locally but is not on `runtime`:
-
-```powershell
-git fetch origin
-git switch runtime
-git pull origin runtime
-```
-
-For normal updates inside an existing `runtime` checkout:
-
-```powershell
-git pull origin runtime
-```
-
-Under normal conditions, `git pull origin runtime` only downloads the new or changed objects from the remote and then merges them into the local branch. It does not re-download the whole repository every time.
-
-Practical notes:
-
-- large newly added binaries can still make an update feel heavy
-- local edits to tracked files can cause merge conflicts
-- for operator-only collaborators, keeping the working tree clean usually makes updates smooth
-
-### Optional dependency install
-
-If you prefer a local virtual environment instead of relying on your global Python installation:
+If you prefer your own local virtual environment instead of the bundled runtime, you can create one with:
 
 ```powershell
 py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-Then you can keep using the normal start scripts:
+### Updating
 
-```text
-start_cli.bat
-start_cli_compat.bat
+For a fresh clone, use the `main` branch directly:
+
+```powershell
+git clone -b main https://github.com/SH7ship24in2022/IsThisShit.git
 ```
+
+If the repository already exists locally but is not on `main`:
+
+```powershell
+git fetch origin
+git switch main
+git pull origin main
+```
+
+For normal updates inside an existing `main` checkout:
+
+```powershell
+git pull origin main
+```
+
+Under normal conditions, `git pull origin main` only downloads the new or changed objects from the remote and then merges them into the local branch. It does not re-download the whole repository every time.
+
+Practical notes:
+
+- large newly added binaries can still make an update feel heavy
+- local edits to tracked files can cause merge conflicts
+- for operator-only collaborators, keeping the working tree clean usually makes updates smooth
 
 ### About `NapCatQQ`
 

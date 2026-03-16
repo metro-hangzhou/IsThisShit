@@ -10,6 +10,7 @@ from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cl
 from qq_data_cli.export_cleanup import cleanup_gateway_media_cache
 from qq_data_cli.qr import render_qr_text
 from qq_data_cli.repl import SlashRepl
+from qq_data_cli.startup_capture import capture_startup_snapshot, get_session_startup_capture_path
 from qq_data_cli.terminal_compat import (
     apply_cli_ui_mode_override,
     probe_terminal_environment,
@@ -48,7 +49,7 @@ app = typer.Typer(
 CLI_HISTORY_SINGLE_PAGE_LIMIT = 200
 
 
-def _init_cli_logging() -> None:
+def _init_cli_logging() -> NapCatSettings:
     settings = NapCatSettings.from_env()
     log_path = setup_cli_logging(settings.state_dir)
     get_cli_logger("app").info(
@@ -57,6 +58,7 @@ def _init_cli_logging() -> None:
         settings.project_root,
         log_path,
     )
+    return settings
 
 
 @app.callback(invoke_without_command=True)
@@ -68,19 +70,35 @@ def cli(
         help="CLI 显示模式：auto、full、compat。",
     ),
 ) -> None:
-    _init_cli_logging()
+    settings = _init_cli_logging()
     try:
         apply_cli_ui_mode_override(ui)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+    terminal_probe = probe_terminal_environment()
+    ui_decision = resolve_cli_ui_mode(
+        terminal_probe,
+        requested_mode=read_requested_cli_ui_mode(),
+    )
+    startup_capture_path = capture_startup_snapshot(
+        settings,
+        terminal_probe=terminal_probe,
+        ui_decision=ui_decision,
+    )
+    if startup_capture_path is not None:
+        get_cli_logger("app").info("startup_capture_path=%s", startup_capture_path)
     if ctx.invoked_subcommand is None:
-        SlashRepl().run()
+        SlashRepl(
+            terminal_probe=terminal_probe,
+            ui_decision=ui_decision,
+            startup_capture_path=startup_capture_path,
+        ).run()
 
 
 @app.command()
 def shell() -> None:
     _init_cli_logging()
-    SlashRepl().run()
+    SlashRepl(startup_capture_path=get_session_startup_capture_path()).run()
 
 
 @app.command("terminal-doctor")

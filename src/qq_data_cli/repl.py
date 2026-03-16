@@ -40,8 +40,11 @@ from qq_data_cli.export_input import (
 )
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
 from qq_data_cli.qr import render_qr_text
+from qq_data_cli.startup_capture import get_latest_startup_capture_path
 from qq_data_cli.target_display import format_target_label, format_target_name, format_target_remark
 from qq_data_cli.terminal_compat import (
+    TerminalProbe,
+    TerminalUiDecision,
     build_cli_ui_profile,
     probe_terminal_environment,
     read_requested_cli_ui_mode,
@@ -69,6 +72,7 @@ from qq_data_integrations import FixtureSnapshotLoader, discover_qq_media_roots
 from qq_data_integrations.napcat import (
     ChatTarget,
     collect_debug_preflight_evidence,
+    get_latest_napcat_launch_log_path,
     NapCatBootstrapper,
     NapCatGateway,
     NapCatQrLoginService,
@@ -81,7 +85,13 @@ from qq_data_integrations.napcat import (
 
 
 class SlashRepl:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        terminal_probe: TerminalProbe | None = None,
+        ui_decision: TerminalUiDecision | None = None,
+        startup_capture_path: Path | None = None,
+    ) -> None:
         self._console = Console()
         self._service = ChatExportService()
         self._fixture_loader = FixtureSnapshotLoader()
@@ -102,20 +112,22 @@ class SlashRepl:
         self._completion_prime_failed: set[str] = set()
         self._completer = SlashCommandCompleter(target_lookup=self._lookup_targets_for_completion)
         self._session: PromptSession | None = None
-        self._terminal_probe = probe_terminal_environment()
-        self._ui_decision = resolve_cli_ui_mode(
+        self._terminal_probe = terminal_probe or probe_terminal_environment()
+        self._ui_decision = ui_decision or resolve_cli_ui_mode(
             self._terminal_probe,
             requested_mode=read_requested_cli_ui_mode(),
         )
         self._ui_profile = build_cli_ui_profile(self._ui_decision)
+        self._startup_capture_path = startup_capture_path or get_latest_startup_capture_path(self._settings.state_dir)
         self._qq_media_roots = discover_qq_media_roots()
         self._media_cache_dir = self._settings.state_dir / "media_index"
         self._logger.info(
-            "repl_initialized state_dir=%s export_dir=%s workdir=%s log_path=%s ui_mode=%s ui_reason=%s",
+            "repl_initialized state_dir=%s export_dir=%s workdir=%s log_path=%s startup_capture=%s ui_mode=%s ui_reason=%s",
             self._settings.state_dir,
             self._settings.export_dir,
             self._settings.workdir,
             self._log_path,
+            self._startup_capture_path,
             self._ui_decision.resolved_mode,
             self._ui_decision.reason,
         )
@@ -125,6 +137,8 @@ class SlashRepl:
         ui_notice = render_cli_ui_mode_notice(self._ui_decision)
         if ui_notice:
             self._console.print(ui_notice)
+        if self._startup_capture_path is not None:
+            self._console.print(f"startup_capture={self._startup_capture_path}")
         self._logger.info("repl_run_start")
         try:
             if self._should_use_basic_loop():
@@ -290,6 +304,8 @@ class SlashRepl:
             f"export_dir={self._settings.export_dir}",
             f"state_dir={self._settings.state_dir}",
             f"log_path={get_cli_log_path() or ''}",
+            f"napcat_log_path={get_latest_napcat_launch_log_path(self._settings.state_dir) or ''}",
+            f"startup_capture_path={self._startup_capture_path or ''}",
             f"cached_groups={gateway.count_targets('group')}",
             f"cached_friends={gateway.count_targets('private')}",
             f"terminal_host={terminal_probe.terminal_host}",

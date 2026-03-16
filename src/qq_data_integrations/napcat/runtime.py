@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from collections.abc import Callable
 from typing import Literal
@@ -29,6 +30,7 @@ class NapCatStartResult(BaseModel):
     attempted_configure: bool = False
     ready: bool = False
     launcher_path: Path | None = None
+    napcat_log_path: Path | None = None
     message: str = ""
 
 
@@ -39,12 +41,14 @@ class NapCatRuntimeStarter:
         *,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
-        launch_process: Callable[[Path], None] | None = None,
+        launch_process: Callable[[Path], Path | None] | None = None,
     ) -> None:
         self._settings = settings
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleep or time.sleep
-        self._launch_process = launch_process or _launch_napcat_process
+        self._launch_process = launch_process or (
+            lambda launcher_path: _launch_napcat_process(launcher_path, settings.state_dir)
+        )
 
     def describe_launch(self) -> NapCatLaunchInfo:
         launcher_path = self._settings.napcat_launcher_path
@@ -115,7 +119,7 @@ class NapCatRuntimeStarter:
                 message=launch_info.reason or f"{endpoint} is not listening and no launchable NapCat runtime was found.",
             )
 
-        self._launch_process(launch_info.launcher_path)
+        napcat_log_path = self._launch_process(launch_info.launcher_path)
         deadline = self._monotonic() + timeout_seconds
         while self._monotonic() < deadline:
             self._sleep(poll_interval)
@@ -126,15 +130,21 @@ class NapCatRuntimeStarter:
                     attempted_start=True,
                     ready=True,
                     launcher_path=launch_info.launcher_path,
-                    message=f"Started NapCat via {launch_info.launcher_path}",
+                    napcat_log_path=napcat_log_path,
+                    message=_append_napcat_log_hint(
+                        f"Started NapCat via {launch_info.launcher_path}",
+                        napcat_log_path,
+                    ),
                 )
         return NapCatStartResult(
             endpoint=endpoint,
             attempted_start=True,
             launcher_path=launch_info.launcher_path,
-            message=(
+            napcat_log_path=napcat_log_path,
+            message=_append_napcat_log_hint(
                 f"Tried to start NapCat via {launch_info.launcher_path}, but {endpoint} at {url} "
-                "did not become ready in time."
+                "did not become ready in time.",
+                napcat_log_path,
             ),
         )
 
@@ -172,13 +182,56 @@ def _looks_like_launchable_runtime(launcher_path: Path) -> bool:
     return all(path.exists() for path in source_files)
 
 
-def _launch_napcat_process(launcher_path: Path) -> None:
+def _launch_napcat_process(launcher_path: Path, state_dir: Path) -> Path | None:
+    log_path, wrapper_path = _prepare_napcat_launch_artifacts(launcher_path, state_dir)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
-        ["cmd.exe", "/c", str(launcher_path)],
+        ["cmd.exe", "/d", "/c", str(wrapper_path)],
         cwd=str(launcher_path.parent),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=creationflags,
     )
+    return log_path
+
+
+def _prepare_napcat_launch_artifacts(launcher_path: Path, state_dir: Path) -> tuple[Path, Path]:
+    logs_dir = state_dir / "napcat_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = logs_dir / f"napcat_{stamp}.log"
+    wrapper_path = logs_dir / f"launch_napcat_{stamp}.cmd"
+    latest_pointer_path = logs_dir / "latest.path"
+    latest_pointer_path.write_text(str(log_path), encoding="utf-8")
+    wrapper_path.write_text(
+        "\n".join(
+            [
+                "@echo off",
+                f'cd /d "{launcher_path.parent}"',
+                f'call "{launcher_path}" >> "{log_path}" 2>&1',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return log_path, wrapper_path
+
+
+def _append_napcat_log_hint(message: str, log_path: Path | None) -> str:
+    if log_path is None:
+        return message
+    return f"{message} NapCat log: {log_path}"
+
+
+def get_latest_napcat_launch_log_path(state_dir: Path) -> Path | None:
+    latest_pointer_path = state_dir / "napcat_logs" / "latest.path"
+    if not latest_pointer_path.exists():
+        return None
+    try:
+        raw = latest_pointer_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return Path(raw)
