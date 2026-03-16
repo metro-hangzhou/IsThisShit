@@ -33,6 +33,13 @@ start_cli_compat.bat
 start_cli.bat
 ```
 
+如果你想先准备本地 `.venv`，推荐：
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
 或者手动：
 
 ```powershell

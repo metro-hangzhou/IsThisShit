@@ -17,4 +17,5 @@ src/qq_data_cli/exports/
 src/qq_data_cli/state/
 src/**/*.egg-info/
 src/**/*.dist-info/
+licensing-drafts/
 **/__pycache__/

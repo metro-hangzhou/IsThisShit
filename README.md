@@ -32,9 +32,16 @@
 
 ### 快速开始
 
-1. 准备 Python 环境
-2. 保证 `NapCat/` 可正常启动
-3. 启动 CLI
+1. 准备 Python 3.13 x64
+2. 如需本地 `.venv`，可执行：
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+3. 保证 `NapCat/` 可正常启动
+4. 启动 CLI
 
 推荐直接双击：
 
@@ -51,6 +58,7 @@ start_cli_compat.bat
 更详细的运行说明见：
 
 - [CLI_USAGE.md](CLI_USAGE.md)
+- [requirements.txt](requirements.txt)
 
 ### 更新方式
 
@@ -192,6 +200,22 @@ Practical notes:
 - large newly added binaries can still make an update feel heavy
 - local edits to tracked files can cause merge conflicts
 - for operator-only collaborators, keeping the working tree clean usually makes updates smooth
+
+### Optional dependency install
+
+If you prefer a local virtual environment instead of relying on your global Python installation:
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Then you can keep using the normal start scripts:
+
+```text
+start_cli.bat
+start_cli_compat.bat
+```
 
 ### About `NapCatQQ`
 
