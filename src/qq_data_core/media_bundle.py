@@ -211,6 +211,7 @@ def materialize_snapshot_media(
                     }
                 )
     copied_map: dict[str, str] = {}
+    occupied_export_paths: dict[str, str] = {}
     resolution_cache: dict[tuple[Any, ...], tuple[Path | None, str]] = {}
     assets: list[MaterializedAsset] = []
     second_pass_candidates: list[tuple[MaterializedAsset, _AssetCandidate]] = []
@@ -228,7 +229,13 @@ def materialize_snapshot_media(
 
         def _candidate_trace_callback(payload: dict[str, Any]) -> None:
             if str(payload.get("phase") or "") == "materialize_asset_substep":
-                route_attempts.append(dict(payload))
+                enriched_payload = dict(payload)
+                enriched_payload.setdefault("current", current_index)
+                enriched_payload.setdefault("total", total_candidates)
+                route_attempts.append(enriched_payload)
+                if progress_callback is not None:
+                    progress_callback(enriched_payload)
+                return
             if progress_callback is not None:
                 progress_callback(payload)
 
@@ -395,7 +402,12 @@ def materialize_snapshot_media(
             )
             continue
 
-        rel_path = _build_export_rel_path(candidate, resolved_path)
+        rel_path = _allocate_export_rel_path(
+            candidate,
+            resolved_path,
+            dedupe_key=dedupe_key,
+            occupied_export_paths=occupied_export_paths,
+        )
         target_path = assets_dir / rel_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -436,6 +448,7 @@ def materialize_snapshot_media(
         asset.status = "copied"
         asset.exported_rel_path = rel_path.as_posix()
         copied_map[dedupe_key] = asset.exported_rel_path
+        occupied_export_paths[asset.exported_rel_path.casefold()] = dedupe_key
         assets.append(asset)
         copied_count += 1
         step_elapsed_s = round(monotonic() - step_started, 4)
@@ -501,7 +514,12 @@ def materialize_snapshot_media(
                     reused_count += 1
                     recovered_count += 1
                     continue
-                rel_path = _build_export_rel_path(candidate, resolved_path)
+                rel_path = _allocate_export_rel_path(
+                    candidate,
+                    resolved_path,
+                    dedupe_key=dedupe_key,
+                    occupied_export_paths=occupied_export_paths,
+                )
                 target_path = assets_dir / rel_path
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -515,6 +533,7 @@ def materialize_snapshot_media(
                 asset.status = "copied"
                 asset.exported_rel_path = rel_path.as_posix()
                 copied_map[dedupe_key] = asset.exported_rel_path
+                occupied_export_paths[asset.exported_rel_path.casefold()] = dedupe_key
                 missing_count -= 1
                 copied_count += 1
                 recovered_count += 1
@@ -923,6 +942,8 @@ def _resolve_candidate_path_napcat_only(
 def _missing_asset_note(resolver: str | None) -> str:
     if resolver == "qq_expired_after_napcat":
         return "asset appears expired in QQ/NapCat; no local file and remote URL unavailable"
+    if resolver == "qq_not_downloaded_local_placeholder":
+        return "QQ only left zero-byte local placeholders (for example OriTemp/*.tmp); the original media was not materialized locally"
     return "source file not found"
 
 
@@ -1803,6 +1824,36 @@ def _build_export_rel_path(candidate: _AssetCandidate, resolved_path: Path) -> P
     if candidate.asset_role:
         return Path(folder) / candidate.asset_role / file_name
     return Path(folder) / file_name
+
+
+def _allocate_export_rel_path(
+    candidate: _AssetCandidate,
+    resolved_path: Path,
+    *,
+    dedupe_key: str,
+    occupied_export_paths: dict[str, str],
+) -> Path:
+    preferred = _build_export_rel_path(candidate, resolved_path)
+    preferred_key = preferred.as_posix().casefold()
+    existing_owner = occupied_export_paths.get(preferred_key)
+    if existing_owner in {None, dedupe_key}:
+        return preferred
+
+    stem = preferred.stem
+    suffix = preferred.suffix
+    parent = preferred.parent
+    collision_suffix = _short_hash(str(resolved_path.resolve()))
+    candidate_path = parent / f"{stem}_{collision_suffix}{suffix}"
+    candidate_key = candidate_path.as_posix().casefold()
+    if occupied_export_paths.get(candidate_key) in {None, dedupe_key}:
+        return candidate_path
+
+    for index in range(2, 1000):
+        numbered = parent / f"{stem}_{collision_suffix}_{index}{suffix}"
+        numbered_key = numbered.as_posix().casefold()
+        if occupied_export_paths.get(numbered_key) in {None, dedupe_key}:
+            return numbered
+    return candidate_path
 
 
 def _normalize_file_name(name: str, *, resolved_path: Path, asset_type: str) -> str:

@@ -399,7 +399,7 @@ class ExportForensicsCollector:
         missing_kind = str(asset.missing_kind or "").strip()
         if not missing_kind:
             return "missing_kind_absent"
-        if missing_kind == "qq_expired_after_napcat":
+        if missing_kind in {"qq_expired_after_napcat", "qq_not_downloaded_local_placeholder"}:
             # Known-expired assets are valid terminal outcomes in release and
             # debug runs. Do not spend incident budget on them unless the
             # missing explanation itself is contradictory or absent.

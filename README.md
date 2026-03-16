@@ -65,6 +65,17 @@ start_cli.bat
 start_cli_compat.bat
 ```
 
+如果你需要先手动启动 NapCat 服务，并希望自动记录 NapCat service 输出，可使用：
+
+```text
+start_napcat_logged.bat
+```
+
+它会把 NapCat 的 stdout/stderr 写入：
+
+- `state/napcat_logs/`
+- 最新路径写入 `state/napcat_logs/latest.path`
+
 更详细的运行说明见：
 
 - [CLI_USAGE.md](CLI_USAGE.md)
@@ -201,6 +212,17 @@ If your terminal host is unstable or visually broken, use:
 ```text
 start_cli_compat.bat
 ```
+
+If you need to start NapCat manually first and also want service output captured automatically, use:
+
+```text
+start_napcat_logged.bat
+```
+
+It writes NapCat stdout/stderr to:
+
+- `state/napcat_logs/`
+- latest path recorded in `state/napcat_logs/latest.path`
 
 See:
 

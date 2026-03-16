@@ -33,6 +33,19 @@ start_cli_compat.bat
 start_cli.bat
 ```
 
+如果你需要**手动**先启动 NapCat 服务、同时希望自动落服务日志，推荐改用：
+
+```text
+start_napcat_logged.bat
+```
+
+它会：
+
+- 调起原版 `NapCat/napcat/launcher-win10.bat`
+- 把 NapCat 的 stdout/stderr 写入 `state/napcat_logs/`
+- 更新 `state/napcat_logs/latest.path`
+
+这样后续排查 NapCat service 报错时，就不需要再手工复制控制台输出。
 如果仓库内已带便携运行时，启动脚本会优先自动使用：
 
 - `python_runtime/`

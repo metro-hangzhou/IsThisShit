@@ -25,7 +25,7 @@ from .media_downloader import NapCatMediaDownloader
 from .models import ChatHistoryBounds, ChatTarget, MetadataCache, NapCatLoginInfo, NapCatLoginStatus
 from .provider import NapCatHistoryProvider
 from .realtime import NapCatRealtimeProvider
-from .runtime import NapCatLaunchInfo, NapCatRuntimeStarter, NapCatStartResult
+from .runtime import NapCatLaunchInfo, NapCatRuntimeStarter, NapCatStartResult, get_latest_napcat_launch_log_path
 from .settings import NapCatSettings
 from .webui_client import NapCatWebUiAuthError, NapCatWebUiClient, NapCatWebUiConnectError, NapCatWebUiError
 from .websocket_client import NapCatWebSocketClient, NapCatWebSocketError
@@ -69,6 +69,7 @@ __all__ = [
     "collect_fast_history_route_matrix",
     "collect_path_matrix",
     "derive_fast_history_url",
+    "get_latest_napcat_launch_log_path",
     "probe_endpoint",
     "probe_settings_endpoints",
 ]

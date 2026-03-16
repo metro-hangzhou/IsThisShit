@@ -62,9 +62,11 @@ class NapCatBootstrapper:
                     endpoint=endpoint,
                     attempted_start=result.attempted_start or webui_result.attempted_start,
                     launcher_path=refreshed_settings.napcat_launcher_path,
+                    napcat_log_path=result.napcat_log_path or webui_result.napcat_log_path,
                     message=(
                         "NapCat WebUI is running, but QQ is not logged in. "
                         "Run /login first, then retry the command."
+                        + _napcat_log_hint(result.napcat_log_path or webui_result.napcat_log_path)
                     ),
                 )
 
@@ -78,7 +80,8 @@ class NapCatBootstrapper:
                 endpoint=endpoint,
                 attempted_start=result.attempted_start or webui_result.attempted_start,
                 launcher_path=refreshed_settings.napcat_launcher_path,
-                message=str(exc),
+                napcat_log_path=result.napcat_log_path or webui_result.napcat_log_path,
+                message=str(exc) + _napcat_log_hint(result.napcat_log_path or webui_result.napcat_log_path),
             )
         finally:
             client.close()
@@ -95,11 +98,13 @@ class NapCatBootstrapper:
                     attempted_configure=changed,
                     ready=True,
                     launcher_path=refreshed_settings.napcat_launcher_path,
+                    napcat_log_path=result.napcat_log_path or webui_result.napcat_log_path,
                     message=(
                         f"{endpoint} is ready at {endpoint_url}"
                         if not changed
                         else f"Enabled default OneBot HTTP/WS servers and {endpoint} is ready at {endpoint_url}"
-                    ),
+                    )
+                    + _napcat_log_hint(result.napcat_log_path or webui_result.napcat_log_path),
                 )
             self._sleep(poll_interval)
 
@@ -108,10 +113,12 @@ class NapCatBootstrapper:
             attempted_start=result.attempted_start or webui_result.attempted_start,
             attempted_configure=changed,
             launcher_path=refreshed_settings.napcat_launcher_path,
+            napcat_log_path=result.napcat_log_path or webui_result.napcat_log_path,
             message=(
                 f"NapCat WebUI is running, but {endpoint} is still not listening at {endpoint_url}. "
                 "Check the OneBot network config in NapCat."
-            ),
+            )
+            + _napcat_log_hint(result.napcat_log_path or webui_result.napcat_log_path),
         )
 
 
@@ -133,3 +140,9 @@ def _endpoint_url(settings: NapCatSettings, endpoint: EndpointName) -> str:
     if endpoint == "onebot_http":
         return settings.http_url
     return settings.ws_url
+
+
+def _napcat_log_hint(log_path) -> str:
+    if not log_path:
+        return ""
+    return f" NapCat log: {log_path}"
