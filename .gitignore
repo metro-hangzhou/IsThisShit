@@ -6,11 +6,11 @@ tmp*/
 .pytest_cache/
 .ruff_cache/
 .uv-cache/
-dist/
-exports/
-state/
+/dist/
+/exports/
+/state/
 licensing-drafts/
-NapCatQQ/
+/NapCatQQ/
 NapCat/config.json
 NapCat/napcat/cache/
 NapCat/napcat/config/*.json
