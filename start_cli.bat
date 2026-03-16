@@ -39,6 +39,28 @@ if exist ".venv\Scripts\python.exe" (
   exit /b !exit_code!
 )
 
+if exist "python_runtime\python.exe" (
+  set "BUNDLE_ROOT=%cd%"
+  set "SRC_PATH=!BUNDLE_ROOT!\src"
+  set "SITE_PACKAGES=!BUNDLE_ROOT!\runtime_site_packages"
+  set "PYTHONPATH=!SRC_PATH!;!SITE_PACKAGES!;!PYTHONPATH!"
+  set "PATH=!BUNDLE_ROOT!\python_runtime;!PATH!"
+  set "PYTHONHOME=!BUNDLE_ROOT!\python_runtime"
+  "python_runtime\python.exe" -c "import typer,prompt_toolkit,httpx,orjson,pydantic,rich,qrcode,websockets" >nul 2>nul
+  if not "!errorlevel!"=="0" (
+    echo Bundled Python runtime found but bundled dependencies are incomplete.
+    echo Expected runtime_site_packages to contain the minimal CLI dependency set.
+    pause
+    exit /b 1
+  )
+  "python_runtime\python.exe" app.py %_CLI_ARGS%
+  set "exit_code=!errorlevel!"
+  if "!exit_code!"=="0" exit /b 0
+  echo CLI exited with code !exit_code!.
+  pause
+  exit /b !exit_code!
+)
+
 where py >nul 2>nul
 if %errorlevel%==0 (
   py -3.13 app.py %_CLI_ARGS%
@@ -50,7 +72,10 @@ if %errorlevel%==0 (
 )
 
 echo Failed to start local runtime.
-echo Expected .venv\Scripts\python.exe or a local Python 3.13 launcher.
+echo Expected one of the following:
+echo   1. .venv\Scripts\python.exe
+echo   2. bundled python_runtime\python.exe plus runtime_site_packages
+echo   3. a local Python 3.13 launcher
 pause
 exit /b 1
 

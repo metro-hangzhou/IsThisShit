@@ -1,6 +1,6 @@
 # CLI Usage
 
-适用对象：已经有一点开发环境基础、知道如何启动 Python/NapCat 的使用者。
+适用对象：已经有一点开发环境基础、知道如何启动 NapCat 的使用者。
 
 ## 启动
 
@@ -27,13 +27,27 @@ start_cli_compat.bat
 - 禁用自动跳转到 Windows Terminal
 - 直接强制 `compat` 显示模式
 
-源码仓库内推荐也直接双击：
+源码仓库或 `main` 运行分支内推荐也直接双击：
 
 ```text
 start_cli.bat
 ```
 
-或者手动：
+如果仓库内已带便携运行时，启动脚本会优先自动使用：
+
+- `python_runtime/`
+- `runtime_site_packages/`
+
+只有这些都不存在时，才需要本机 Python。
+
+如果你更希望自己维护本地虚拟环境，也可以手动执行：
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+也可以手动：
 
 ```powershell
 python app.py
