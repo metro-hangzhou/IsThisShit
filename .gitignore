@@ -1,21 +1,31 @@
-.idea/
-.venv/
-.tmp/
-.tmp*/
-tmp*/
-.pytest_cache/
-.ruff_cache/
-.uv-cache/
+# Root-anchored ignore rules only.
+# Do not use loose names like `dist/` or `cache/` without a leading `/`.
+# In this repository, unanchored directory names have already masked required
+# vendored runtime assets such as `NapCat/.../node_modules/.../dist/*`.
+
+/.idea/
+/.venv/
+/.tmp/
+/.tmp*/
+/tmp*/
+/.pytest_cache/
+/.ruff_cache/
+/.uv-cache/
 /dist/
 /exports/
 /state/
-licensing-drafts/
+/licensing-drafts/
 /NapCatQQ/
-NapCat/config.json
-NapCat/napcat/cache/
-NapCat/napcat/config/*.json
-src/qq_data_cli/exports/
-src/qq_data_cli/state/
-src/**/*.egg-info/
-src/**/*.dist-info/
-**/__pycache__/
+/NapCat/config.json
+/NapCat/napcat/cache/
+/NapCat/napcat/config/*.json
+/src/qq_data_cli/exports/
+/src/qq_data_cli/state/
+/src/**/*.egg-info/
+/src/**/*.dist-info/
+/src/**/__pycache__/
+/tests/**/__pycache__/
+/scripts/**/__pycache__/
+/python_runtime/**/__pycache__/
+/runtime_site_packages/**/__pycache__/
+/NapCat/**/__pycache__/
