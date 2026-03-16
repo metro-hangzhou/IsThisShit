@@ -74,6 +74,14 @@ git pull origin runtime
 git pull origin runtime
 ```
 
+正常情况下，后续 `git pull origin runtime` 只会增量拉取远端新增或变化的内容，然后自动合并到本地当前分支，不会每次重新下载整个仓库。
+
+需要注意的是：
+
+- 如果远端新增了较大的二进制文件，Git 仍然需要把这些新增对象下载下来
+- 如果你本地修改过同一份被跟踪文件，更新时可能出现合并冲突
+- 对只运行不改代码的协作者来说，保持本地工作区干净，更新通常会最顺滑
+
 ### NapCatQQ 说明
 
 `NapCatQQ/` 不由当前仓库跟踪。
@@ -176,6 +184,14 @@ For normal updates inside an existing `runtime` checkout:
 ```powershell
 git pull origin runtime
 ```
+
+Under normal conditions, `git pull origin runtime` only downloads the new or changed objects from the remote and then merges them into the local branch. It does not re-download the whole repository every time.
+
+Practical notes:
+
+- large newly added binaries can still make an update feel heavy
+- local edits to tracked files can cause merge conflicts
+- for operator-only collaborators, keeping the working tree clean usually makes updates smooth
 
 ### About `NapCatQQ`
 
