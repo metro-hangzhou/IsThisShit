@@ -6,10 +6,11 @@ tmp*/
 .pytest_cache/
 .ruff_cache/
 .uv-cache/
-dist/
-exports/
-state/
-NapCatQQ/
+/dist/
+/exports/
+/state/
+licensing-drafts/
+/NapCatQQ/
 NapCat/config.json
 NapCat/napcat/cache/
 NapCat/napcat/config/*.json
@@ -17,5 +18,4 @@ src/qq_data_cli/exports/
 src/qq_data_cli/state/
 src/**/*.egg-info/
 src/**/*.dist-info/
-licensing-drafts/
 **/__pycache__/
