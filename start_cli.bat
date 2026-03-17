@@ -18,7 +18,7 @@ if "%~1"=="" (
   if not defined WT_SESSION (
     if not defined TERM_PROGRAM (
       if not defined ConEmuPID (
-        if /I not "%CLI_AUTO_WT%"=="0" (
+        if /I "%CLI_AUTO_WT%"=="1" (
           if defined _WT_EXE (
             start "" "!_WT_EXE!" -w 0 new-tab cmd.exe /k "\"%~dp0start_cli_modern_host.bat\""
             exit /b 0
@@ -30,6 +30,7 @@ if "%~1"=="" (
 )
 
 :run_cli
+echo Starting CLI...
 if exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" app.py %_CLI_ARGS%
   set "exit_code=!errorlevel!"

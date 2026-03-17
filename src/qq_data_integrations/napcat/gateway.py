@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from threading import RLock
+from time import monotonic
 
 from qq_data_core.models import ExportRequest, SourceChatSnapshot, WatchRequest
 
@@ -8,7 +10,7 @@ from .directory import NapCatMetadataDirectory
 from .fast_history_client import NapCatFastHistoryClient
 from .http_client import NapCatHttpClient
 from .media_downloader import NapCatMediaDownloader
-from .models import ChatHistoryBounds, ChatTarget
+from .models import ChatHistoryBounds, ChatTarget, normalize_chat_type
 from .provider import NapCatHistoryProvider
 from .realtime import NapCatRealtimeProvider
 from .settings import NapCatSettings
@@ -17,6 +19,8 @@ from .websocket_client import NapCatWebSocketClient
 
 
 class NapCatGateway:
+    HISTORY_BOUNDS_CACHE_TTL_S = 15.0
+
     def __init__(
         self,
         settings: NapCatSettings,
@@ -31,11 +35,10 @@ class NapCatGateway:
             access_token=settings.access_token,
             use_system_proxy=settings.use_system_proxy,
         )
-        fast_headers = _build_fast_history_headers(settings)
         self._fast_history_client = (
             NapCatFastHistoryClient(
                 settings.fast_history_url,
-                headers=fast_headers,
+                headers_provider=lambda: _build_fast_history_headers(settings),
                 use_system_proxy=settings.use_system_proxy,
             )
             if settings.fast_history_mode != "off" and settings.fast_history_url
@@ -52,7 +55,11 @@ class NapCatGateway:
         )
         self._ws_client = ws_client
         self._realtime_provider: NapCatRealtimeProvider | None = None
-        self._history_bounds_cache: dict[tuple[str, str, bool, bool], ChatHistoryBounds] = {}
+        self._history_bounds_cache: dict[
+            tuple[str, str, bool, bool],
+            tuple[float, ChatHistoryBounds],
+        ] = {}
+        self._sync_lock = RLock()
         self._media_downloader = NapCatMediaDownloader(
             self._http_client,
             fast_client=self._fast_history_client,
@@ -62,10 +69,13 @@ class NapCatGateway:
         )
 
     def close(self) -> None:
-        self._media_downloader.close()
-        self._http_client.close()
-        if self._fast_history_client is not None:
-            self._fast_history_client.close()
+        with self._sync_lock:
+            self._media_downloader.close()
+            self._http_client.close()
+            if self._fast_history_client is not None:
+                self._fast_history_client.close()
+            self._realtime_provider = None
+            self._ws_client = None
 
     def list_targets(
         self,
@@ -76,12 +86,13 @@ class NapCatGateway:
         limit: int = 8,
     ) -> list[ChatTarget]:
         normalized_chat_type = self._normalize_chat_type(chat_type)
-        return self._metadata_directory.search(
-            normalized_chat_type,
-            keyword,
-            refresh=refresh,
-            limit=limit,
-        )
+        with self._sync_lock:
+            return self._metadata_directory.search(
+                normalized_chat_type,
+                keyword,
+                refresh=refresh,
+                limit=limit,
+            )
 
     def resolve_target(
         self,
@@ -91,17 +102,20 @@ class NapCatGateway:
         refresh_if_missing: bool = True,
     ) -> ChatTarget:
         normalized_chat_type = self._normalize_chat_type(chat_type)
-        return self._metadata_directory.resolve(
-            normalized_chat_type,
-            query,
-            refresh_if_missing=refresh_if_missing,
-        )
+        with self._sync_lock:
+            return self._metadata_directory.resolve(
+                normalized_chat_type,
+                query,
+                refresh_if_missing=refresh_if_missing,
+            )
 
     def count_targets(self, chat_type: str) -> int:
-        return self._metadata_directory.count(self._normalize_chat_type(chat_type))
+        with self._sync_lock:
+            return self._metadata_directory.count(self._normalize_chat_type(chat_type))
 
     def fetch_snapshot(self, request: ExportRequest) -> SourceChatSnapshot:
-        return self._history_provider.fetch_snapshot(request)
+        with self._sync_lock:
+            return self._history_provider.fetch_snapshot(request)
 
     def fetch_snapshot_tail(
         self,
@@ -111,12 +125,13 @@ class NapCatGateway:
         page_size: int = 100,
         progress_callback=None,
     ) -> SourceChatSnapshot:
-        return self._history_provider.fetch_snapshot_tail(
-            request,
-            data_count=data_count,
-            page_size=page_size,
-            progress_callback=progress_callback,
-        )
+        with self._sync_lock:
+            return self._history_provider.fetch_snapshot_tail(
+                request,
+                data_count=data_count,
+                page_size=page_size,
+                progress_callback=progress_callback,
+            )
 
     def fetch_history_before(
         self,
@@ -125,11 +140,12 @@ class NapCatGateway:
         before_message_seq: str | None,
         count: int | None = None,
     ) -> SourceChatSnapshot:
-        return self._history_provider.fetch_snapshot_before(
-            request,
-            before_message_seq=before_message_seq,
-            count=count,
-        )
+        with self._sync_lock:
+            return self._history_provider.fetch_snapshot_before(
+                request,
+                before_message_seq=before_message_seq,
+                count=count,
+            )
 
     def get_history_bounds(
         self,
@@ -142,17 +158,21 @@ class NapCatGateway:
         refresh: bool = False,
     ) -> ChatHistoryBounds:
         cache_key = (request.chat_type, request.chat_id, need_earliest, need_final)
-        if not refresh and cache_key in self._history_bounds_cache:
-            return self._history_bounds_cache[cache_key]
-        bounds = self._history_provider.get_history_bounds(
-            request,
-            page_size=page_size,
-            need_earliest=need_earliest,
-            need_final=need_final,
-            progress_callback=progress_callback,
-        )
-        self._history_bounds_cache[cache_key] = bounds
-        return bounds
+        with self._sync_lock:
+            if not refresh and cache_key in self._history_bounds_cache:
+                cached_at, cached_bounds = self._history_bounds_cache[cache_key]
+                if monotonic() - cached_at <= self.HISTORY_BOUNDS_CACHE_TTL_S:
+                    return cached_bounds
+                self._history_bounds_cache.pop(cache_key, None)
+            bounds = self._history_provider.get_history_bounds(
+                request,
+                page_size=page_size,
+                need_earliest=need_earliest,
+                need_final=need_final,
+                progress_callback=progress_callback,
+            )
+            self._history_bounds_cache[cache_key] = (monotonic(), bounds)
+            return bounds
 
     def fetch_snapshot_between(
         self,
@@ -161,11 +181,12 @@ class NapCatGateway:
         page_size: int = 100,
         progress_callback=None,
     ) -> SourceChatSnapshot:
-        return self._history_provider.fetch_snapshot_between(
-            request,
-            page_size=page_size,
-            progress_callback=progress_callback,
-        )
+        with self._sync_lock:
+            return self._history_provider.fetch_snapshot_between(
+                request,
+                page_size=page_size,
+                progress_callback=progress_callback,
+            )
 
     def fetch_snapshot_tail_between(
         self,
@@ -175,12 +196,13 @@ class NapCatGateway:
         page_size: int = 100,
         progress_callback=None,
     ) -> SourceChatSnapshot:
-        return self._history_provider.fetch_snapshot_tail_between(
-            request,
-            data_count=data_count,
-            page_size=page_size,
-            progress_callback=progress_callback,
-        )
+        with self._sync_lock:
+            return self._history_provider.fetch_snapshot_tail_between(
+                request,
+                data_count=data_count,
+                page_size=page_size,
+                progress_callback=progress_callback,
+            )
 
     def fetch_full_snapshot(
         self,
@@ -189,11 +211,12 @@ class NapCatGateway:
         page_size: int = 100,
         progress_callback=None,
     ) -> SourceChatSnapshot:
-        return self._history_provider.fetch_full_snapshot(
-            request,
-            page_size=page_size,
-            progress_callback=progress_callback,
-        )
+        with self._sync_lock:
+            return self._history_provider.fetch_full_snapshot(
+                request,
+                page_size=page_size,
+                progress_callback=progress_callback,
+            )
 
     async def watch(self, request: WatchRequest) -> AsyncIterator[dict]:
         provider = self._ensure_realtime_provider()
@@ -207,7 +230,16 @@ class NapCatGateway:
         return self._media_downloader
 
     def cleanup_media_download_cache(self) -> dict[str, object]:
-        return self._media_downloader.cleanup_remote_cache()
+        with self._sync_lock:
+            self._history_bounds_cache.clear()
+            self._history_provider.reset_export_state()
+            return self._media_downloader.cleanup_remote_cache()
+
+    def reset_export_state(self) -> None:
+        with self._sync_lock:
+            self._history_bounds_cache.clear()
+            self._history_provider.reset_export_state()
+            self._media_downloader.reset_export_state()
 
     def _ensure_realtime_provider(self) -> NapCatRealtimeProvider:
         if self._realtime_provider is None:
@@ -221,7 +253,7 @@ class NapCatGateway:
         return self._realtime_provider
 
     def _normalize_chat_type(self, chat_type: str) -> str:
-        return "group" if chat_type == "group" else "private"
+        return normalize_chat_type(chat_type)
 
 
 def _build_fast_history_headers(settings: NapCatSettings) -> dict[str, str] | None:

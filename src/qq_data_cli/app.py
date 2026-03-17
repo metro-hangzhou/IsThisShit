@@ -3,14 +3,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from time import monotonic
+import sys
+from typing import TYPE_CHECKING
 
 import typer
 
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
-from qq_data_cli.export_cleanup import cleanup_gateway_media_cache
-from qq_data_cli.qr import render_qr_text
-from qq_data_cli.repl import SlashRepl
-from qq_data_cli.startup_capture import capture_startup_snapshot, get_session_startup_capture_path
 from qq_data_cli.terminal_compat import (
     apply_cli_ui_mode_override,
     probe_terminal_environment,
@@ -18,27 +16,12 @@ from qq_data_cli.terminal_compat import (
     render_terminal_doctor_lines,
     resolve_cli_ui_mode,
 )
-from qq_data_core import (
-    ChatExportService,
-    ExportForensicsCollector,
-    ExportPerfTraceWriter,
-    resolve_strict_missing_policy,
-    ExportRequest,
-    build_export_content_summary,
-    build_default_output_path,
-    format_missing_breakdown_compact,
-)
-from qq_data_integrations import FixtureSnapshotLoader, discover_qq_media_roots
-from qq_data_integrations.napcat import (
-    NapCatBootstrapper,
-    ChatTarget,
-    collect_debug_preflight_evidence,
-    NapCatGateway,
-    NapCatQrLoginService,
-    NapCatSettings,
-    NapCatTargetLookupError,
-    NapCatWebUiClient,
-)
+from qq_data_integrations.napcat.settings import NapCatSettings
+
+if TYPE_CHECKING:
+    from qq_data_core.export_perf import ExportPerfTraceWriter
+    from qq_data_integrations.napcat.gateway import NapCatGateway
+    from qq_data_integrations.napcat.models import ChatTarget
 
 app = typer.Typer(
     help="QQ chat exporter developer CLI",
@@ -49,8 +32,26 @@ app = typer.Typer(
 CLI_HISTORY_SINGLE_PAGE_LIMIT = 200
 
 
-def _init_cli_logging() -> NapCatSettings:
+def _extract_state_dir_override(argv: list[str] | None = None) -> Path | None:
+    args = list(argv if argv is not None else sys.argv[1:])
+    if "export-history" not in args:
+        return None
+    last_value: str | None = None
+    for index, token in enumerate(args):
+        lowered = token.casefold()
+        if lowered == "--state-dir":
+            if index + 1 < len(args):
+                last_value = args[index + 1]
+        elif lowered.startswith("--state-dir="):
+            last_value = token.split("=", 1)[1]
+    return Path(last_value) if last_value else None
+
+
+def _init_cli_logging(*, argv: list[str] | None = None) -> NapCatSettings:
     settings = NapCatSettings.from_env()
+    state_dir_override = _extract_state_dir_override(argv)
+    if state_dir_override is not None:
+        settings = settings.model_copy(update={"state_dir": state_dir_override})
     log_path = setup_cli_logging(settings.state_dir)
     get_cli_logger("app").info(
         "cli_entry state_dir=%s project_root=%s log_path=%s",
@@ -59,6 +60,22 @@ def _init_cli_logging() -> NapCatSettings:
         log_path,
     )
     return settings
+
+
+def _build_settings_loader(
+    current_settings: NapCatSettings,
+    *,
+    pinned_updates: dict[str, object] | None = None,
+):
+    updates = dict(pinned_updates or {})
+
+    def _loader() -> NapCatSettings:
+        refreshed = NapCatSettings.from_env()
+        if not updates:
+            return refreshed
+        return refreshed.model_copy(update=updates)
+
+    return _loader
 
 
 @app.callback(invoke_without_command=True)
@@ -70,7 +87,7 @@ def cli(
         help="CLI 显示模式：auto、full、compat。",
     ),
 ) -> None:
-    settings = _init_cli_logging()
+    settings = _init_cli_logging(argv=list(sys.argv[1:]))
     try:
         apply_cli_ui_mode_override(ui)
     except ValueError as exc:
@@ -80,30 +97,37 @@ def cli(
         terminal_probe,
         requested_mode=read_requested_cli_ui_mode(),
     )
-    startup_capture_path = capture_startup_snapshot(
-        settings,
-        terminal_probe=terminal_probe,
-        ui_decision=ui_decision,
-    )
-    if startup_capture_path is not None:
-        get_cli_logger("app").info("startup_capture_path=%s", startup_capture_path)
     if ctx.invoked_subcommand is None:
+        typer.echo("正在启动 CLI，请稍候...")
+        from qq_data_cli.repl import SlashRepl
+        from qq_data_cli.startup_capture import get_session_startup_capture_path
+
         SlashRepl(
             terminal_probe=terminal_probe,
             ui_decision=ui_decision,
-            startup_capture_path=startup_capture_path,
+            startup_capture_path=get_session_startup_capture_path(),
+            defer_startup_capture=True,
         ).run()
 
 
 @app.command()
 def shell() -> None:
-    _init_cli_logging()
-    SlashRepl(startup_capture_path=get_session_startup_capture_path()).run()
+    if get_cli_log_path() is None:
+        _init_cli_logging()
+    typer.echo("正在启动 CLI，请稍候...")
+    from qq_data_cli.repl import SlashRepl
+    from qq_data_cli.startup_capture import get_session_startup_capture_path
+
+    SlashRepl(
+        startup_capture_path=get_session_startup_capture_path(),
+        defer_startup_capture=True,
+    ).run()
 
 
 @app.command("terminal-doctor")
 def terminal_doctor() -> None:
-    _init_cli_logging()
+    if get_cli_log_path() is None:
+        _init_cli_logging()
     probe = probe_terminal_environment()
     decision = resolve_cli_ui_mode(
         probe,
@@ -120,6 +144,10 @@ def login(
     webui_url: str | None = typer.Option(None, "--webui-url"),
     webui_token: str | None = typer.Option(None, "--webui-token"),
 ) -> None:
+    from qq_data_integrations.napcat.bootstrap import NapCatBootstrapper
+    from qq_data_integrations.napcat.login import NapCatQrLoginService
+    from qq_data_integrations.napcat.webui_client import NapCatWebUiClient
+
     base_settings = NapCatSettings.from_env()
     settings = base_settings.model_copy(
         update={
@@ -127,7 +155,17 @@ def login(
             "webui_token": webui_token if webui_token is not None else base_settings.webui_token,
         }
     )
-    start_result = NapCatBootstrapper(settings).ensure_endpoint("webui")
+    start_result = NapCatBootstrapper(
+        settings,
+        settings_loader=_build_settings_loader(
+            settings,
+            pinned_updates={
+                "webui_url": settings.webui_url,
+                "webui_token": settings.webui_token,
+                "state_dir": settings.state_dir,
+            },
+        ),
+    ).ensure_endpoint("webui")
     if not start_result.ready:
         raise typer.BadParameter(start_result.message)
     if (start_result.attempted_start or start_result.attempted_configure) and start_result.message:
@@ -146,8 +184,15 @@ def login(
     )
     try:
         service = NapCatQrLoginService(client)
+        from qq_data_cli.qr import build_login_qr_image_path, render_qr_text, write_qr_png
 
         def on_qr(url: str) -> None:
+            qr_image_path = write_qr_png(
+                url,
+                build_login_qr_image_path(settings.project_root),
+            )
+            typer.echo(f"qr_image_path={qr_image_path}")
+            typer.echo("请直接打开该图片扫码登录。")
             typer.echo(render_qr_text(url))
             typer.echo(f"qr_url={url}")
 
@@ -176,17 +221,25 @@ def export_fixture(
     out_path: Path,
     fmt: str = typer.Option("jsonl", "--format", "-f"),
 ) -> None:
+    from qq_data_core import ChatExportService, normalize_export_format
+    from qq_data_integrations import FixtureSnapshotLoader, discover_qq_media_roots
+
+    try:
+        normalized_fmt = normalize_export_format(fmt)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--format") from exc
     loader = FixtureSnapshotLoader()
     service = ChatExportService()
+    settings = NapCatSettings.from_env()
     media_roots = discover_qq_media_roots()
     snapshot = loader.load_export(fixture_path)
     normalized = service.build_snapshot(snapshot)
     bundle = service.write_bundle(
         normalized,
         out_path,
-        fmt=fmt.lower(),
+        fmt=normalized_fmt,
         media_search_roots=media_roots,
-        media_cache_dir=Path("state") / "media_index",
+        media_cache_dir=settings.state_dir / "media_index",
     )
     typer.echo(str(bundle.data_path))
 
@@ -210,8 +263,32 @@ def export_history(
         help="调试导出缺失策略：off、collect、abort、threshold:N。",
     ),
 ) -> None:
+    from qq_data_cli.export_cleanup import cleanup_gateway_media_cache
+    from qq_data_core import (
+        ChatExportService,
+        ExportForensicsCollector,
+        ExportPerfTraceWriter,
+        ExportRequest,
+        build_default_output_path,
+        build_export_content_summary,
+        format_missing_breakdown_compact,
+        normalize_export_format,
+        resolve_strict_missing_policy,
+    )
+    from qq_data_integrations.napcat.bootstrap import NapCatBootstrapper
+    from qq_data_integrations.napcat.diagnostics import collect_debug_preflight_evidence
+    from qq_data_integrations.napcat.gateway import NapCatGateway
+    from qq_data_integrations.napcat.models import normalize_chat_type
+
     logger = get_cli_logger("app")
-    normalized_chat_type = "group" if chat_type.lower() == "group" else "private"
+    try:
+        normalized_fmt = normalize_export_format(fmt)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--format") from exc
+    try:
+        normalized_chat_type = normalize_chat_type(chat_type)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="chat_type") from exc
     base_settings = NapCatSettings.from_env()
     settings = base_settings.model_copy(
         update={
@@ -221,7 +298,18 @@ def export_history(
             "state_dir": state_dir or base_settings.state_dir,
         }
     )
-    start_result = NapCatBootstrapper(settings).ensure_endpoint("onebot_http")
+    start_result = NapCatBootstrapper(
+        settings,
+        settings_loader=_build_settings_loader(
+            settings,
+            pinned_updates={
+                "http_url": settings.http_url,
+                "access_token": settings.access_token,
+                "export_dir": settings.export_dir,
+                "state_dir": settings.state_dir,
+            },
+        ),
+    ).ensure_endpoint("onebot_http")
     if not start_result.ready:
         raise typer.BadParameter(start_result.message)
     if start_result.attempted_start or start_result.attempted_configure:
@@ -253,7 +341,7 @@ def export_history(
             policy=resolve_strict_missing_policy(strict_missing, env=os.environ),
             command_context={
                 "entrypoint": "app.export-history",
-                "format": fmt.lower(),
+                "format": normalized_fmt,
                 "limit": limit,
                 "strict_missing": strict_missing,
                 "chat_ref": chat_ref,
@@ -275,7 +363,7 @@ def export_history(
             "export_start",
             {
                 "chat_name": target.display_name,
-                "format": fmt.lower(),
+                "format": normalized_fmt,
                 "limit": limit,
                 "target_dir": str((out_path.parent if out_path is not None else settings.export_dir).resolve()),
             },
@@ -302,12 +390,12 @@ def export_history(
             settings.export_dir,
             chat_type=normalized_chat_type,
             chat_id=target.chat_id,
-            fmt=fmt.lower(),
+            fmt=normalized_fmt,
         )
         bundle = service.write_bundle(
             normalized,
             target_path,
-            fmt=fmt.lower(),
+            fmt=normalized_fmt,
             media_resolution_mode="napcat_only",
             media_download_manager=(
                 gateway.build_media_download_manager()
@@ -356,7 +444,7 @@ def export_history(
             (
                 f"records={len(normalized.messages)} copied={bundle.copied_asset_count} "
                 f"reused={bundle.reused_asset_count} missing={bundle.missing_asset_count} "
-                f"missing_kinds=[{missing_kinds}] "
+                f"final_missing_reason=[{missing_kinds}] "
                 f"pages={summary['pages_scanned']} retries={summary['retry_events']} trace={trace.path}"
             ),
             err=True,
@@ -400,13 +488,16 @@ def export_history(
 
 
 def _resolve_target(
-    gateway: NapCatGateway,
+    gateway: "NapCatGateway",
     chat_type: str,
     query: str,
     *,
     chat_name: str | None,
     refresh: bool,
-) -> ChatTarget:
+) -> "ChatTarget":
+    from qq_data_integrations.napcat.directory import NapCatTargetLookupError
+    from qq_data_integrations.napcat.models import ChatTarget
+
     if query.isdigit():
         try:
             return gateway.resolve_target(chat_type, query, refresh_if_missing=True)
@@ -415,12 +506,15 @@ def _resolve_target(
     return gateway.resolve_target(chat_type, query, refresh_if_missing=True)
 
 
-def _build_cli_export_progress_callback(trace: ExportPerfTraceWriter):
+def _build_cli_export_progress_callback(trace: "ExportPerfTraceWriter"):
     state: dict[str, object] = {
         "last_text": "",
         "last_emit": 0.0,
         "last_pages": -1,
         "last_current": -1,
+        "last_download_text": "",
+        "last_download_emit": 0.0,
+        "last_download_completed": -1,
     }
 
     def callback(update: dict[str, object]) -> None:
@@ -430,6 +524,29 @@ def _build_cli_export_progress_callback(trace: ExportPerfTraceWriter):
         if not text:
             return
         now = monotonic()
+        if phase == "download_assets":
+            stage = str(update.get("stage") or "progress")
+            completed = int(update.get("completed") or update.get("download_completed") or 0)
+            total = int(update.get("candidate_total") or update.get("download_total") or 0)
+            last_completed = int(state.get("last_download_completed") or -1)
+            if (
+                stage == "progress"
+                and completed < total
+                and completed >= last_completed
+                and completed - last_completed < 4
+                and now - float(state.get("last_download_emit") or 0.0) < 0.2
+            ):
+                return
+            if (
+                text == state.get("last_download_text")
+                and now - float(state.get("last_download_emit") or 0.0) < 0.75
+            ):
+                return
+            state["last_download_completed"] = completed
+            state["last_download_text"] = text
+            state["last_download_emit"] = now
+            typer.echo(text, err=True)
+            return
         if phase == "materialize_assets":
             current = int(update.get("current") or 0)
             total = int(update.get("total") or 0)
@@ -531,6 +648,38 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
             detail += f" rate={current / elapsed_s:.1f}/s elapsed={elapsed_s:.1f}s"
         return detail
 
+    if phase == "download_assets":
+        stage = str(update.get("stage") or "progress")
+        total = int(update.get("candidate_total") or update.get("download_total") or 0)
+        queued = int(update.get("queued") or 0)
+        active = int(update.get("active") or update.get("download_inflight") or 0)
+        completed = int(update.get("completed") or update.get("download_completed") or 0)
+        failed = int(update.get("failed") or update.get("download_failed") or 0)
+        cached = int(update.get("cached") or update.get("download_cached") or 0)
+        eager = int(update.get("eager_remote_candidates") or 0)
+        token = int(update.get("public_token_candidates") or 0)
+        context = int(update.get("context_candidates") or 0)
+        last_asset_type = str(update.get("last_asset_type") or "").strip()
+        last_file_name = str(update.get("last_file_name") or "").strip()
+        last_status = str(update.get("last_status") or "").strip()
+        if stage == "done" and not total:
+            return None
+        parts = [f"remote_downloads(subqueue): {stage}"]
+        parts.append(f"candidates={total}")
+        parts.append(f"ok={completed}")
+        parts.append(f"cached={cached}")
+        parts.append(f"failed={failed}")
+        parts.append(f"queued={queued}")
+        parts.append(f"active={active}")
+        if stage == "start":
+            parts.append(f"sources=eager:{eager}/token:{token}/context:{context}")
+        if last_asset_type and last_status:
+            last_label = last_asset_type
+            if last_file_name:
+                last_label = f"{last_label}:{last_file_name}"
+            parts.append(f"last={last_status}@{last_label}")
+        return " ".join(parts)
+
     if phase == "forensic_incident" and str(update.get("stage") or "") == "recorded":
         if not bool(update.get("is_new_incident")):
             return None
@@ -569,7 +718,6 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
 
 
 def main() -> None:
-    _init_cli_logging()
     app()
 
 

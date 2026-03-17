@@ -3,16 +3,25 @@ from __future__ import annotations
 import shlex
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 
-from qq_data_core import EXPORT_TIME_FORMAT, SPECIAL_TIME_EXPRESSIONS, is_explicit_datetime_literal
+from qq_data_core import (
+    EXPORT_TIME_FORMAT,
+    SPECIAL_TIME_EXPRESSIONS,
+    format_export_datetime,
+    is_explicit_datetime_literal,
+    is_parseable_datetime_literal,
+)
 from qq_data_core.models import EXPORT_TIMEZONE
 from qq_data_cli.export_commands import EXPORT_COMMAND_PROFILES, FORMAT_MARKERS
 from qq_data_cli.export_input import render_export_date_literal_display
 from qq_data_cli.logging_utils import get_cli_logger
 from qq_data_cli.target_display import format_target_label, format_target_remark, is_blank_like_text
-from qq_data_integrations.napcat import ChatTarget
+
+if TYPE_CHECKING:
+    from qq_data_integrations.napcat.models import ChatTarget
 
 COMMANDS = [
     "/doctor",
@@ -39,6 +48,11 @@ WATCH_OPTIONS = ["--refresh"]
 LOGIN_OPTIONS = ["--refresh", "--timeout", "--poll"]
 FORMAT_VALUES = ["jsonl", "txt"]
 DATE_FUNCTIONS = list(SPECIAL_TIME_EXPRESSIONS)
+DATE_FUNCTION_COMPLETIONS = [
+    *DATE_FUNCTIONS,
+    *(f"{value}+" for value in DATE_FUNCTIONS),
+    *(f"{value}-" for value in DATE_FUNCTIONS),
+]
 DATA_COUNT_INLINE = "data_count="
 WATCH_COMMANDS = [
     "/exit",
@@ -50,6 +64,7 @@ WATCH_COMMANDS = [
 ]
 WATCH_EXPORT_OPTIONS = ["--format", "--out", "--limit", "--data-count", "--include-raw"]
 FORMAT_ALIASES = ["asTXT", "asJSONL"]
+_MAX_REPORTED_LOOKUP_FAILURES = 128
 
 
 class SlashCommandCompleter(Completer):
@@ -324,6 +339,8 @@ class SlashCommandCompleter(Completer):
         )
         if failure_key in self._reported_lookup_failures:
             return
+        if len(self._reported_lookup_failures) >= _MAX_REPORTED_LOOKUP_FAILURES:
+            self._reported_lookup_failures.clear()
         self._reported_lookup_failures.add(failure_key)
         self._logger.warning(
             "completion_lookup_failed scope=%s chat_type=%s keyword=%r error=%s",
@@ -430,14 +447,22 @@ def _complete_time_expressions(
     start_position: int,
     now_provider: Callable[[], datetime],
 ):
-    if is_explicit_datetime_literal(current_token):
+    normalized_literal = _normalize_datetime_literal_token(current_token)
+    if normalized_literal is not None:
+        if normalized_literal != current_token:
+            yield Completion(
+                text=normalized_literal,
+                start_position=start_position,
+                display=render_export_date_literal_display(normalized_literal),
+                display_meta="normalized explicit datetime",
+            )
         time_candidate = _build_time_stage_candidate(
-            current_token,
+            normalized_literal,
             slot_index=slot_index,
             previous_date_tokens=previous_date_tokens,
             now_provider=now_provider,
         )
-        if time_candidate is not None and time_candidate != current_token:
+        if time_candidate is not None and time_candidate != normalized_literal:
             yield Completion(
                 text=time_candidate,
                 start_position=start_position,
@@ -447,7 +472,11 @@ def _complete_time_expressions(
         return
 
     if current_token and current_token.startswith("@"):
-        yield from _complete_words(DATE_FUNCTIONS, current_token, start_position=start_position)
+        yield from _complete_words(
+            DATE_FUNCTION_COMPLETIONS,
+            current_token,
+            start_position=start_position,
+        )
         return
 
     if not current_token:
@@ -456,13 +485,14 @@ def _complete_time_expressions(
             previous_date_tokens=previous_date_tokens,
             now_provider=now_provider,
         )
-        yield Completion(
-            text=date_candidate,
-            start_position=start_position,
-            display=render_export_date_literal_display(date_candidate),
-            display_meta="explicit datetime",
-        )
-        yield from _complete_words(DATE_FUNCTIONS, current_token, start_position=start_position)
+        if date_candidate is not None:
+            yield Completion(
+                text=date_candidate,
+                start_position=start_position,
+                display=render_export_date_literal_display(date_candidate),
+                display_meta="explicit datetime",
+            )
+        yield from _complete_words(DATE_FUNCTION_COMPLETIONS, current_token, start_position=start_position)
         return
 
     if current_token[:1].isdigit():
@@ -471,7 +501,7 @@ def _complete_time_expressions(
             previous_date_tokens=previous_date_tokens,
             now_provider=now_provider,
         )
-        if candidate.startswith(current_token):
+        if candidate is not None and candidate.startswith(current_token):
             yield Completion(
                 text=candidate,
                 start_position=start_position,
@@ -496,12 +526,14 @@ def _build_date_stage_candidate(
     *,
     previous_date_tokens: list[str],
     now_provider: Callable[[], datetime],
-) -> str:
+) -> str | None:
     anchor = _resolve_anchor_datetime(
         slot_index,
         previous_date_tokens=previous_date_tokens,
         now_provider=now_provider,
     )
+    if anchor is None:
+        return None
     if slot_index <= 0:
         candidate = anchor
     else:
@@ -524,6 +556,8 @@ def _build_time_stage_candidate(
         previous_date_tokens=previous_date_tokens,
         now_provider=now_provider,
     )
+    if anchor is None:
+        return None
     resolved = current_dt.replace(
         hour=anchor.hour,
         minute=anchor.minute,
@@ -538,13 +572,28 @@ def _resolve_anchor_datetime(
     *,
     previous_date_tokens: list[str],
     now_provider: Callable[[], datetime],
-) -> datetime:
+) -> datetime | None:
     now = now_provider().astimezone(EXPORT_TIMEZONE).replace(microsecond=0)
     if slot_index <= 0:
         return now
-    if previous_date_tokens and is_explicit_datetime_literal(previous_date_tokens[0]):
-        return datetime.strptime(previous_date_tokens[0], EXPORT_TIME_FORMAT).replace(tzinfo=EXPORT_TIMEZONE)
-    return now
+    anchor_index = slot_index - 1
+    if anchor_index >= len(previous_date_tokens):
+        return None
+    anchor_token = previous_date_tokens[anchor_index]
+    normalized_anchor = _normalize_datetime_literal_token(anchor_token)
+    if normalized_anchor is not None:
+        return datetime.strptime(normalized_anchor, EXPORT_TIME_FORMAT).replace(tzinfo=EXPORT_TIMEZONE)
+    return None
+
+
+def _normalize_datetime_literal_token(value: str) -> str | None:
+    if not is_parseable_datetime_literal(value):
+        return None
+    try:
+        parsed = datetime.strptime(value.strip(), EXPORT_TIME_FORMAT).replace(tzinfo=EXPORT_TIMEZONE)
+    except ValueError:
+        return None
+    return format_export_datetime(parsed)
 
 
 def _display_time_only(value: str) -> str:

@@ -29,7 +29,7 @@ from .export_forensics import (
 )
 from .normalize import normalize_message, normalize_snapshot
 from .paths import build_default_output_path
-from .services import ChatExportService
+from .services import ChatExportService, normalize_export_format
 from .time_expr import (
     EXPORT_TIME_FORMAT,
     SPECIAL_TIME_EXPRESSIONS,
@@ -74,6 +74,7 @@ __all__ = [
     "is_explicit_datetime_literal",
     "is_parseable_datetime_literal",
     "normalize_message",
+    "normalize_export_format",
     "normalize_snapshot",
     "parse_time_expression",
     "resolve_strict_missing_policy",

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import os
 import re
 import shutil
-from threading import Lock
+from threading import Event, Lock, Thread
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from collections.abc import Callable
 from contextlib import suppress
@@ -15,6 +17,8 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+
+from qq_data_core.paths import build_timestamp_token
 
 from .fast_history_client import (
     NapCatFastHistoryClient,
@@ -60,7 +64,16 @@ class NapCatMediaDownloader:
         self._old_context_failure_buckets: dict[tuple[str, str], int] = {}
         self._old_context_skip_logged: set[tuple[str, str]] = set()
         self._old_context_expired_buckets: set[tuple[str, str]] = set()
-        self._remote_cache_dir = remote_cache_dir
+        self._remote_cache_root = remote_cache_dir
+        self._remote_process_cache_dir = (
+            remote_cache_dir / f"pid_{os.getpid()}"
+            if remote_cache_dir is not None
+            else None
+        )
+        self._remote_cache_dir: Path | None = None
+        self._active_export_cache_token: str | None = None
+        self._use_system_proxy = use_system_proxy
+        self._remote_transport = remote_transport
         self._prefetched_media: dict[tuple[Any, ...], tuple[Path | None, str | None]] = {}
         self._prefetched_media_payloads: dict[tuple[Any, ...], dict[str, Any] | None] = {}
         self._prefetched_forward_media: dict[tuple[Any, ...], tuple[Path | None, str | None]] = {}
@@ -68,9 +81,9 @@ class NapCatMediaDownloader:
         self._shared_media_outcomes: dict[tuple[Any, ...], tuple[Path | None, str | None]] = {}
         self._remote_media_resolution_cache: dict[tuple[str, str], str | None] = {}
         self._remote_media_resolution_futures: dict[tuple[str, str], Future[str | None]] = {}
-        self._public_token_prefetch_cache: dict[tuple[str, str, str, str], dict[str, Any] | None] = {}
+        self._public_token_prefetch_cache: dict[tuple[str, ...], dict[str, Any] | None] = {}
         self._public_token_prefetch_futures: dict[
-            tuple[str, str, str, str],
+            tuple[str, ...],
             Future[dict[str, Any] | None],
         ] = {}
         self._known_bad_public_tokens: dict[tuple[str, str], str] = {}
@@ -83,6 +96,11 @@ class NapCatMediaDownloader:
         self._remote_media_fetch_workers = self._compute_remote_media_fetch_workers()
         self._public_token_prefetch_workers = self._compute_public_token_prefetch_workers()
         self._prefetch_feedback_lock = Lock()
+        self._prefetch_state_lock = Lock()
+        self._executor_lock = Lock()
+        self._download_progress_lock = Lock()
+        self._download_progress = self._new_download_progress_state()
+        self._download_operation_states: dict[tuple[str, str], str] = {}
         self._prefetch_feedback: dict[str, int] = {
             "remote_ok": 0,
             "remote_error": 0,
@@ -91,27 +109,21 @@ class NapCatMediaDownloader:
             "token_remote_ok": 0,
             "token_remote_error": 0,
         }
-        self._remote_executor = ThreadPoolExecutor(
-            max_workers=self._remote_media_fetch_workers,
-            thread_name_prefix="qq-remote-media",
-        )
-        self._public_token_executor = ThreadPoolExecutor(
-            max_workers=self._public_token_prefetch_workers,
-            thread_name_prefix="qq-public-token",
-        )
-        self._remote_client = httpx.Client(
-            timeout=self.REMOTE_MEDIA_FETCH_TIMEOUT_S,
-            transport=remote_transport,
-            trust_env=use_system_proxy,
-            follow_redirects=True,
-        )
+        self._public_token_executor: ThreadPoolExecutor | None = None
+        self._remote_loop: asyncio.AbstractEventLoop | None = None
+        self._remote_loop_thread: Thread | None = None
+        self._remote_async_client: httpx.AsyncClient | None = None
+        self._remote_async_semaphore: asyncio.Semaphore | None = None
+        self._create_prefetch_executors()
 
     def close(self) -> None:
-        self._remote_client.close()
-        self._remote_executor.shutdown(wait=False, cancel_futures=True)
-        self._public_token_executor.shutdown(wait=False, cancel_futures=True)
+        self._rebuild_prefetch_executors(wait=True, recreate=False)
+
+    def reset_export_state(self) -> None:
+        self._reset_transient_export_state()
 
     def cleanup_remote_cache(self) -> dict[str, Any]:
+        self._rebuild_prefetch_executors(wait=True, recreate=True)
         self._reset_transient_export_state()
         cache_root = self._remote_cache_dir
         stats: dict[str, Any] = {
@@ -122,6 +134,8 @@ class NapCatMediaDownloader:
             "cleared_memory_state": True,
             "cache_cleared": False,
         }
+        self._remote_cache_dir = None
+        self._active_export_cache_token = None
         if cache_root is None:
             stats["skipped_reason"] = "cache_disabled"
             return stats
@@ -141,7 +155,6 @@ class NapCatMediaDownloader:
 
         try:
             shutil.rmtree(cache_root)
-            cache_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             stats["cleanup_error"] = str(exc)
             self._logger.warning(
@@ -154,20 +167,184 @@ class NapCatMediaDownloader:
         stats["cache_cleared"] = True
         return stats
 
+    def _prepare_remote_cache_dir(self) -> Path | None:
+        process_root = self._remote_process_cache_dir
+        if process_root is None:
+            self._remote_cache_dir = None
+            self._active_export_cache_token = None
+            return None
+        if self._remote_cache_dir is not None and self._remote_cache_dir.exists():
+            return self._remote_cache_dir
+        export_token = build_timestamp_token(include_pid=True)
+        cache_dir = process_root / f"export_{export_token}"
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            self._remote_cache_dir = None
+            self._active_export_cache_token = None
+            return None
+        self._remote_cache_dir = cache_dir
+        self._active_export_cache_token = export_token
+        return cache_dir
+
     def _reset_transient_export_state(self) -> None:
-        self._prefetched_media.clear()
-        self._prefetched_media_payloads.clear()
-        self._prefetched_forward_media.clear()
-        self._prefetched_forward_media_payloads.clear()
-        self._shared_media_outcomes.clear()
-        self._remote_media_resolution_cache.clear()
-        self._remote_media_resolution_futures.clear()
-        self._public_token_prefetch_cache.clear()
-        self._public_token_prefetch_futures.clear()
-        self._old_context_failure_buckets.clear()
-        self._old_context_skip_logged.clear()
-        self._old_context_expired_buckets.clear()
-        self._image_placeholder_missing_cache.clear()
+        with self._prefetch_state_lock:
+            self._fast_context_route_disabled = False
+            self._prefetched_media.clear()
+            self._prefetched_media_payloads.clear()
+            self._prefetched_forward_media.clear()
+            self._prefetched_forward_media_payloads.clear()
+            self._shared_media_outcomes.clear()
+            self._remote_media_resolution_cache.clear()
+            self._remote_media_resolution_futures.clear()
+            self._public_token_prefetch_cache.clear()
+            self._public_token_prefetch_futures.clear()
+            self._known_bad_public_tokens.clear()
+            self._old_context_failure_buckets.clear()
+            self._old_context_skip_logged.clear()
+            self._old_context_expired_buckets.clear()
+            self._image_placeholder_missing_cache.clear()
+        with self._download_progress_lock:
+            self._download_progress = self._new_download_progress_state()
+            self._download_operation_states.clear()
+        with self._prefetch_feedback_lock:
+            self._prefetch_feedback = {
+                "remote_ok": 0,
+                "remote_error": 0,
+                "token_payload": 0,
+                "token_resolved": 0,
+                "token_remote_ok": 0,
+                "token_remote_error": 0,
+            }
+
+    @staticmethod
+    def _new_download_progress_state() -> dict[str, Any]:
+        return {
+            "candidate_total": 0,
+            "eager_remote_candidates": 0,
+            "public_token_candidates": 0,
+            "context_candidates": 0,
+            "queued": 0,
+            "active": 0,
+            "completed": 0,
+            "failed": 0,
+            "cached": 0,
+            "last_asset_type": None,
+            "last_file_name": None,
+            "last_status": None,
+        }
+
+    def _initialize_download_progress_for_requests(
+        self,
+        requests: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self._prepare_remote_cache_dir()
+        summary = self._summarize_download_candidates(requests)
+        with self._download_progress_lock:
+            self._download_progress = {
+                **self._new_download_progress_state(),
+                **summary,
+            }
+            self._download_operation_states.clear()
+            return dict(self._download_progress)
+
+    def begin_export_download_tracking(
+        self,
+        requests: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self._initialize_download_progress_for_requests(requests)
+
+    def export_download_progress_snapshot(self) -> dict[str, Any]:
+        with self._download_progress_lock:
+            return dict(self._download_progress)
+
+    def settle_export_download_progress(self, *, timeout_s: float | None = None) -> dict[str, Any]:
+        futures: list[Future[Any]] = []
+        with self._prefetch_state_lock:
+            futures.extend(self._remote_media_resolution_futures.values())
+            futures.extend(self._public_token_prefetch_futures.values())
+        deadline = None if timeout_s is None else monotonic() + max(0.0, timeout_s)
+        for future in futures:
+            remaining = None
+            if deadline is not None:
+                remaining = max(0.05, deadline - monotonic())
+                if remaining <= 0:
+                    break
+            with suppress(Exception):
+                future.result(timeout=remaining)
+        return self.export_download_progress_snapshot()
+
+    def _update_download_progress(
+        self,
+        cache_key: tuple[str, str],
+        *,
+        asset_type: str,
+        file_name: str | None,
+        next_state: str,
+    ) -> None:
+        with self._download_progress_lock:
+            current_state = self._download_operation_states.get(cache_key)
+            if current_state == next_state:
+                return
+            progress = self._download_progress
+            if current_state == "queued":
+                progress["queued"] = max(0, int(progress["queued"]) - 1)
+            elif current_state == "active":
+                progress["active"] = max(0, int(progress["active"]) - 1)
+
+            if next_state == "queued":
+                progress["queued"] = int(progress["queued"]) + 1
+            elif next_state == "active":
+                progress["active"] = int(progress["active"]) + 1
+            elif next_state == "completed":
+                progress["completed"] = int(progress["completed"]) + 1
+            elif next_state == "failed":
+                progress["failed"] = int(progress["failed"]) + 1
+            elif next_state == "cached":
+                progress["cached"] = int(progress["cached"]) + 1
+
+            progress["last_asset_type"] = asset_type or None
+            progress["last_file_name"] = file_name or None
+            progress["last_status"] = next_state
+            self._download_operation_states[cache_key] = next_state
+
+    def _summarize_download_candidates(
+        self,
+        requests: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        candidate_total = 0
+        eager_remote_candidates = 0
+        public_token_candidates = 0
+        context_candidates = 0
+        for request in requests:
+            asset_type = str(request.get("asset_type") or "").strip()
+            hint = self._request_hint(request)
+            if self._resolve_from_hint_local_path(hint) != (None, None):
+                continue
+            if asset_type not in self.REMOTE_PREFETCHABLE_ASSET_TYPES:
+                continue
+            has_remote = bool(
+                self._resolve_remote_url(str(hint.get("remote_url") or hint.get("url") or "").strip())
+            )
+            has_public_token = bool(str(hint.get("public_action") or "").strip()) and bool(
+                str(hint.get("public_file_token") or "").strip()
+            )
+            has_context = self._has_context_hint(hint) or self._has_forward_parent_hint(hint)
+            if not (has_remote or has_public_token or has_context):
+                continue
+            candidate_total += 1
+            if has_remote:
+                eager_remote_candidates += 1
+            elif has_public_token:
+                public_token_candidates += 1
+            else:
+                context_candidates += 1
+        return {
+            "candidate_total": candidate_total,
+            "eager_remote_candidates": eager_remote_candidates,
+            "public_token_candidates": public_token_candidates,
+            "context_candidates": context_candidates,
+        }
 
     def prepare_for_export(
         self,
@@ -175,6 +352,8 @@ class NapCatMediaDownloader:
         *,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
+        if requests and not int(self.export_download_progress_snapshot().get("candidate_total") or 0):
+            self._initialize_download_progress_for_requests(requests)
         if self._fast_client is None or not requests:
             return
         self._configure_prefetch_pools_for_requests(
@@ -1884,7 +2063,7 @@ class NapCatMediaDownloader:
                 path = Path(cached_resolution)
                 if path.exists() and path.is_file():
                     return path.resolve(), "napcat_forward_remote_url"
-                self._remote_media_resolution_cache.pop(cache_key, None)
+                self._drop_remote_prefetch_result(cache_key)
             return None, None
         if request is not None:
             self._emit_asset_substep_trace(
@@ -1902,7 +2081,7 @@ class NapCatMediaDownloader:
             hint={"url": resolved_remote_url},
         )
         elapsed_s = monotonic() - started
-        self._remote_media_resolution_cache[cache_key] = resolved
+        self._store_remote_prefetch_result(cache_key, resolved)
         self._record_prefetch_feedback("remote_ok" if resolved is not None else "remote_error")
         if request is not None:
             self._emit_asset_substep_trace(
@@ -1994,7 +2173,7 @@ class NapCatMediaDownloader:
                 cached_path = Path(cached_resolution)
                 if cached_path.exists() and cached_path.is_file():
                     return cached_path.resolve()
-                self._remote_media_resolution_cache.pop(cache_key, None)
+                self._drop_remote_prefetch_result(cache_key)
             return None
         if request is not None:
             self._emit_asset_substep_trace(
@@ -2012,7 +2191,7 @@ class NapCatMediaDownloader:
             hint={"url": resolved_remote_url},
         )
         elapsed_s = monotonic() - started
-        self._remote_media_resolution_cache[cache_key] = resolved
+        self._store_remote_prefetch_result(cache_key, resolved)
         if request is not None:
             self._emit_asset_substep_trace(
                 trace_callback,
@@ -2075,7 +2254,7 @@ class NapCatMediaDownloader:
             return None
         cached_path = Path(prefetched_resolution)
         if not cached_path.exists() or not cached_path.is_file():
-            self._remote_media_resolution_cache.pop(cache_key, None)
+            self._drop_remote_prefetch_result(cache_key)
             return None
         return cached_path.resolve()
 
@@ -2114,7 +2293,7 @@ class NapCatMediaDownloader:
             return None, True
         cached_path = Path(prefetched_resolution)
         if not cached_path.exists() or not cached_path.is_file():
-            self._remote_media_resolution_cache.pop(cache_key, None)
+            self._drop_remote_prefetch_result(cache_key)
             return None, True
         return cached_path.resolve(), True
 
@@ -2142,17 +2321,13 @@ class NapCatMediaDownloader:
             or None
         )
         cache_key = (asset_type, self._normalized_match_url(resolved_remote_url))
-        if cache_key in self._remote_media_resolution_cache:
-            return
-        future = self._remote_media_resolution_futures.get(cache_key)
-        if future is not None and not future.done():
-            return
-        self._remote_media_resolution_futures[cache_key] = self._remote_executor.submit(
-            self._download_remote_media_prefetch_task,
-            asset_type,
-            file_name,
-            resolved_remote_url,
+        future, created = self._ensure_remote_media_future(
+            asset_type=asset_type,
+            file_name=file_name,
+            resolved_remote_url=resolved_remote_url,
         )
+        if future is None or not created:
+            return
 
     def _schedule_request_remote_prefetch(
         self,
@@ -2206,9 +2381,9 @@ class NapCatMediaDownloader:
             action=action,
             token=token,
         )
-        if cache_key in self._public_token_prefetch_cache:
+        cached_result, future = self._public_token_prefetch_state(cache_key)
+        if cached_result is not ...:
             return
-        future = self._public_token_prefetch_futures.get(cache_key)
         if future is not None and not future.done():
             return
         file_name = (
@@ -2216,13 +2391,26 @@ class NapCatMediaDownloader:
             or str(request_data.get("file_name") or "").strip()
             or None
         )
-        self._public_token_prefetch_futures[cache_key] = self._public_token_executor.submit(
-            self._prefetch_public_token_task,
-            asset_type,
-            action,
-            token,
-            file_name,
-        )
+        with self._executor_lock:
+            public_token_executor = self._public_token_executor
+            if public_token_executor is None:
+                return
+            future = public_token_executor.submit(
+                self._prefetch_public_token_task,
+                asset_type,
+                action,
+                token,
+                file_name,
+            )
+        with self._prefetch_state_lock:
+            existing_future = self._public_token_prefetch_futures.get(cache_key)
+            existing_result = self._public_token_prefetch_cache.get(cache_key, ...)
+            if existing_result is not ... or (
+                existing_future is not None and not existing_future.done()
+            ):
+                future.cancel()
+                return
+            self._public_token_prefetch_futures[cache_key] = future
 
     def _peek_public_token_prefetch(
         self,
@@ -2238,7 +2426,7 @@ class NapCatMediaDownloader:
             action=action,
             token=token,
         )
-        cached_result = self._public_token_prefetch_cache.get(cache_key, ...)
+        cached_result, future = self._public_token_prefetch_state(cache_key)
         if cached_result is not ...:
             self._emit_public_token_prefetch_trace(
                 request=request,
@@ -2247,15 +2435,13 @@ class NapCatMediaDownloader:
                 trace_callback=trace_callback,
             )
             return cached_result
-        future = self._public_token_prefetch_futures.get(cache_key)
         if future is None or not future.done():
             return None
         try:
             cached_result = future.result()
         except Exception:
             cached_result = None
-        self._public_token_prefetch_cache[cache_key] = cached_result
-        self._public_token_prefetch_futures.pop(cache_key, None)
+        self._store_public_token_prefetch_result(cache_key, cached_result)
         self._emit_public_token_prefetch_trace(
             request=request,
             action=action,
@@ -2305,7 +2491,7 @@ class NapCatMediaDownloader:
             action=action,
             token=token,
         )
-        cached_result = self._public_token_prefetch_cache.get(cache_key, ...)
+        cached_result, future = self._public_token_prefetch_state(cache_key)
         if cached_result is not ...:
             self._emit_public_token_prefetch_trace(
                 request=request,
@@ -2314,7 +2500,6 @@ class NapCatMediaDownloader:
                 trace_callback=trace_callback,
             )
             return cached_result
-        future = self._public_token_prefetch_futures.get(cache_key)
         if future is None:
             return None
         try:
@@ -2323,8 +2508,7 @@ class NapCatMediaDownloader:
             return None
         except Exception:
             cached_result = None
-        self._public_token_prefetch_cache[cache_key] = cached_result
-        self._public_token_prefetch_futures.pop(cache_key, None)
+        self._store_public_token_prefetch_result(cache_key, cached_result)
         self._emit_public_token_prefetch_trace(
             request=request,
             action=action,
@@ -2368,7 +2552,7 @@ class NapCatMediaDownloader:
             hint={"url": resolved_remote_url},
         )
         cache_key = (asset_type, self._normalized_match_url(resolved_remote_url))
-        self._remote_media_resolution_cache[cache_key] = downloaded
+        self._store_remote_prefetch_result(cache_key, downloaded)
         if downloaded is None:
             self._record_prefetch_feedback("token_remote_error")
             return result
@@ -2383,22 +2567,53 @@ class NapCatMediaDownloader:
         request_data: dict[str, Any],
         action: str,
         token: str,
-    ) -> tuple[str, str, str, str]:
+    ) -> tuple[str, ...]:
+        hint = request_data.get("download_hint")
+        hint_dict = hint if isinstance(hint, dict) else {}
+        parent = hint_dict.get("_forward_parent")
+        parent_dict = parent if isinstance(parent, dict) else {}
+
+        def _pick(*keys: str) -> str:
+            for key in keys:
+                value = request_data.get(key)
+                if value not in {None, ""}:
+                    return str(value).strip()
+                value = hint_dict.get(key)
+                if value not in {None, ""}:
+                    return str(value).strip()
+            return ""
+
+        def _pick_parent(*keys: str) -> str:
+            for key in keys:
+                value = parent_dict.get(key)
+                if value not in {None, ""}:
+                    return str(value).strip()
+            return ""
+
         return (
             str(request_data.get("asset_type") or "").strip(),
+            str(request_data.get("asset_role") or "").strip(),
             str(action or "").strip().lower(),
             str(token or "").strip(),
             str(request_data.get("file_name") or "").strip().lower(),
+            str(request_data.get("md5") or "").strip().lower(),
+            _pick("message_id_raw"),
+            _pick("element_id"),
+            _pick("peer_uid"),
+            _pick("chat_type_raw"),
+            _pick_parent("message_id_raw"),
+            _pick_parent("element_id"),
+            _pick_parent("peer_uid"),
+            _pick_parent("chat_type_raw"),
         )
 
     def _consume_remote_media_prefetch(
         self,
         cache_key: tuple[str, str],
     ) -> str | None | object:
-        cached_resolution = self._remote_media_resolution_cache.get(cache_key, ...)
+        cached_resolution, future = self._remote_prefetch_state(cache_key)
         if cached_resolution is not ...:
             return cached_resolution
-        future = self._remote_media_resolution_futures.get(cache_key)
         if future is None:
             return ...
         try:
@@ -2407,38 +2622,115 @@ class NapCatMediaDownloader:
             return ...
         except Exception:
             cached_resolution = None
-        self._remote_media_resolution_cache[cache_key] = cached_resolution
-        self._remote_media_resolution_futures.pop(cache_key, None)
+        self._store_remote_prefetch_result(cache_key, cached_resolution)
         return cached_resolution
 
     def _peek_remote_media_prefetch(
         self,
         cache_key: tuple[str, str],
     ) -> str | None | object:
-        cached_resolution = self._remote_media_resolution_cache.get(cache_key, ...)
+        cached_resolution, future = self._remote_prefetch_state(cache_key)
         if cached_resolution is not ...:
             return cached_resolution
-        future = self._remote_media_resolution_futures.get(cache_key)
         if future is None or not future.done():
             return ...
         try:
             cached_resolution = future.result()
         except Exception:
             cached_resolution = None
-        self._remote_media_resolution_cache[cache_key] = cached_resolution
-        self._remote_media_resolution_futures.pop(cache_key, None)
+        self._store_remote_prefetch_result(cache_key, cached_resolution)
         return cached_resolution
 
-    def _download_remote_media_prefetch_task(
+    def _submit_remote_media_download(
+        self,
+        *,
+        asset_type: str,
+        file_name: str | None,
+        resolved_remote_url: str,
+    ) -> Future[str | None] | None:
+        with self._executor_lock:
+            loop = self._remote_loop
+            if loop is None or loop.is_closed():
+                return None
+            try:
+                return asyncio.run_coroutine_threadsafe(
+                    self._download_remote_media_prefetch_task(
+                        asset_type=asset_type,
+                        file_name=file_name,
+                        resolved_remote_url=resolved_remote_url,
+                    ),
+                    loop,
+                )
+            except RuntimeError:
+                return None
+
+    def _ensure_remote_media_future(
+        self,
+        *,
+        asset_type: str,
+        file_name: str | None,
+        resolved_remote_url: str,
+    ) -> tuple[Future[str | None] | None, bool]:
+        cache_key = (asset_type, self._normalized_match_url(resolved_remote_url))
+        cached_resolution, future = self._remote_prefetch_state(cache_key)
+        if cached_resolution is not ...:
+            return None, False
+        if future is not None and not future.done():
+            return future, False
+        future = self._submit_remote_media_download(
+            asset_type=asset_type,
+            file_name=file_name,
+            resolved_remote_url=resolved_remote_url,
+        )
+        if future is None:
+            return None, False
+        with self._prefetch_state_lock:
+            existing_future = self._remote_media_resolution_futures.get(cache_key)
+            existing_result = self._remote_media_resolution_cache.get(cache_key, ...)
+            if existing_result is not ...:
+                future.cancel()
+                return None, False
+            if existing_future is not None and not existing_future.done():
+                future.cancel()
+                return existing_future, False
+            self._update_download_progress(
+                cache_key,
+                asset_type=asset_type,
+                file_name=file_name,
+                next_state="queued",
+            )
+            self._remote_media_resolution_futures[cache_key] = future
+        return future, True
+
+    async def _download_remote_media_prefetch_task(
         self,
         asset_type: str,
         file_name: str | None,
         resolved_remote_url: str,
     ) -> str | None:
-        resolved = self._download_remote_media(
+        cache_key = (asset_type, self._normalized_match_url(resolved_remote_url))
+        self._update_download_progress(
+            cache_key,
+            asset_type=asset_type,
+            file_name=file_name,
+            next_state="active",
+        )
+        resolved, used_cached_file = await self._download_remote_media_async(
             asset_type=asset_type,
             file_name=file_name,
             hint={"url": resolved_remote_url},
+        )
+        self._update_download_progress(
+            cache_key,
+            asset_type=asset_type,
+            file_name=file_name,
+            next_state=(
+                "failed"
+                if resolved is None
+                else "cached"
+                if used_cached_file
+                else "completed"
+            ),
         )
         self._record_prefetch_feedback("remote_ok" if resolved is not None else "remote_error")
         return resolved
@@ -2491,20 +2783,93 @@ class NapCatMediaDownloader:
             and public_token_workers == self._public_token_prefetch_workers
         ):
             return
-        if self._remote_media_resolution_futures or self._public_token_prefetch_futures:
+        if self._prefetch_has_inflight_work():
             return
-        self._remote_executor.shutdown(wait=False, cancel_futures=True)
-        self._public_token_executor.shutdown(wait=False, cancel_futures=True)
         self._remote_media_fetch_workers = remote_workers
         self._public_token_prefetch_workers = public_token_workers
-        self._remote_executor = ThreadPoolExecutor(
-            max_workers=self._remote_media_fetch_workers,
-            thread_name_prefix="qq-remote-media",
-        )
+        self._rebuild_prefetch_executors(wait=False, recreate=True)
+
+    def _create_prefetch_executors(self) -> None:
+        self._start_remote_download_runtime()
         self._public_token_executor = ThreadPoolExecutor(
             max_workers=self._public_token_prefetch_workers,
             thread_name_prefix="qq-public-token",
         )
+
+    def _rebuild_prefetch_executors(self, *, wait: bool, recreate: bool) -> None:
+        with self._executor_lock:
+            public_token_executor = self._public_token_executor
+            self._public_token_executor = None
+            if public_token_executor is not None:
+                public_token_executor.shutdown(wait=wait, cancel_futures=True)
+            self._stop_remote_download_runtime(wait=wait)
+            if recreate:
+                self._create_prefetch_executors()
+
+    def _start_remote_download_runtime(self) -> None:
+        if self._remote_loop is not None and self._remote_loop_thread is not None:
+            return
+        ready = Event()
+
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._remote_loop = loop
+            self._remote_async_client = httpx.AsyncClient(
+                timeout=self.REMOTE_MEDIA_FETCH_TIMEOUT_S,
+                transport=self._remote_transport,
+                trust_env=self._use_system_proxy,
+                follow_redirects=True,
+            )
+            self._remote_async_semaphore = asyncio.Semaphore(self._remote_media_fetch_workers)
+            ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                client = self._remote_async_client
+                if client is not None:
+                    loop.run_until_complete(client.aclose())
+                self._remote_async_client = None
+                self._remote_async_semaphore = None
+                self._remote_loop = None
+                asyncio.set_event_loop(None)
+                loop.close()
+
+        thread = Thread(
+            target=_runner,
+            name="qq-remote-media-async",
+            daemon=True,
+        )
+        self._remote_loop_thread = thread
+        thread.start()
+        if not ready.wait(timeout=5.0):
+            raise RuntimeError("remote media async runtime failed to start")
+
+    def _stop_remote_download_runtime(self, *, wait: bool) -> None:
+        loop = self._remote_loop
+        thread = self._remote_loop_thread
+        if loop is None or thread is None:
+            self._remote_loop = None
+            self._remote_loop_thread = None
+            return
+        with self._prefetch_state_lock:
+            futures = list(self._remote_media_resolution_futures.values())
+        if wait:
+            for future in futures:
+                with suppress(Exception):
+                    future.result(timeout=self.REMOTE_MEDIA_FETCH_TIMEOUT_S + 2.0)
+        else:
+            for future in futures:
+                future.cancel()
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5.0)
+        self._remote_loop_thread = None
 
     @classmethod
     def _compute_remote_media_fetch_workers(
@@ -2522,10 +2887,24 @@ class NapCatMediaDownloader:
         hardware_target = max(4, min(8, cpu_count // 2 or 4))
         queue_pressure = max(total_prefetchable, eager_remote_prefetchable * 2)
         if queue_pressure <= 32:
-            return min(hardware_target, 4)
-        if queue_pressure <= 160:
-            return min(hardware_target, max(4, hardware_target - 1))
-        return hardware_target
+            workers = min(hardware_target, 4)
+        elif queue_pressure <= 160:
+            workers = min(hardware_target, max(4, hardware_target - 1))
+        else:
+            workers = hardware_target
+        feedback = feedback or {}
+        remote_ok = int(feedback.get("remote_ok", 0))
+        remote_error = int(feedback.get("remote_error", 0))
+        total_remote = remote_ok + remote_error
+        if total_remote >= 12:
+            error_ratio = remote_error / float(total_remote)
+            if error_ratio >= 0.6:
+                workers = max(3, workers - 2)
+            elif error_ratio >= 0.35:
+                workers = max(4, workers - 1)
+            elif remote_ok >= 24 and error_ratio <= 0.1:
+                workers = min(hardware_target, workers + 1)
+        return max(1, min(16, workers))
 
     @classmethod
     def _compute_public_token_prefetch_workers(
@@ -2543,10 +2922,24 @@ class NapCatMediaDownloader:
         base = max(2, min(4, cpu_count // 4 or 2))
         token_pressure = max(0, total_prefetchable - eager_remote_prefetchable)
         if token_pressure <= 24:
-            return min(base, 2)
-        if token_pressure <= 96:
-            return min(base, 3)
-        return min(base, 4)
+            workers = min(base, 2)
+        elif token_pressure <= 96:
+            workers = min(base, 3)
+        else:
+            workers = min(base, 4)
+        feedback = feedback or {}
+        token_payload = int(feedback.get("token_payload", 0))
+        token_resolved = int(feedback.get("token_resolved", 0))
+        token_remote_ok = int(feedback.get("token_remote_ok", 0))
+        token_remote_error = int(feedback.get("token_remote_error", 0))
+        if token_payload >= 8:
+            resolve_ratio = token_resolved / float(max(token_payload, 1))
+            remote_error_ratio = token_remote_error / float(max(token_remote_ok + token_remote_error, 1))
+            if resolve_ratio < 0.35 or remote_error_ratio >= 0.5:
+                workers = max(1, workers - 1)
+            elif resolve_ratio >= 0.75 and remote_error_ratio <= 0.15 and token_pressure > 24:
+                workers = min(base, workers + 1)
+        return max(1, min(8, workers))
 
     def _prefetch_feedback_snapshot(self) -> dict[str, int]:
         with self._prefetch_feedback_lock:
@@ -2555,6 +2948,55 @@ class NapCatMediaDownloader:
     def _record_prefetch_feedback(self, key: str) -> None:
         with self._prefetch_feedback_lock:
             self._prefetch_feedback[key] = self._prefetch_feedback.get(key, 0) + 1
+
+    def _remote_prefetch_state(
+        self,
+        cache_key: tuple[str, str],
+    ) -> tuple[str | None | object, Future[str | None] | None]:
+        with self._prefetch_state_lock:
+            return (
+                self._remote_media_resolution_cache.get(cache_key, ...),
+                self._remote_media_resolution_futures.get(cache_key),
+            )
+
+    def _store_remote_prefetch_result(
+        self,
+        cache_key: tuple[str, str],
+        value: str | None,
+    ) -> None:
+        with self._prefetch_state_lock:
+            self._remote_media_resolution_cache[cache_key] = value
+            self._remote_media_resolution_futures.pop(cache_key, None)
+
+    def _drop_remote_prefetch_result(self, cache_key: tuple[str, str]) -> None:
+        with self._prefetch_state_lock:
+            self._remote_media_resolution_cache.pop(cache_key, None)
+            self._remote_media_resolution_futures.pop(cache_key, None)
+
+    def _public_token_prefetch_state(
+        self,
+        cache_key: tuple[str, str, str, str],
+    ) -> tuple[dict[str, Any] | None | object, Future[dict[str, Any] | None] | None]:
+        with self._prefetch_state_lock:
+            return (
+                self._public_token_prefetch_cache.get(cache_key, ...),
+                self._public_token_prefetch_futures.get(cache_key),
+            )
+
+    def _store_public_token_prefetch_result(
+        self,
+        cache_key: tuple[str, str, str, str],
+        value: dict[str, Any] | None,
+    ) -> None:
+        with self._prefetch_state_lock:
+            self._public_token_prefetch_cache[cache_key] = value
+            self._public_token_prefetch_futures.pop(cache_key, None)
+
+    def _prefetch_has_inflight_work(self) -> bool:
+        with self._prefetch_state_lock:
+            return any(not future.done() for future in self._remote_media_resolution_futures.values()) or any(
+                not future.done() for future in self._public_token_prefetch_futures.values()
+            )
 
     def _download_remote_sticker(
         self,
@@ -2571,7 +3013,10 @@ class NapCatMediaDownloader:
         cache_root = self._remote_cache_dir / "remote_stickers"
         native_name = remote_file_name or file_name or "sticker.gif"
         role_folder = "dynamic" if asset_role == "dynamic" else "static"
-        native_path = cache_root / role_folder / native_name
+        native_path = cache_root / role_folder / self._remote_cache_file_name(
+            remote_url,
+            file_name=native_name,
+        )
         try:
             native_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -2585,17 +3030,70 @@ class NapCatMediaDownloader:
                 return None
         return str(native_path)
 
-    def _download_remote_payload(self, remote_url: str) -> bytes | None:
+    async def _download_remote_payload_async(self, remote_url: str) -> bytes | None:
         resolved_url = self._resolve_remote_url(remote_url)
         if not resolved_url:
             return None
+        client = self._remote_async_client
+        semaphore = self._remote_async_semaphore
+        if client is None or semaphore is None:
+            return None
         try:
-            response = self._remote_client.get(resolved_url)
-            response.raise_for_status()
+            async with semaphore:
+                response = await client.get(resolved_url)
+                response.raise_for_status()
         except httpx.HTTPError:
             return None
         payload = response.content
         return payload if payload else None
+
+    def _download_remote_payload(self, remote_url: str) -> bytes | None:
+        loop = self._remote_loop
+        if loop is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            self._download_remote_payload_async(remote_url),
+            loop,
+        )
+        try:
+            return future.result(timeout=self.REMOTE_MEDIA_FETCH_TIMEOUT_S + 2.0)
+        except Exception:
+            future.cancel()
+            return None
+
+    async def _download_remote_media_async(
+        self,
+        *,
+        asset_type: str,
+        file_name: str | None,
+        hint: dict[str, Any],
+    ) -> tuple[str | None, bool]:
+        remote_url = str(hint.get("url") or "").strip()
+        if not remote_url or self._remote_cache_dir is None:
+            return None, False
+
+        remote_name = self._remote_file_name(remote_url, file_name=file_name)
+        if not remote_name:
+            return None, False
+        cache_root = self._remote_cache_dir / "remote_media" / asset_type
+        target_path = cache_root / self._remote_cache_file_name(
+            remote_url,
+            file_name=remote_name,
+        )
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None, False
+
+        if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
+            return str(target_path), True
+
+        payload = await self._download_remote_payload_async(remote_url)
+        if payload is None:
+            return None, False
+        if not self._write_bytes(target_path, payload):
+            return None, False
+        return str(target_path), False
 
     def _download_remote_media(
         self,
@@ -2605,26 +3103,25 @@ class NapCatMediaDownloader:
         hint: dict[str, Any],
     ) -> str | None:
         remote_url = str(hint.get("url") or "").strip()
-        if not remote_url or self._remote_cache_dir is None:
+        resolved_remote_url = self._resolve_remote_url(remote_url)
+        if not resolved_remote_url:
             return None
-
-        remote_name = self._remote_file_name(remote_url, file_name=file_name)
-        if not remote_name:
+        cache_key = (asset_type, self._normalized_match_url(resolved_remote_url))
+        cached_resolution = self._consume_remote_media_prefetch(cache_key)
+        if cached_resolution is not ...:
+            return cached_resolution
+        future, _created = self._ensure_remote_media_future(
+            asset_type=asset_type,
+            file_name=file_name,
+            resolved_remote_url=resolved_remote_url,
+        )
+        if future is None:
             return None
-        cache_root = self._remote_cache_dir / "remote_media" / asset_type
-        target_path = cache_root / remote_name
         try:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
+            return future.result(timeout=self.REMOTE_MEDIA_FETCH_TIMEOUT_S + 2.0)
+        except Exception:
+            future.cancel()
             return None
-
-        if not target_path.exists() or not target_path.is_file() or target_path.stat().st_size <= 0:
-            payload = self._download_remote_payload(remote_url)
-            if payload is None:
-                return None
-            if not self._write_bytes(target_path, payload):
-                return None
-        return str(target_path)
 
     def _should_skip_old_bucket(self, old_bucket: tuple[str, str] | None) -> bool:
         if old_bucket is None:
@@ -2824,7 +3321,9 @@ class NapCatMediaDownloader:
 
     @staticmethod
     def _write_bytes(target_path: Path, payload: bytes) -> bool:
-        temp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+        temp_path = target_path.with_name(
+            f".{target_path.stem}.{build_timestamp_token(include_pid=True)}{target_path.suffix}.tmp"
+        )
         try:
             temp_path.write_bytes(payload)
             temp_path.replace(target_path)
@@ -2898,6 +3397,16 @@ class NapCatMediaDownloader:
         if remote_leaf:
             return remote_leaf
         return None
+
+    @staticmethod
+    def _remote_cache_file_name(remote_url: str, *, file_name: str | None) -> str:
+        raw_name = NapCatMediaDownloader._remote_file_name(remote_url, file_name=file_name) or "remote.bin"
+        path = Path(raw_name)
+        suffix = "".join(path.suffixes)
+        stem = path.name[: -len(suffix)] if suffix else path.name
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._") or "remote"
+        url_hash = hashlib.sha1(remote_url.encode("utf-8")).hexdigest()[:12]
+        return f"{safe_stem}_{url_hash}{suffix}"
 
     def _resolve_remote_url(self, remote_url: str) -> str | None:
         candidate = str(remote_url or "").strip()

@@ -4,10 +4,11 @@ import asyncio
 import os
 import shlex
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app_or_none
@@ -20,7 +21,6 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
-from qq_data_cli.completion import SlashCommandCompleter
 from qq_data_cli.completion_runtime import completion_application_is_noop
 from qq_data_cli.export_commands import (
     EXPORT_COMMAND_PROFILES,
@@ -33,14 +33,10 @@ from qq_data_cli.export_commands import (
 )
 from qq_data_cli.export_cleanup import cleanup_gateway_media_cache
 from qq_data_cli.export_input import (
-    ExportCommandLexer,
-    ExportDateDisplayProcessor,
     move_export_date_cursor,
     roll_export_date_token,
 )
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
-from qq_data_cli.qr import render_qr_text
-from qq_data_cli.startup_capture import get_latest_startup_capture_path
 from qq_data_cli.target_display import format_target_label, format_target_name, format_target_remark
 from qq_data_cli.terminal_compat import (
     TerminalProbe,
@@ -52,65 +48,44 @@ from qq_data_cli.terminal_compat import (
     render_terminal_doctor_lines,
     resolve_cli_ui_mode,
 )
-from qq_data_cli.watch_view import WatchConversationView
-from qq_data_core import (
-    apply_export_profile,
-    build_export_content_summary,
-    ChatExportService,
-    ExportForensicsCollector,
-    ExportPerfTraceWriter,
-    ExportRequest,
-    format_export_content_summary,
-    format_export_datetime,
-    is_explicit_datetime_literal,
-    resolve_strict_missing_policy,
-    trim_snapshot_to_last_messages,
-    WatchRequest,
-    build_default_output_path,
-)
-from qq_data_integrations import FixtureSnapshotLoader, discover_qq_media_roots
-from qq_data_integrations.napcat import (
-    ChatTarget,
-    collect_debug_preflight_evidence,
-    get_latest_napcat_launch_log_path,
-    NapCatBootstrapper,
-    NapCatGateway,
-    NapCatQrLoginService,
-    NapCatRuntimeStarter,
-    NapCatSettings,
-    NapCatTargetLookupError,
-    NapCatWebUiClient,
-    probe_settings_endpoints,
-)
+from qq_data_integrations.napcat.settings import NapCatSettings
+
+if TYPE_CHECKING:
+    from qq_data_cli.completion import SlashCommandCompleter
+    from qq_data_core import ChatExportService, ExportPerfTraceWriter
+    from qq_data_integrations.napcat.gateway import NapCatGateway
+    from qq_data_integrations.napcat.login import NapCatQrLoginService
+    from qq_data_integrations.napcat.models import ChatTarget
+    from qq_data_integrations.napcat.webui_client import NapCatWebUiClient
 
 
 class SlashRepl:
+    COMPLETION_PRIMED_TTL_S = 120.0
+    COMPLETION_PRIME_RETRY_COOLDOWN_S = 20.0
+
     def __init__(
         self,
         *,
         terminal_probe: TerminalProbe | None = None,
         ui_decision: TerminalUiDecision | None = None,
         startup_capture_path: Path | None = None,
+        defer_startup_capture: bool = False,
     ) -> None:
         self._console = Console()
-        self._service = ChatExportService()
-        self._fixture_loader = FixtureSnapshotLoader()
+        self._service: ChatExportService | None = None
+        self._fixture_loader = None
         self._settings = NapCatSettings.from_env()
         self._log_path = setup_cli_logging(self._settings.state_dir)
         self._logger = get_cli_logger("repl")
-        self._runtime_starter = NapCatRuntimeStarter(self._settings)
-        self._bootstrapper = NapCatBootstrapper(
-            self._settings,
-            runtime_starter=self._runtime_starter,
-            settings_loader=NapCatSettings.from_env,
-        )
+        self._runtime_starter = None
+        self._bootstrapper = None
         self._gateway: NapCatGateway | None = None
         self._webui_client: NapCatWebUiClient | None = None
         self._login_service: NapCatQrLoginService | None = None
         self._last_qr_url: str | None = None
-        self._completion_primed: set[str] = set()
-        self._completion_prime_failed: set[str] = set()
-        self._completer = SlashCommandCompleter(target_lookup=self._lookup_targets_for_completion)
+        self._completion_primed_at: dict[str, float] = {}
+        self._completion_prime_failed_at: dict[str, float] = {}
+        self._completer: SlashCommandCompleter | None = None
         self._session: PromptSession | None = None
         self._terminal_probe = terminal_probe or probe_terminal_environment()
         self._ui_decision = ui_decision or resolve_cli_ui_mode(
@@ -118,9 +93,17 @@ class SlashRepl:
             requested_mode=read_requested_cli_ui_mode(),
         )
         self._ui_profile = build_cli_ui_profile(self._ui_decision)
-        self._startup_capture_path = startup_capture_path or get_latest_startup_capture_path(self._settings.state_dir)
-        self._qq_media_roots = discover_qq_media_roots()
-        self._media_cache_dir = self._settings.state_dir / "media_index"
+        self._defer_startup_capture = defer_startup_capture
+        self._startup_capture_lock = threading.Lock()
+        self._startup_capture_thread: threading.Thread | None = None
+        if startup_capture_path is not None:
+            self._startup_capture_path = startup_capture_path
+        elif not defer_startup_capture:
+            from qq_data_cli.startup_capture import get_latest_startup_capture_path
+
+            self._startup_capture_path = get_latest_startup_capture_path(self._settings.state_dir)
+        else:
+            self._startup_capture_path = None
         self._logger.info(
             "repl_initialized state_dir=%s export_dir=%s workdir=%s log_path=%s startup_capture=%s ui_mode=%s ui_reason=%s",
             self._settings.state_dir,
@@ -133,6 +116,7 @@ class SlashRepl:
         )
 
     def run(self) -> None:
+        self._kickoff_startup_capture_if_needed()
         self._console.print("Slash REPL ready. 输入 /help 查看命令；常用有 /friends、/watch、/export。")
         ui_notice = render_cli_ui_mode_notice(self._ui_decision)
         if ui_notice:
@@ -242,12 +226,14 @@ class SlashRepl:
             if command == "/watch":
                 self._handle_watch(argv[1:])
                 return False
-        except NapCatTargetLookupError as exc:
-            self._console.print(str(exc))
-            if exc.matches:
-                self._print_targets(exc.matches, title="Closest Matches")
-            return False
         except Exception as exc:
+            if exc.__class__.__name__ == "NapCatTargetLookupError":
+                self._console.print(str(exc))
+                matches = getattr(exc, "matches", None)
+                if matches:
+                    self._print_targets(matches, title="Closest Matches")
+                return False
+            self._logger.exception("repl_command_failed command=%s raw=%s", command, raw)
             self._console.print(_friendly_command_failure(exc))
             return False
 
@@ -255,7 +241,11 @@ class SlashRepl:
         return False
 
     def _handle_login(self, argv: list[str]) -> None:
-        _, options = _parse_options(argv)
+        _, options = _parse_options(
+            argv,
+            allowed_options={"timeout", "poll", "refresh"},
+            command_name="/login",
+        )
         timeout_seconds = float(options.get("timeout") or 300)
         poll_interval = float(options.get("poll") or 3)
         refresh = bool(options.get("refresh"))
@@ -281,11 +271,21 @@ class SlashRepl:
             self._console.print(f"note: {exc}")
 
     def _handle_status(self) -> None:
+        from qq_data_cli.startup_capture import capture_startup_snapshot
+        from qq_data_integrations.napcat.runtime import get_latest_napcat_launch_log_path
+
         gateway = self._require_gateway()
         terminal_probe = probe_terminal_environment()
         ui_decision = resolve_cli_ui_mode(
             terminal_probe,
             requested_mode=read_requested_cli_ui_mode(),
+        )
+        self._startup_capture_path = capture_startup_snapshot(
+            self._settings,
+            terminal_probe=terminal_probe,
+            ui_decision=ui_decision,
+            force_refresh=True,
+            capture_profile="full",
         )
         lines = [
             f"http_url={self._settings.http_url}",
@@ -295,6 +295,7 @@ class SlashRepl:
             f"fast_history_url={self._settings.fast_history_url or ''}",
             f"use_system_proxy={self._settings.use_system_proxy}",
             f"auto_start_napcat={self._settings.auto_start_napcat}",
+            f"auto_configure_onebot={self._settings.auto_configure_onebot}",
             f"project_root={self._settings.project_root}",
             f"napcat_dir={self._settings.napcat_dir or ''}",
             f"napcat_launcher_path={self._settings.napcat_launcher_path or ''}",
@@ -333,8 +334,10 @@ class SlashRepl:
         self._console.print("\n".join(lines))
 
     def _handle_doctor(self) -> None:
+        from qq_data_integrations.napcat.diagnostics import probe_settings_endpoints
+
         self._handle_status()
-        launch_info = self._runtime_starter.describe_launch()
+        launch_info = self._require_runtime_starter().describe_launch()
         probes = probe_settings_endpoints(self._settings)
         table = Table(title="Endpoint Probes")
         table.add_column("Name")
@@ -371,19 +374,26 @@ class SlashRepl:
         self._console.print("\n".join(render_terminal_doctor_lines(probe, decision)))
 
     def _handle_fixture_export(self, argv: list[str]) -> None:
+        from qq_data_integrations import FixtureSnapshotLoader, discover_qq_media_roots
+        from qq_data_core import normalize_export_format
+
         if len(argv) < 3:
             raise ValueError("Usage: /fixture-export <fixture_json> <out_path> [jsonl|txt]")
         fixture_path = Path(argv[1])
         out_path = Path(argv[2])
-        fmt = argv[3].lower() if len(argv) > 3 else out_path.suffix.lstrip(".").lower() or "jsonl"
+        requested_fmt = argv[3].lower() if len(argv) > 3 else out_path.suffix.lstrip(".").lower() or "jsonl"
+        fmt = normalize_export_format(requested_fmt)
+        if self._fixture_loader is None:
+            self._fixture_loader = FixtureSnapshotLoader()
         snapshot = self._fixture_loader.load_export(fixture_path)
-        normalized = self._service.build_snapshot(snapshot)
-        bundle = self._service.write_bundle(
+        service = self._require_service()
+        normalized = service.build_snapshot(snapshot)
+        bundle = service.write_bundle(
             normalized,
             out_path,
             fmt=fmt,
-            media_search_roots=self._qq_media_roots,
-            media_cache_dir=self._media_cache_dir,
+            media_search_roots=discover_qq_media_roots(),
+            media_cache_dir=self._settings.state_dir / "media_index",
         )
         self._console.print(
             f"written: {bundle.data_path} "
@@ -392,7 +402,11 @@ class SlashRepl:
         )
 
     def _handle_list_targets(self, chat_type: str, argv: list[str]) -> None:
-        positionals, options = _parse_options(argv)
+        positionals, options = _parse_options(
+            argv,
+            allowed_options={"limit", "refresh"},
+            command_name=f"/{'groups' if chat_type == 'group' else 'friends'}",
+        )
         keyword = positionals[0] if positionals else None
         limit = _parse_int_option(options, "limit", default=8)
         refresh = bool(options.get("refresh"))
@@ -409,11 +423,22 @@ class SlashRepl:
             return
         title = "Groups" if chat_type == "group" else "Friends"
         self._print_targets(targets, title=title)
-        self._completion_primed.add(chat_type)
-        self._completion_prime_failed.discard(chat_type)
+        self._mark_completion_primed(chat_type)
 
     def _handle_export(self, command: str, argv: list[str]) -> None:
-        positionals, options = _parse_options(argv)
+        positionals, options = _parse_options(
+            argv,
+            allowed_options={
+                "format",
+                "out",
+                "limit",
+                "data-count",
+                "include-raw",
+                "refresh",
+                "strict-missing",
+            },
+            command_name=command,
+        )
         parsed = parse_root_export_command(command, positionals, options, default_limit=20)
 
         self._ensure_endpoint_ready("onebot_http")
@@ -429,7 +454,14 @@ class SlashRepl:
         self._run_single_export(parsed, target=target, batch_prefix=None)
 
     def _handle_watch(self, argv: list[str]) -> None:
-        positionals, options = _parse_options(argv)
+        from qq_data_cli.watch_view import WatchConversationView
+        from qq_data_core import WatchRequest
+
+        positionals, options = _parse_options(
+            argv,
+            allowed_options={"refresh", "limit"},
+            command_name="/watch",
+        )
         if len(positionals) < 2:
             raise ValueError("Usage: /watch group|friend <name-or-id> [--refresh] [--limit N]")
 
@@ -447,7 +479,7 @@ class SlashRepl:
         view = WatchConversationView(
             settings=self._settings,
             gateway=self._require_gateway(),
-            service=self._service,
+            service=self._require_service(),
             target=target,
             request=request,
             history_limit=history_limit,
@@ -477,9 +509,17 @@ class SlashRepl:
         self._logger.info("watch_closed reason=application_return chat_id=%s", target.chat_id)
 
     def _render_login_qr(self, qr_url: str) -> None:
+        from qq_data_cli.qr import build_login_qr_image_path, render_qr_text, write_qr_png
+
         if qr_url == self._last_qr_url:
             return
         self._last_qr_url = qr_url
+        qr_image_path = write_qr_png(
+            qr_url,
+            build_login_qr_image_path(self._settings.project_root),
+        )
+        self._console.print(f"qr_image_path={qr_image_path}")
+        self._console.print("请直接打开该图片扫码登录。")
         self._console.print(
             Panel.fit(
                 render_qr_text(qr_url),
@@ -524,6 +564,9 @@ class SlashRepl:
         self._console.print(table)
 
     def _resolve_target(self, chat_type: str, query: str, *, refresh: bool) -> ChatTarget:
+        from qq_data_integrations.napcat.directory import NapCatTargetLookupError
+        from qq_data_integrations.napcat.models import ChatTarget
+
         if query.isdigit():
             try:
                 return self._require_gateway().resolve_target(
@@ -584,7 +627,18 @@ class SlashRepl:
         batch_prefix: str | None,
         output_dir: Path | None = None,
     ) -> None:
+        from qq_data_core import (
+            apply_export_profile,
+            build_export_content_summary,
+            ExportForensicsCollector,
+            ExportPerfTraceWriter,
+            format_export_content_summary,
+            resolve_strict_missing_policy,
+            trim_snapshot_to_last_messages,
+        )
+
         gateway = self._require_gateway()
+        service = self._require_service()
         out_path = self._resolve_export_output_path(parsed, target=target, output_dir=output_dir)
         trace = ExportPerfTraceWriter(
             self._settings.state_dir,
@@ -628,7 +682,7 @@ class SlashRepl:
                 "state_dir": str(self._settings.state_dir),
                 "project_root": str(self._settings.project_root),
                 "napcat_dir": str(self._settings.napcat_dir) if self._settings.napcat_dir else None,
-                **collect_debug_preflight_evidence(self._settings),
+                **self._collect_debug_preflight_evidence(),
             }
         )
         trace.write_event(
@@ -649,10 +703,10 @@ class SlashRepl:
                 target=target,
                 progress_callback=progress_callback,
             )
-            normalized = self._service.build_snapshot(snapshot, include_raw=parsed.include_raw)
+            normalized = service.build_snapshot(snapshot, include_raw=parsed.include_raw)
             normalized = trim_snapshot_to_last_messages(normalized, data_count=parsed.data_count)
             normalized = apply_export_profile(normalized, parsed.profile)
-            bundle = self._service.write_bundle(
+            bundle = service.write_bundle(
                 normalized,
                 out_path,
                 fmt=parsed.fmt,
@@ -747,6 +801,8 @@ class SlashRepl:
         target: ChatTarget,
         output_dir: Path | None,
     ) -> Path:
+        from qq_data_core import build_default_output_path
+
         if output_dir is None and parsed.out_path is not None and not parsed.batch_target_queries:
             return parsed.out_path
         base_dir = (output_dir or self._settings.export_dir).resolve()
@@ -761,7 +817,7 @@ class SlashRepl:
     def _build_root_export_progress_callback(
         self,
         *,
-        trace: ExportPerfTraceWriter,
+        trace: "ExportPerfTraceWriter",
         prefix: str | None,
         display: "_RootExportProgressDisplay",
     ):
@@ -777,6 +833,10 @@ class SlashRepl:
         def callback(update: dict[str, object]) -> None:
             phase = str(update.get("phase") or "progress")
             trace.write_event(phase, update)
+            if phase == "download_assets":
+                download_text = self._format_root_export_download_progress(update, prefix=label_prefix)
+                display.update_download_progress(download_text or "")
+                return
             text = self._format_root_export_progress(update, prefix=label_prefix)
             if not text:
                 return
@@ -818,6 +878,8 @@ class SlashRepl:
         return callback
 
     def _format_root_export_progress(self, update: dict[str, object], *, prefix: str) -> str | None:
+        from qq_data_core import format_export_datetime
+
         phase = str(update.get("phase") or "")
         elapsed_s = float(update.get("elapsed_s") or 0.0)
         rate_suffix = f" rate={float(update.get('rate_per_s') or 0.0):.1f}/s elapsed={elapsed_s:.1f}s" if elapsed_s > 0 else ""
@@ -960,7 +1022,46 @@ class SlashRepl:
             return detail
         return None
 
+    def _format_root_export_download_progress(
+        self,
+        update: dict[str, object],
+        *,
+        prefix: str,
+    ) -> str | None:
+        stage = str(update.get("stage") or "progress")
+        total = int(update.get("candidate_total") or update.get("download_total") or 0)
+        completed = int(update.get("completed") or update.get("download_completed") or 0)
+        failed = int(update.get("failed") or update.get("download_failed") or 0)
+        inflight = int(update.get("active") or update.get("download_inflight") or 0)
+        queued = int(update.get("queued") or 0)
+        cached = int(update.get("cached") or update.get("download_cached") or 0)
+        eager = int(update.get("eager_remote_candidates") or 0)
+        token = int(update.get("public_token_candidates") or 0)
+        context = int(update.get("context_candidates") or 0)
+        last_asset_type = str(update.get("last_asset_type") or "").strip()
+        last_file_name = str(update.get("last_file_name") or "").strip()
+        last_status = str(update.get("last_status") or "").strip()
+        if stage == "done" and not total:
+            return ""
+        parts = [f"{prefix}remote_downloads(subqueue): {stage}"]
+        parts.append(f"candidates={total}")
+        parts.append(f"ok={completed}")
+        parts.append(f"cached={cached}")
+        parts.append(f"failed={failed}")
+        parts.append(f"queued={queued}")
+        parts.append(f"inflight={inflight}")
+        if stage == "start":
+            parts.append(f"sources=eager:{eager}/token:{token}/context:{context}")
+        if last_asset_type and last_status:
+            last_label = last_asset_type
+            if last_file_name:
+                last_label = f"{last_label}:{last_file_name}"
+            parts.append(f"last={last_status}@{last_label}")
+        return " ".join(parts)
+
     def _build_export_snapshot(self, parsed: ParsedExportCommand, *, target: ChatTarget, progress_callback=None):
+        from qq_data_core import ExportRequest, format_export_datetime
+
         history_page_size = max(100, parsed.limit, min(parsed.data_count or 0, 500))
         request = ExportRequest(
             chat_type=target.chat_type,
@@ -1044,9 +1145,72 @@ class SlashRepl:
         return gateway.list_targets(chat_type, keyword, limit=limit)
 
     def _require_gateway(self) -> NapCatGateway:
+        from qq_data_integrations.napcat.gateway import NapCatGateway
+
         if self._gateway is None:
             self._gateway = NapCatGateway(self._settings)
         return self._gateway
+
+    def _require_service(self) -> "ChatExportService":
+        from qq_data_core import ChatExportService
+
+        if self._service is None:
+            self._service = ChatExportService()
+        return self._service
+
+    def _require_runtime_starter(self):
+        from qq_data_integrations.napcat.runtime import NapCatRuntimeStarter
+
+        if self._runtime_starter is None:
+            self._runtime_starter = NapCatRuntimeStarter(self._settings)
+        return self._runtime_starter
+
+    def _require_bootstrapper(self):
+        from qq_data_integrations.napcat.bootstrap import NapCatBootstrapper
+
+        if self._bootstrapper is None:
+            self._bootstrapper = NapCatBootstrapper(
+                self._settings,
+                runtime_starter=self._require_runtime_starter(),
+                settings_loader=NapCatSettings.from_env,
+            )
+        return self._bootstrapper
+
+    def _kickoff_startup_capture_if_needed(self) -> None:
+        if not self._defer_startup_capture:
+            return
+        if self._startup_capture_path is not None:
+            return
+        if self._startup_capture_thread is not None and self._startup_capture_thread.is_alive():
+            return
+
+        settings = self._settings.model_copy(deep=True)
+        terminal_probe = self._terminal_probe
+        ui_decision = self._ui_decision
+
+        def _worker() -> None:
+            try:
+                from qq_data_cli.startup_capture import capture_startup_snapshot
+
+                path = capture_startup_snapshot(
+                    settings,
+                    terminal_probe=terminal_probe,
+                    ui_decision=ui_decision,
+                    capture_profile="startup",
+                )
+                with self._startup_capture_lock:
+                    self._startup_capture_path = path
+                if path is not None:
+                    self._logger.info("startup_capture_path=%s", path)
+            except Exception:
+                self._logger.exception("startup_capture_background_failed")
+
+        self._startup_capture_thread = threading.Thread(
+            target=_worker,
+            name="startup-capture",
+            daemon=True,
+        )
+        self._startup_capture_thread.start()
 
     def _refresh_settings(self) -> None:
         self._settings = NapCatSettings.from_env()
@@ -1056,12 +1220,8 @@ class SlashRepl:
             requested_mode=read_requested_cli_ui_mode(),
         )
         self._ui_profile = build_cli_ui_profile(self._ui_decision)
-        self._runtime_starter = NapCatRuntimeStarter(self._settings)
-        self._bootstrapper = NapCatBootstrapper(
-            self._settings,
-            runtime_starter=self._runtime_starter,
-            settings_loader=NapCatSettings.from_env,
-        )
+        self._runtime_starter = None
+        self._bootstrapper = None
         if self._gateway is not None:
             self._gateway.close()
             self._gateway = None
@@ -1069,11 +1229,11 @@ class SlashRepl:
             self._webui_client.close()
             self._webui_client = None
         self._login_service = None
-        self._completion_primed.clear()
-        self._completion_prime_failed.clear()
+        self._completion_primed_at.clear()
+        self._completion_prime_failed_at.clear()
 
     def _ensure_endpoint_ready(self, endpoint: str) -> None:
-        result = self._bootstrapper.ensure_endpoint(endpoint)
+        result = self._require_bootstrapper().ensure_endpoint(endpoint)
         if result.already_running:
             return
         if result.ready:
@@ -1084,9 +1244,17 @@ class SlashRepl:
         raise RuntimeError(result.message)
 
     def _prime_target_cache(self, chat_type: str, *, quiet: bool) -> None:
-        if chat_type in self._completion_primed:
+        if self._completion_cache_is_fresh(
+            self._completion_primed_at,
+            chat_type,
+            ttl_s=self.COMPLETION_PRIMED_TTL_S,
+        ):
             return
-        if quiet and chat_type in self._completion_prime_failed:
+        if quiet and self._completion_cache_is_fresh(
+            self._completion_prime_failed_at,
+            chat_type,
+            ttl_s=self.COMPLETION_PRIME_RETRY_COOLDOWN_S,
+        ):
             return
 
         gateway = self._require_gateway()
@@ -1098,18 +1266,38 @@ class SlashRepl:
             gateway.list_targets(chat_type, refresh=True, limit=32)
         except Exception:
             if has_cached_targets:
-                self._completion_primed.add(chat_type)
-                self._completion_prime_failed.discard(chat_type)
+                self._completion_prime_failed_at[chat_type] = monotonic()
                 return
-            self._completion_prime_failed.add(chat_type)
+            self._completion_prime_failed_at[chat_type] = monotonic()
             if not quiet:
                 raise
             return
 
-        self._completion_primed.add(chat_type)
-        self._completion_prime_failed.discard(chat_type)
+        self._mark_completion_primed(chat_type)
+
+    def _mark_completion_primed(self, chat_type: str) -> None:
+        self._completion_primed_at[chat_type] = monotonic()
+        self._completion_prime_failed_at.pop(chat_type, None)
+
+    @staticmethod
+    def _completion_cache_is_fresh(
+        cache: dict[str, float],
+        chat_type: str,
+        *,
+        ttl_s: float,
+    ) -> bool:
+        marked_at = cache.get(chat_type)
+        if marked_at is None:
+            return False
+        if monotonic() - marked_at <= ttl_s:
+            return True
+        cache.pop(chat_type, None)
+        return False
 
     def _require_login_service(self) -> NapCatQrLoginService:
+        from qq_data_integrations.napcat.login import NapCatQrLoginService
+        from qq_data_integrations.napcat.webui_client import NapCatWebUiClient
+
         if self._login_service is None:
             self._webui_client = NapCatWebUiClient(
                 self._settings.webui_url,
@@ -1120,8 +1308,13 @@ class SlashRepl:
         return self._login_service
 
     def _build_session(self) -> PromptSession:
+        from qq_data_cli.completion import SlashCommandCompleter
+        from qq_data_cli.export_input import ExportCommandLexer, ExportDateDisplayProcessor
+
         history_path = self._settings.state_dir / "cli_history.txt"
         history_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._completer is None:
+            self._completer = SlashCommandCompleter(target_lookup=self._lookup_targets_for_completion)
         session_kwargs: dict[str, Any] = {
             "completer": self._completer,
             "history": FileHistory(str(history_path)),
@@ -1139,6 +1332,11 @@ class SlashRepl:
             **session_kwargs,
         )
 
+    def _collect_debug_preflight_evidence(self) -> dict[str, Any]:
+        from qq_data_integrations.napcat.diagnostics import collect_debug_preflight_evidence
+
+        return collect_debug_preflight_evidence(self._settings)
+
 
 class _RootExportProgressDisplay:
     def __init__(self, console: Console, *, target_label: str, batch_prefix: str | None) -> None:
@@ -1147,6 +1345,7 @@ class _RootExportProgressDisplay:
         self._batch_prefix = batch_prefix or ""
         self._live: Live | None = None
         self._progress_line = "Preparing export..."
+        self._download_line = ""
 
     def start(self) -> None:
         if self._live is not None:
@@ -1168,24 +1367,40 @@ class _RootExportProgressDisplay:
             return
         self._live.update(self._renderable(), refresh=True)
 
+    def update_download_progress(self, text: str) -> None:
+        self._download_line = text
+        if self._live is None:
+            self.start()
+            return
+        self._live.update(self._renderable(), refresh=True)
+
     def stop(self) -> None:
         if self._live is None:
             return
         self._live.stop()
         self._live = None
+        self._download_line = ""
 
     def _renderable(self) -> Panel:
         header = self._target_label
         if self._batch_prefix:
             header = f"{self._batch_prefix} {header}"
+        lines = [header, self._progress_line]
+        if self._download_line:
+            lines.append(self._download_line)
         return Panel(
-            "\n".join([header, self._progress_line]),
+            "\n".join(lines),
             title="Export Progress",
             border_style="cyan",
         )
 
 
-def _parse_options(argv: list[str]) -> tuple[list[str], dict[str, Any]]:
+def _parse_options(
+    argv: list[str],
+    *,
+    allowed_options: set[str] | None = None,
+    command_name: str | None = None,
+) -> tuple[list[str], dict[str, Any]]:
     positionals: list[str] = []
     options: dict[str, Any] = {}
     index = 0
@@ -1197,6 +1412,13 @@ def _parse_options(argv: list[str]) -> tuple[list[str], dict[str, Any]]:
             continue
 
         key = token[2:]
+        option_name = key.split("=", 1)[0]
+        if allowed_options is not None and option_name not in allowed_options:
+            supported = ", ".join(f"--{name}" for name in sorted(allowed_options))
+            prefix = f"{command_name} " if command_name else ""
+            raise ValueError(
+                f"{prefix}不支持参数 --{option_name}。支持的参数：{supported or '无'}"
+            )
         if "=" in key:
             option_name, option_value = key.split("=", 1)
             options[option_name] = option_value
@@ -1551,6 +1773,8 @@ def _split_cli_tokens(text: str) -> list[str]:
 
 
 def _needs_same_token_export_followup(tokens: list[str], *, watch_mode: bool) -> bool:
+    from qq_data_core import is_explicit_datetime_literal
+
     if not tokens or tokens[0].casefold() not in EXPORT_COMMAND_PROFILES:
         return False
     if watch_mode:

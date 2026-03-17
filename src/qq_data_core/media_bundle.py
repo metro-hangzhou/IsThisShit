@@ -20,6 +20,7 @@ from .export_forensics import (
     ForensicsRecordResult,
 )
 from .models import ExportBundleResult, MaterializedAsset, NormalizedMessage, NormalizedSegment, NormalizedSnapshot
+from .paths import atomic_write_bytes, build_timestamp_token
 
 MATERIALIZE_SLOW_STEP_WARN_S = 5.0
 
@@ -60,6 +61,8 @@ def write_export_bundle(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     forensics_collector: ExportForensicsCollector | None = None,
 ) -> ExportBundleResult:
+    stage_token = build_timestamp_token(include_pid=True)
+    staged_data_path = data_path.with_name(f".{data_path.name}.{stage_token}.tmp")
     if progress_callback is not None:
         progress_callback(
             {
@@ -69,61 +72,77 @@ def write_export_bundle(
                 "target_path": str(data_path),
             }
         )
-    written_data_path = write_data(snapshot, data_path)
-    if progress_callback is not None:
-        progress_callback(
+    staged_assets_dir = data_path.parent / f".{data_path.stem}_assets.{stage_token}.tmp"
+    manifest_path = data_path.with_suffix(".manifest.json")
+    final_assets_dir = data_path.parent / f"{data_path.stem}_assets"
+    try:
+        written_data_path = write_data(snapshot, staged_data_path)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "write_data_file",
+                    "stage": "done",
+                    "record_count": len(snapshot.messages),
+                    "target_path": str(data_path),
+                    "staged_path": str(written_data_path),
+                }
+            )
+        assets = materialize_snapshot_media(
+            snapshot,
+            staged_assets_dir,
+            media_resolution_mode=media_resolution_mode,
+            media_search_roots=media_search_roots,
+            media_cache_dir=media_cache_dir,
+            media_download_callback=media_download_callback,
+            media_download_manager=media_download_manager,
+            progress_callback=progress_callback,
+            forensics_collector=forensics_collector,
+        )
+        summary = _summarize_assets(assets)
+        if data_path.exists():
+            data_path.unlink()
+        written_data_path.replace(data_path)
+        if final_assets_dir.exists():
+            shutil.rmtree(final_assets_dir)
+        if staged_assets_dir.exists():
+            shutil.move(str(staged_assets_dir), str(final_assets_dir))
+        _write_manifest_json(
+            manifest_path,
             {
-                "phase": "write_data_file",
-                "stage": "done",
-                "record_count": len(snapshot.messages),
-                "target_path": str(written_data_path),
-            }
-    )
-    assets_dir = written_data_path.parent / f"{written_data_path.stem}_assets"
-    manifest_path = written_data_path.with_suffix(".manifest.json")
-    assets = materialize_snapshot_media(
-        snapshot,
-        assets_dir,
-        media_resolution_mode=media_resolution_mode,
-        media_search_roots=media_search_roots,
-        media_cache_dir=media_cache_dir,
-        media_download_callback=media_download_callback,
-        media_download_manager=media_download_manager,
-        progress_callback=progress_callback,
-        forensics_collector=forensics_collector,
-    )
-    summary = _summarize_assets(assets)
-    _write_manifest_json(
-        manifest_path,
-        {
-        "schema_version": 1,
-        "chat_type": snapshot.chat_type,
-        "chat_id": snapshot.chat_id,
-        "chat_name": snapshot.chat_name,
-        "exported_at": snapshot.exported_at.isoformat(),
-        "record_count": len(snapshot.messages),
-        "metadata": snapshot.metadata,
-        "data_file": written_data_path.name,
-        "assets_dir": assets_dir.name,
-        "asset_summary": summary,
-        "missing_breakdown": _summarize_missing_breakdown(assets),
-        },
-        assets=assets,
-    )
-    return ExportBundleResult(
-        data_path=written_data_path,
-        manifest_path=manifest_path,
-        assets_dir=assets_dir,
-        record_count=len(snapshot.messages),
-        copied_asset_count=summary["copied"],
-        reused_asset_count=summary["reused"],
-        missing_asset_count=summary["missing"],
-        error_asset_count=summary["error"],
-        forensic_run_dir=forensics_collector.run_dir if forensics_collector is not None else None,
-        forensic_summary_path=forensics_collector.summary_path if forensics_collector is not None else None,
-        forensic_incident_count=forensics_collector.incident_count if forensics_collector is not None else 0,
-        assets=assets,
-    )
+            "schema_version": 1,
+            "chat_type": snapshot.chat_type,
+            "chat_id": snapshot.chat_id,
+            "chat_name": snapshot.chat_name,
+            "exported_at": snapshot.exported_at.isoformat(),
+            "record_count": len(snapshot.messages),
+            "metadata": snapshot.metadata,
+            "data_file": data_path.name,
+            "assets_dir": final_assets_dir.name,
+            "asset_summary": summary,
+            "missing_breakdown": _summarize_missing_breakdown(assets),
+            },
+            assets=assets,
+        )
+        return ExportBundleResult(
+            data_path=data_path,
+            manifest_path=manifest_path,
+            assets_dir=final_assets_dir,
+            record_count=len(snapshot.messages),
+            copied_asset_count=summary["copied"],
+            reused_asset_count=summary["reused"],
+            missing_asset_count=summary["missing"],
+            error_asset_count=summary["error"],
+            forensic_run_dir=forensics_collector.run_dir if forensics_collector is not None else None,
+            forensic_summary_path=forensics_collector.summary_path if forensics_collector is not None else None,
+            forensic_incident_count=forensics_collector.incident_count if forensics_collector is not None else 0,
+            assets=assets,
+        )
+    finally:
+        with suppress(OSError):
+            staged_data_path.unlink(missing_ok=True)
+        if staged_assets_dir.exists():
+            with suppress(OSError):
+                shutil.rmtree(staged_assets_dir)
 
 
 def materialize_snapshot_media(
@@ -143,6 +162,18 @@ def materialize_snapshot_media(
     for message in snapshot.messages:
         for candidate in _iter_asset_candidates(message):
             candidate_entries.append((message, candidate))
+    download_requests = [
+        {
+            "asset_type": candidate.asset_type,
+            "asset_role": candidate.asset_role,
+            "file_name": candidate.file_name,
+            "source_path": candidate.source_path,
+            "md5": candidate.md5,
+            "timestamp_ms": candidate.timestamp_ms,
+            "download_hint": candidate.download_hint,
+        }
+        for _message, candidate in candidate_entries
+    ]
     search_context: _MediaSearchContext | None = None
     if media_resolution_mode != "napcat_only":
         candidates = [candidate for _message, candidate in candidate_entries]
@@ -154,7 +185,13 @@ def materialize_snapshot_media(
             media_cache_dir=media_cache_dir,
         )
     if media_resolution_mode == "napcat_only" and media_download_manager is not None:
-        request_count = len(candidate_entries)
+        request_count = len(download_requests)
+        if progress_callback is not None:
+            _emit_download_queue_progress(
+                progress_callback,
+                stage="start",
+                snapshot=media_download_manager.begin_export_download_tracking(download_requests),
+            )
         if progress_callback is not None:
             progress_callback(
                 {
@@ -165,30 +202,13 @@ def materialize_snapshot_media(
             )
         started_prefetch = monotonic()
         try:
-            chunk_size = max(
-                1,
-                int(getattr(media_download_manager, "PREFETCH_BATCH_SIZE", 200) or 200),
-            )
-            for start in range(0, request_count, chunk_size):
-                chunk_requests = [
-                    {
-                        "asset_type": candidate.asset_type,
-                        "asset_role": candidate.asset_role,
-                        "file_name": candidate.file_name,
-                        "source_path": candidate.source_path,
-                        "md5": candidate.md5,
-                        "timestamp_ms": candidate.timestamp_ms,
-                        "download_hint": candidate.download_hint,
-                    }
-                    for _message, candidate in candidate_entries[start : start + chunk_size]
-                ]
-                if progress_callback is None:
-                    media_download_manager.prepare_for_export(chunk_requests)
-                else:
-                    media_download_manager.prepare_for_export(
-                        chunk_requests,
-                        progress_callback=progress_callback,
-                    )
+            if progress_callback is None:
+                media_download_manager.prepare_for_export(download_requests)
+            else:
+                media_download_manager.prepare_for_export(
+                    download_requests,
+                    progress_callback=progress_callback,
+                )
         except Exception as exc:
             if progress_callback is not None:
                 progress_callback(
@@ -220,6 +240,7 @@ def materialize_snapshot_media(
     missing_count = 0
     error_count = 0
     total_candidates = len(candidate_entries)
+    last_download_signature: tuple[Any, ...] | None = None
 
     for message, candidate in candidate_entries:
         current_index = len(assets) + 1
@@ -367,6 +388,16 @@ def materialize_snapshot_media(
                 resolver=asset.resolver,
                 step_elapsed_s=step_elapsed_s,
             )
+            if media_download_manager is not None:
+                snapshot = media_download_manager.export_download_progress_snapshot()
+                signature = tuple(sorted(snapshot.items()))
+                if signature != last_download_signature:
+                    _emit_download_queue_progress(
+                        progress_callback,
+                        stage="progress",
+                        snapshot=snapshot,
+                    )
+                    last_download_signature = signature
             continue
 
         dedupe_key = str(resolved_path).lower()
@@ -400,6 +431,16 @@ def materialize_snapshot_media(
                 resolver=asset.resolver,
                 step_elapsed_s=step_elapsed_s,
             )
+            if media_download_manager is not None:
+                snapshot = media_download_manager.export_download_progress_snapshot()
+                signature = tuple(sorted(snapshot.items()))
+                if signature != last_download_signature:
+                    _emit_download_queue_progress(
+                        progress_callback,
+                        stage="progress",
+                        snapshot=snapshot,
+                    )
+                    last_download_signature = signature
             continue
 
         rel_path = _allocate_export_rel_path(
@@ -443,6 +484,16 @@ def materialize_snapshot_media(
                 resolver=asset.resolver,
                 step_elapsed_s=step_elapsed_s,
             )
+            if media_download_manager is not None:
+                snapshot = media_download_manager.export_download_progress_snapshot()
+                signature = tuple(sorted(snapshot.items()))
+                if signature != last_download_signature:
+                    _emit_download_queue_progress(
+                        progress_callback,
+                        stage="progress",
+                        snapshot=snapshot,
+                    )
+                    last_download_signature = signature
             continue
 
         asset.status = "copied"
@@ -476,6 +527,16 @@ def materialize_snapshot_media(
             resolver=asset.resolver,
             step_elapsed_s=step_elapsed_s,
         )
+        if media_download_manager is not None:
+            snapshot = media_download_manager.export_download_progress_snapshot()
+            signature = tuple(sorted(snapshot.items()))
+            if signature != last_download_signature:
+                _emit_download_queue_progress(
+                    progress_callback,
+                    stage="progress",
+                    snapshot=snapshot,
+                )
+                last_download_signature = signature
 
     if second_pass_candidates:
         if progress_callback is not None:
@@ -547,6 +608,12 @@ def materialize_snapshot_media(
                 }
             )
 
+    if media_download_manager is not None:
+        _emit_download_queue_progress(
+            progress_callback,
+            stage="done",
+            snapshot=media_download_manager.settle_export_download_progress(),
+        )
     return assets
 
 
@@ -698,6 +765,33 @@ def _emit_materialization_progress(
         payload["step_elapsed_ms"] = int(round(step_elapsed_s * 1000))
         if step_elapsed_s >= MATERIALIZE_SLOW_STEP_WARN_S:
             payload["slow_step"] = True
+    progress_callback(payload)
+
+
+def _emit_download_queue_progress(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    stage: str,
+    snapshot: dict[str, Any],
+) -> None:
+    if progress_callback is None:
+        return
+    payload = {
+        "phase": "download_assets",
+        "stage": stage,
+        "candidate_total": int(snapshot.get("candidate_total") or 0),
+        "eager_remote_candidates": int(snapshot.get("eager_remote_candidates") or 0),
+        "public_token_candidates": int(snapshot.get("public_token_candidates") or 0),
+        "context_candidates": int(snapshot.get("context_candidates") or 0),
+        "queued": int(snapshot.get("queued") or 0),
+        "active": int(snapshot.get("active") or 0),
+        "completed": int(snapshot.get("completed") or 0),
+        "failed": int(snapshot.get("failed") or 0),
+        "cached": int(snapshot.get("cached") or 0),
+        "last_asset_type": snapshot.get("last_asset_type"),
+        "last_file_name": snapshot.get("last_file_name"),
+        "last_status": snapshot.get("last_status"),
+    }
     progress_callback(payload)
 
 
@@ -1803,7 +1897,7 @@ def _write_legacy_md5_cache(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "files": rows,
     }
-    cache_path.write_bytes(orjson.dumps(payload))
+    atomic_write_bytes(cache_path, orjson.dumps(payload))
 
 
 def _legacy_md5_cache_path(directory: Path, *, cache_dir: Path) -> Path:

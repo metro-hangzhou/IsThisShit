@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 
 from ..models import EXPORT_TIMEZONE, NormalizedMessage, NormalizedSnapshot
+from ..paths import build_timestamp_token
 
 
 def _format_dt(value: datetime) -> str:
@@ -69,6 +71,10 @@ def _resource_lines(message: NormalizedMessage) -> list[str]:
 
 
 def render_txt(snapshot: NormalizedSnapshot) -> str:
+    return "".join(_iter_txt_chunks(snapshot))
+
+
+def _iter_txt_chunks(snapshot: NormalizedSnapshot):
     lines: list[str] = [
         "[QQ Data Exporter / NapCatQQ]",
         "",
@@ -90,27 +96,36 @@ def render_txt(snapshot: NormalizedSnapshot) -> str:
         lines.append("时间范围: -")
     lines.append("")
 
+    yield "\n".join(lines).strip() + "\n"
+
     for message in snapshot.messages:
-        lines.extend(
-            [
-                "",
-                f"{message.sender_name or message.sender_id}:",
-                f"发送者ID: {message.sender_id}",
-                f"时间: {_format_dt(datetime.fromisoformat(message.timestamp_iso))}",
-                f"内容: {_display_content(message)}",
-            ]
-        )
+        message_lines = [
+            "",
+            f"{message.sender_name or message.sender_id}:",
+            f"发送者ID: {message.sender_id}",
+            f"时间: {_format_dt(datetime.fromisoformat(message.timestamp_iso))}",
+            f"内容: {_display_content(message)}",
+        ]
         resource_lines = _resource_lines(message)
         if resource_lines:
-            lines.append(f"资源: {len(resource_lines)} 个文件")
-            lines.extend(resource_lines)
+            message_lines.append(f"资源: {len(resource_lines)} 个文件")
+            message_lines.extend(resource_lines)
         if message.reply_to:
-            lines.append(f"回复:  - {message.reply_to.preview_text or '原消息'}")
-
-    return "\n".join(lines).strip() + "\n"
+            message_lines.append(f"回复:  - {message.reply_to.preview_text or '原消息'}")
+        yield "\n".join(message_lines) + "\n"
 
 
 def write_txt(snapshot: NormalizedSnapshot, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(render_txt(snapshot), encoding="utf-8")
-    return output_path
+    temp_path = output_path.with_name(
+        f".{output_path.stem}.{build_timestamp_token(include_pid=True)}{output_path.suffix}.tmp"
+    )
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="") as handle:
+            for chunk in _iter_txt_chunks(snapshot):
+                handle.write(chunk)
+        temp_path.replace(output_path)
+        return output_path
+    finally:
+        with suppress(OSError):
+            temp_path.unlink()

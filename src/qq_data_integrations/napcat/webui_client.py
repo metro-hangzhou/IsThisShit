@@ -22,6 +22,14 @@ class NapCatWebUiConnectError(NapCatWebUiError):
     pass
 
 
+class NapCatWebUiTimeoutError(NapCatWebUiError):
+    pass
+
+
+class NapCatWebUiResponseError(NapCatWebUiError):
+    pass
+
+
 class NapCatWebUiClient:
     def __init__(
         self,
@@ -142,8 +150,22 @@ class NapCatWebUiClient:
         return data
 
     def _extract_data(self, response: httpx.Response) -> Any:
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise NapCatWebUiResponseError(
+                f"NapCat WebUI returned HTTP {response.status_code}."
+            ) from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise NapCatWebUiResponseError(
+                "NapCat WebUI returned non-JSON response."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise NapCatWebUiResponseError(
+                "NapCat WebUI returned unexpected JSON payload."
+            )
         if payload.get("code") != 0:
             message = payload.get("message") or "NapCat WebUI request failed"
             if message == "Unauthorized":
@@ -160,6 +182,10 @@ class NapCatWebUiClient:
                 f"{self._base_url}. No service is listening there. "
                 "Start or enable NapCat for your QQNT, or set NAPCAT_WEBUI_URL / NAPCAT_WORKDIR "
                 "to the actual runtime."
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise NapCatWebUiTimeoutError(
+                f"NapCat WebUI timed out waiting for {path} at {self._base_url}"
             ) from exc
 
 
