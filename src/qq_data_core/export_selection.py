@@ -417,10 +417,7 @@ def _build_missing_retry_plan(
             f"{profile_command} {chat_type_token} {snapshot.chat_id} "
             f"{start_token} {end_token}{fmt_marker}{strict_suffix}"
         ).strip()
-        cli_command = (
-            f"python app.py export-history {chat_type_token} {snapshot.chat_id} "
-            f"{start_token} {end_token} --format {str(fmt).strip().lower() or 'jsonl'}{strict_suffix}"
-        ).strip()
+        cli_command = f"run_targeted_missing_retest.bat --only-cluster {len(result_clusters) + 1}".strip()
         result_clusters.append(
             {
                 "start_token": start_token,
