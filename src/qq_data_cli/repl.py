@@ -262,6 +262,9 @@ class SlashRepl:
         )
         self._console.print("QQ login succeeded.")
         self._print_login_info(info)
+        # QQ 登录成功后，NapCat 可能刚刚生成了账号绑定的 onebot11_<uin>.json。
+        # 这里立即刷新 settings，避免后续 endpoint/补全预热仍拿着登录前的旧配置视图。
+        self._refresh_settings()
         try:
             self._ensure_endpoint_ready("onebot_http")
             self._ensure_endpoint_ready("onebot_ws")
