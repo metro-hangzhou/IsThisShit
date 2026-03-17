@@ -85,7 +85,7 @@ start_napcat_logged.bat
 首次拉取推荐直接指定 `main` 分支：
 
 ```powershell
-git clone -b main https://github.com/SH7ship24in2022/IsThisShit.git
+git clone -b main https://github.com/metro-hangzhou/IsThisShit.git
 ```
 
 如果你已经 clone 过仓库，但当前不在 `main` 分支：
@@ -246,7 +246,7 @@ py -3.13 -m venv .venv
 For a fresh clone, use the `main` branch directly:
 
 ```powershell
-git clone -b main https://github.com/SH7ship24in2022/IsThisShit.git
+git clone -b main https://github.com/metro-hangzhou/IsThisShit.git
 ```
 
 If the repository already exists locally but is not on `main`:
