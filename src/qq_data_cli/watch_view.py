@@ -976,7 +976,13 @@ class WatchConversationView:
                 logger=self._logger,
             )
             cleanup_done = True
-            content_summary = build_export_content_summary(normalized, bundle, profile=parsed.profile)
+            content_summary = build_export_content_summary(
+                normalized,
+                bundle,
+                profile=parsed.profile,
+                fmt=parsed.fmt,
+                strict_missing=parsed.strict_missing,
+            )
             return bundle, len(normalized.messages), content_summary, cleanup_stats
         finally:
             if not cleanup_done:

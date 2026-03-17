@@ -732,7 +732,13 @@ class SlashRepl:
                 forensics_collector=forensics,
             )
             cleanup_stats = cleanup_gateway_media_cache(gateway, trace=trace, logger=self._logger)
-            content_summary = build_export_content_summary(normalized, bundle, profile=parsed.profile)
+            content_summary = build_export_content_summary(
+                normalized,
+                bundle,
+                profile=parsed.profile,
+                fmt=parsed.fmt,
+                strict_missing=parsed.strict_missing,
+            )
             summary = trace.build_summary(record_count=len(normalized.messages))
             trace.write_event(
                 "export_complete",

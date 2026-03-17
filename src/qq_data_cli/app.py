@@ -271,6 +271,7 @@ def export_history(
         ExportRequest,
         build_default_output_path,
         build_export_content_summary,
+        format_missing_retry_hints_compact,
         format_missing_breakdown_compact,
         normalize_export_format,
         resolve_strict_missing_policy,
@@ -406,7 +407,13 @@ def export_history(
             forensics_collector=forensics,
         )
         cleanup_stats = cleanup_gateway_media_cache(gateway, trace=trace, logger=logger)
-        content_summary = build_export_content_summary(normalized, bundle, profile="all")
+        content_summary = build_export_content_summary(
+            normalized,
+            bundle,
+            profile="all",
+            fmt=normalized_fmt,
+            strict_missing=strict_missing,
+        )
         summary = trace.build_summary(record_count=len(normalized.messages))
         trace.write_event(
             "export_complete",
@@ -449,6 +456,8 @@ def export_history(
             ),
             err=True,
         )
+        for retry_hint in format_missing_retry_hints_compact(content_summary, shell="cli"):
+            typer.echo(retry_hint, err=True)
         if int(getattr(bundle, "forensic_incident_count", 0) or 0):
             typer.echo(
                 f"forensics: incidents={getattr(bundle, 'forensic_incident_count', 0)} "

@@ -17,6 +17,7 @@ from .export_selection import (
     format_export_content_summary_compact,
     format_export_content_summary,
     format_missing_breakdown_compact,
+    format_missing_retry_hints_compact,
     format_watch_export_result_summary,
     trim_snapshot_to_last_messages,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "format_export_content_summary_compact",
     "format_export_content_summary",
     "format_missing_breakdown_compact",
+    "format_missing_retry_hints_compact",
     "format_watch_export_result_summary",
     "render_debug_content",
     "render_watch_line",

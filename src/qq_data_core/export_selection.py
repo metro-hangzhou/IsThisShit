@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections import Counter
 from copy import deepcopy
+from datetime import datetime, timedelta
 from typing import Literal
 
 from .models import ExportBundleResult, NormalizedMessage, NormalizedSegment, NormalizedSnapshot
+from .time_expr import format_export_datetime
 
 ExportProfile = Literal["all", "only_text", "text_image", "text_image_emoji"]
 
@@ -39,6 +41,17 @@ PROFILE_SEGMENT_TYPES: dict[ExportProfile, set[str] | None] = {
     "text_image": {"text", "system", "share", "forward", "image"},
     "text_image_emoji": {"text", "system", "share", "forward", "image", "emoji", "sticker"},
 }
+
+PROFILE_COMMANDS: dict[ExportProfile, str] = {
+    "all": "/export",
+    "only_text": "/export_onlyText",
+    "text_image": "/export_TextImage",
+    "text_image_emoji": "/export_TextImageEmoji",
+}
+
+MISSING_RETRY_CLUSTER_GAP = timedelta(minutes=10)
+MISSING_RETRY_WINDOW_PADDING = timedelta(seconds=15)
+MAX_MISSING_RETRY_HINTS = 6
 
 
 def _count_segments_in_messages(messages: list[NormalizedMessage]) -> Counter[str]:
@@ -116,6 +129,8 @@ def build_export_content_summary(
     bundle: ExportBundleResult,
     *,
     profile: ExportProfile,
+    fmt: str = "jsonl",
+    strict_missing: str | None = None,
 ) -> dict[str, object]:
     segment_counts = Counter()
     source_segment_counts = _coerce_segment_counts(snapshot.metadata.get("source_segment_counts"))
@@ -157,11 +172,15 @@ def build_export_content_summary(
 
     return {
         "profile": profile,
+        "chat_type": snapshot.chat_type,
+        "chat_id": snapshot.chat_id,
         "message_count": len(snapshot.messages),
         "source_message_count": int(snapshot.metadata.get("source_message_count") or len(snapshot.messages)),
         "requested_data_count": snapshot.metadata.get("requested_data_count"),
         "oldest_timestamp_iso": oldest_timestamp_iso,
         "latest_timestamp_iso": latest_timestamp_iso,
+        "format": fmt,
+        "strict_missing": strict_missing,
         "segment_counts": {key: int(segment_counts[key]) for key in CONTENT_SEGMENT_ORDER},
         "source_segment_counts": {
             key: int(source_segment_counts[key]) for key in CONTENT_SEGMENT_ORDER
@@ -171,6 +190,13 @@ def build_export_content_summary(
         "missing_assets": {key: int(missing_assets[key]) for key in ASSET_TYPE_ORDER},
         "error_assets": {key: int(error_assets[key]) for key in ASSET_TYPE_ORDER},
         "missing_breakdown": dict(sorted((str(key), int(value)) for key, value in missing_breakdown.items())),
+        "missing_retry_plan": _build_missing_retry_plan(
+            snapshot=snapshot,
+            bundle=bundle,
+            profile=profile,
+            fmt=fmt,
+            strict_missing=str(strict_missing or "").strip() or None,
+        ),
     }
 
 
@@ -230,6 +256,22 @@ def format_export_content_summary(summary: dict[str, object]) -> list[str]:
             )
             + "]"
         )
+    retry_plan = summary.get("missing_retry_plan") or {}
+    clusters = retry_plan.get("clusters") if isinstance(retry_plan, dict) else None
+    if isinstance(clusters, list) and clusters:
+        lines.append("  missing_retry_hint=可只重试下列 missing 资产时间窗：")
+        for index, cluster in enumerate(clusters, start=1):
+            if not isinstance(cluster, dict):
+                continue
+            lines.append(
+                "    "
+                + f"[{index}] assets={int(cluster.get('asset_count') or 0)} "
+                + f"messages={int(cluster.get('message_count') or 0)} "
+                + f"window={cluster.get('start_token')} -> {cluster.get('end_token')}"
+            )
+            repl_command = str(cluster.get("repl_command") or "").strip()
+            if repl_command:
+                lines.append(f"        repl={repl_command}")
     return lines
 
 
@@ -241,6 +283,28 @@ def format_missing_breakdown_compact(summary: dict[str, object]) -> str:
         f"{key}:{int(value)}"
         for key, value in missing_breakdown.items()
     )
+
+
+def format_missing_retry_hints_compact(summary: dict[str, object], *, shell: Literal["repl", "cli"]) -> list[str]:
+    retry_plan = summary.get("missing_retry_plan") or {}
+    if not isinstance(retry_plan, dict):
+        return []
+    clusters = retry_plan.get("clusters")
+    if not isinstance(clusters, list):
+        return []
+    key = "repl_command" if shell == "repl" else "cli_command"
+    lines: list[str] = []
+    for index, cluster in enumerate(clusters, start=1):
+        if not isinstance(cluster, dict):
+            continue
+        command = str(cluster.get(key) or "").strip()
+        if not command:
+            continue
+        lines.append(
+            f"retry_hint[{index}] assets={int(cluster.get('asset_count') or 0)} "
+            f"messages={int(cluster.get('message_count') or 0)} cmd={command}"
+        )
+    return lines
 
 
 def format_export_content_summary_compact(summary: dict[str, object]) -> str:
@@ -295,6 +359,87 @@ def format_watch_export_result_summary(summary: dict[str, object]) -> str:
         f"final_miss={missing_total} "
         f"expired_occurrences={expired_total}"
     )
+
+
+def _build_missing_retry_plan(
+    *,
+    snapshot: NormalizedSnapshot,
+    bundle: ExportBundleResult,
+    profile: ExportProfile,
+    fmt: str,
+    strict_missing: str | None,
+) -> dict[str, object] | None:
+    missing_assets = [asset for asset in bundle.assets if asset.status == "missing" and asset.timestamp_iso]
+    if not missing_assets:
+        return None
+
+    clustered_assets = sorted(
+        missing_assets,
+        key=lambda asset: (asset.timestamp_iso, asset.message_id or "", asset.file_name or ""),
+    )
+    clusters: list[list] = []
+    current_cluster: list = []
+    previous_dt: datetime | None = None
+    for asset in clustered_assets:
+        try:
+            current_dt = datetime.fromisoformat(asset.timestamp_iso)
+        except ValueError:
+            continue
+        if not current_cluster or previous_dt is None or current_dt - previous_dt <= MISSING_RETRY_CLUSTER_GAP:
+            current_cluster.append((asset, current_dt))
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [(asset, current_dt)]
+        previous_dt = current_dt
+    if current_cluster:
+        clusters.append(current_cluster)
+
+    if not clusters:
+        return None
+
+    chat_type_token = "group" if snapshot.chat_type == "group" else "friend"
+    profile_command = PROFILE_COMMANDS.get(profile, "/export")
+    fmt_marker = " asTXT" if str(fmt).strip().lower() == "txt" else ""
+    strict_suffix = f" --strict-missing {strict_missing}" if strict_missing else ""
+
+    result_clusters: list[dict[str, object]] = []
+    for cluster in clusters[:MAX_MISSING_RETRY_HINTS]:
+        assets = [asset for asset, _dt in cluster]
+        datetimes = [dt for _asset, dt in cluster]
+        start_dt = min(datetimes) - MISSING_RETRY_WINDOW_PADDING
+        end_dt = max(datetimes) + MISSING_RETRY_WINDOW_PADDING
+        start_token = format_export_datetime(start_dt)
+        end_token = format_export_datetime(end_dt)
+        message_ids = {asset.message_id for asset in assets if asset.message_id}
+        asset_types = Counter(asset.asset_type for asset in assets if asset.asset_type)
+        missing_kinds = Counter(asset.missing_kind or asset.resolver or "missing" for asset in assets)
+        repl_command = (
+            f"{profile_command} {chat_type_token} {snapshot.chat_id} "
+            f"{start_token} {end_token}{fmt_marker}{strict_suffix}"
+        ).strip()
+        cli_command = (
+            f"python app.py export-history {chat_type_token} {snapshot.chat_id} "
+            f"{start_token} {end_token} --format {str(fmt).strip().lower() or 'jsonl'}{strict_suffix}"
+        ).strip()
+        result_clusters.append(
+            {
+                "start_token": start_token,
+                "end_token": end_token,
+                "asset_count": len(assets),
+                "message_count": len(message_ids),
+                "asset_types": dict(sorted((str(key), int(value)) for key, value in asset_types.items())),
+                "missing_kinds": dict(sorted((str(key), int(value)) for key, value in missing_kinds.items())),
+                "repl_command": repl_command,
+                "cli_command": cli_command,
+            }
+        )
+
+    return {
+        "cluster_gap_seconds": int(MISSING_RETRY_CLUSTER_GAP.total_seconds()),
+        "padding_seconds": int(MISSING_RETRY_WINDOW_PADDING.total_seconds()),
+        "cluster_count": len(result_clusters),
+        "clusters": result_clusters,
+    }
 
 
 def _rebuild_message(message: NormalizedMessage, segments: list[NormalizedSegment]) -> NormalizedMessage | None:
