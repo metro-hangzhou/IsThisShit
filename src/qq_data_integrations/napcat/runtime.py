@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import time
-from datetime import datetime
+from contextlib import suppress
 from pathlib import Path
 from collections.abc import Callable
 from typing import Literal
 
 from pydantic import BaseModel
 
+from qq_data_core.paths import atomic_write_text, build_timestamp_token
+
 from .diagnostics import probe_endpoint
 from .settings import NapCatSettings
 
 
 EndpointName = Literal["webui", "onebot_http", "onebot_ws"]
+_MAX_LAUNCH_WRAPPERS = 8
 
 
 class NapCatLaunchInfo(BaseModel):
@@ -80,8 +84,9 @@ class NapCatRuntimeStarter:
         poll_interval: float = 0.5,
     ) -> NapCatStartResult:
         url = _endpoint_url(self._settings, endpoint)
-        current = probe_endpoint(endpoint, url)
+        current = _probe_configured_endpoint(self._settings, endpoint)
         if current.listening:
+            _pin_runtime_environment(self._settings)
             return NapCatStartResult(
                 endpoint=endpoint,
                 already_running=True,
@@ -89,13 +94,49 @@ class NapCatRuntimeStarter:
                 launcher_path=self._settings.napcat_launcher_path,
                 message=f"{endpoint} already listening at {url}",
             )
+        if current.transport_listening and not current.protocol_identified:
+            warmed_probe = self._retry_protocol_identification(
+                endpoint,
+                timeout_seconds=timeout_seconds,
+                poll_interval=poll_interval,
+            )
+            if warmed_probe:
+                _pin_runtime_environment(self._settings)
+                return NapCatStartResult(
+                    endpoint=endpoint,
+                    launcher_path=self._settings.napcat_launcher_path,
+                    ready=warmed_probe.listening,
+                    message=(
+                        f"{endpoint} port at {url} is already occupied; NapCat identified after a short warm-up. "
+                        f"detail={warmed_probe.detail or 'protocol signature matched'}"
+                    ),
+                )
+            return NapCatStartResult(
+                endpoint=endpoint,
+                launcher_path=self._settings.napcat_launcher_path,
+                message=(
+                    f"{endpoint} port is already occupied at {url}, but the service does not look like NapCat. "
+                    f"detail={current.detail or 'unknown'} "
+                    "Observed the port briefly but the protocol signature never matched."
+                ),
+            )
+        if current.protocol_identified:
+            return NapCatStartResult(
+                endpoint=endpoint,
+                launcher_path=self._settings.napcat_launcher_path,
+                message=(
+                    f"{endpoint} is responding at {url}, but it is not ready for the current CLI settings. "
+                    f"detail={current.detail or 'protocol check failed'}"
+                ),
+            )
 
         if endpoint != "webui":
             for sibling in ("webui", "onebot_http", "onebot_ws"):
                 if sibling == endpoint:
                     continue
-                sibling_probe = probe_endpoint(sibling, _endpoint_url(self._settings, sibling))
-                if sibling_probe.listening:
+                sibling_probe = _probe_configured_endpoint(self._settings, sibling)
+                if sibling_probe.protocol_identified:
+                    _pin_runtime_environment(self._settings)
                     return NapCatStartResult(
                         endpoint=endpoint,
                         launcher_path=self._settings.napcat_launcher_path,
@@ -123,8 +164,9 @@ class NapCatRuntimeStarter:
         deadline = self._monotonic() + timeout_seconds
         while self._monotonic() < deadline:
             self._sleep(poll_interval)
-            probe = probe_endpoint(endpoint, url)
+            probe = _probe_configured_endpoint(self._settings, endpoint)
             if probe.listening:
+                _pin_runtime_environment(self._settings)
                 return NapCatStartResult(
                     endpoint=endpoint,
                     attempted_start=True,
@@ -183,7 +225,7 @@ def _looks_like_launchable_runtime(launcher_path: Path) -> bool:
 
 
 def _launch_napcat_process(launcher_path: Path, state_dir: Path) -> Path | None:
-    log_path, wrapper_path = _prepare_napcat_launch_artifacts(launcher_path, state_dir)
+    log_path, wrapper_path, latest_pointer_path = _prepare_napcat_launch_artifacts(launcher_path, state_dir)
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
         ["cmd.exe", "/d", "/c", str(wrapper_path)],
@@ -193,29 +235,42 @@ def _launch_napcat_process(launcher_path: Path, state_dir: Path) -> Path | None:
         stderr=subprocess.DEVNULL,
         creationflags=creationflags,
     )
+    atomic_write_text(latest_pointer_path, str(log_path), encoding="utf-8")
     return log_path
 
 
-def _prepare_napcat_launch_artifacts(launcher_path: Path, state_dir: Path) -> tuple[Path, Path]:
+def _prepare_napcat_launch_artifacts(launcher_path: Path, state_dir: Path) -> tuple[Path, Path, Path]:
     logs_dir = state_dir / "napcat_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _prune_old_launch_wrappers(logs_dir)
+    stamp = build_timestamp_token(include_pid=True)
     log_path = logs_dir / f"napcat_{stamp}.log"
     wrapper_path = logs_dir / f"launch_napcat_{stamp}.cmd"
     latest_pointer_path = logs_dir / "latest.path"
-    latest_pointer_path.write_text(str(log_path), encoding="utf-8")
-    wrapper_path.write_text(
+    atomic_write_text(
+        wrapper_path,
         "\n".join(
             [
                 "@echo off",
                 f'cd /d "{launcher_path.parent}"',
                 f'call "{launcher_path}" >> "{log_path}" 2>&1',
             ]
-        )
-        + "\n",
+        ) + "\n",
         encoding="utf-8",
     )
-    return log_path, wrapper_path
+    return log_path, wrapper_path, latest_pointer_path
+
+
+def _prune_old_launch_wrappers(logs_dir: Path) -> None:
+    with suppress(OSError):
+        wrappers = sorted(
+            logs_dir.glob("launch_napcat_*.cmd"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in wrappers[_MAX_LAUNCH_WRAPPERS:]:
+            with suppress(OSError):
+                stale.unlink()
 
 
 def _append_napcat_log_hint(message: str, log_path: Path | None) -> str:
@@ -234,4 +289,62 @@ def get_latest_napcat_launch_log_path(state_dir: Path) -> Path | None:
         return None
     if not raw:
         return None
-    return Path(raw)
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = (latest_pointer_path.parent / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    try:
+        allowed_dir = (state_dir / "napcat_logs").resolve()
+    except OSError:
+        allowed_dir = state_dir / "napcat_logs"
+    if candidate.parent != allowed_dir:
+        return None
+    if candidate.suffix.casefold() != ".log":
+        return None
+    if not candidate.exists() or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _probe_configured_endpoint(settings: NapCatSettings, endpoint: EndpointName):
+    token = settings.webui_token if endpoint == "webui" else settings.access_token
+    return probe_endpoint(
+        endpoint,
+        _endpoint_url(settings, endpoint),
+        access_token=token,
+        use_system_proxy=settings.use_system_proxy,
+    )
+
+
+def _pin_runtime_environment(settings: NapCatSettings) -> None:
+    _set_path_env("NAPCAT_DIR", settings.napcat_dir)
+    _set_path_env("NAPCAT_LAUNCHER", settings.napcat_launcher_path)
+    _set_path_env("NAPCAT_WORKDIR", settings.workdir)
+    _set_path_env("NAPCAT_ONEBOT_CONFIG", settings.onebot_config_path)
+    _set_path_env("NAPCAT_WEBUI_CONFIG", settings.webui_config_path)
+
+
+def _set_path_env(key: str, value: Path | None) -> None:
+    if value is None:
+        return
+    os.environ[key] = str(value)
+
+
+    def _retry_protocol_identification(
+        self,
+        endpoint: EndpointName,
+        *,
+        timeout_seconds: float,
+        poll_interval: float,
+    ):
+        deadline = self._monotonic() + min(timeout_seconds, 2.0)
+        sleep_interval = min(poll_interval, 0.25)
+        while self._monotonic() < deadline:
+            self._sleep(sleep_interval)
+            probe = _probe_configured_endpoint(self._settings, endpoint)
+            if probe.protocol_identified:
+                return probe
+            if not probe.transport_listening:
+                return None
+        return None

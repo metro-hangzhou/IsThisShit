@@ -15,6 +15,7 @@ class NapCatSettings(BaseModel):
     napcat_dir: Path | None = None
     napcat_launcher_path: Path | None = None
     auto_start_napcat: bool = True
+    auto_configure_onebot: bool = False
     http_url: str = Field(default="http://127.0.0.1:3000")
     ws_url: str = Field(default="ws://127.0.0.1:3001")
     access_token: str | None = None
@@ -36,41 +37,55 @@ class NapCatSettings(BaseModel):
         napcat_dir = _resolve_napcat_dir(project_root)
         launcher_path = _resolve_launcher_path(project_root, napcat_dir)
         workdir = _resolve_workdir(project_root, napcat_dir)
-        onebot_config_path = _resolve_config_path(
-            os.getenv("NAPCAT_ONEBOT_CONFIG"),
-            _candidate_config_paths(
-                "onebot11.json",
-                workdir=workdir,
+        try:
+            onebot_config_path = _resolve_config_path(
+                os.getenv("NAPCAT_ONEBOT_CONFIG"),
+                candidates=_candidate_config_paths(
+                    "onebot11.json",
+                    workdir=workdir,
+                    project_root=project_root,
+                    napcat_dir=napcat_dir,
+                    extra_glob_patterns=["onebot11_*.json"],
+                    extra_relative_paths=[
+                        Path("config") / "onebot11.json",
+                        Path("napcat") / "config" / "onebot11.json",
+                        Path("NapCatQQ") / "config" / "onebot11.json",
+                        Path("NapCat") / "napcat" / "config" / "onebot11.json",
+                        Path("NapCatRuntime") / "napcat" / "config" / "onebot11.json",
+                        Path("NapCatQQ") / "packages" / "napcat-develop" / "config" / "onebot11.json",
+                    ],
+                ),
                 project_root=project_root,
-                napcat_dir=napcat_dir,
-                extra_glob_patterns=["onebot11_*.json"],
-                extra_relative_paths=[
-                    Path("config") / "onebot11.json",
-                    Path("napcat") / "config" / "onebot11.json",
-                    Path("NapCatQQ") / "config" / "onebot11.json",
-                    Path("NapCat") / "napcat" / "config" / "onebot11.json",
-                    Path("NapCatRuntime") / "napcat" / "config" / "onebot11.json",
-                    Path("NapCatQQ") / "packages" / "napcat-develop" / "config" / "onebot11.json",
-                ],
-            ),
-        )
-        webui_config_path = _resolve_config_path(
-            os.getenv("NAPCAT_WEBUI_CONFIG"),
-            _candidate_config_paths(
-                "webui.json",
-                workdir=workdir,
+                base_dir=workdir or napcat_dir or project_root,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"explicit NAPCAT_ONEBOT_CONFIG path {os.getenv('NAPCAT_ONEBOT_CONFIG')} does not exist"
+            ) from exc
+        try:
+            webui_config_path = _resolve_config_path(
+                os.getenv("NAPCAT_WEBUI_CONFIG"),
+                candidates=_candidate_config_paths(
+                    "webui.json",
+                    workdir=workdir,
+                    project_root=project_root,
+                    napcat_dir=napcat_dir,
+                    extra_relative_paths=[
+                        Path("config") / "webui.json",
+                        Path("napcat") / "config" / "webui.json",
+                        Path("NapCatQQ") / "config" / "webui.json",
+                        Path("NapCat") / "napcat" / "config" / "webui.json",
+                        Path("NapCatRuntime") / "napcat" / "config" / "webui.json",
+                        Path("NapCatQQ") / "packages" / "napcat-webui-backend" / "webui.json",
+                    ],
+                ),
                 project_root=project_root,
-                napcat_dir=napcat_dir,
-                extra_relative_paths=[
-                    Path("config") / "webui.json",
-                    Path("napcat") / "config" / "webui.json",
-                    Path("NapCatQQ") / "config" / "webui.json",
-                    Path("NapCat") / "napcat" / "config" / "webui.json",
-                    Path("NapCatRuntime") / "napcat" / "config" / "webui.json",
-                    Path("NapCatQQ") / "packages" / "napcat-webui-backend" / "webui.json",
-                ],
-            ),
-        )
+                base_dir=workdir or napcat_dir or project_root,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"explicit NAPCAT_WEBUI_CONFIG path {os.getenv('NAPCAT_WEBUI_CONFIG')} does not exist"
+            ) from exc
         onebot_config = _read_json_file(onebot_config_path)
         webui_config = _read_json_file(webui_config_path)
 
@@ -86,6 +101,10 @@ class NapCatSettings(BaseModel):
             napcat_dir=napcat_dir,
             napcat_launcher_path=launcher_path,
             auto_start_napcat=_parse_bool_env(os.getenv("NAPCAT_AUTO_START"), default=True),
+            auto_configure_onebot=_parse_bool_env(
+                os.getenv("NAPCAT_AUTO_CONFIGURE_ONEBOT"),
+                default=False,
+            ),
             http_url=os.getenv("NAPCAT_HTTP_URL", http_defaults["url"]),
             ws_url=os.getenv("NAPCAT_WS_URL", ws_defaults["url"]),
             access_token=_first_non_none(access_token_env, http_defaults["token"], ws_defaults["token"]),
@@ -114,6 +133,122 @@ class NapCatSettings(BaseModel):
         )
 
 
+def build_settings_resolution_diagnostics(settings: "NapCatSettings") -> dict[str, Any]:
+    project_root = settings.project_root
+    napcat_dir_candidates = [
+        project_root / "NapCat",
+        project_root / "NapCatRuntime",
+        project_root / "NapCatQQ",
+        project_root / "vendor" / "NapCat",
+        project_root / "vendor" / "NapCatQQ",
+    ]
+    workdir_candidates: list[Path] = []
+    if settings.napcat_dir is not None:
+        workdir_candidates.extend([settings.napcat_dir, settings.napcat_dir / "napcat"])
+    workdir_candidates.extend(
+        [
+            project_root / "NapCat",
+            project_root / "NapCat" / "napcat",
+            project_root / "NapCatRuntime",
+            project_root / "NapCatRuntime" / "napcat",
+        ]
+    )
+    napcat_dir_candidate_paths = [
+        candidate for candidate in _dedupe_paths(napcat_dir_candidates) if candidate is not None
+    ]
+    workdir_candidate_paths = [
+        candidate for candidate in _dedupe_paths(workdir_candidates) if candidate is not None
+    ]
+    onebot_candidates = _candidate_config_paths(
+        "onebot11.json",
+        workdir=settings.workdir,
+        project_root=project_root,
+        napcat_dir=settings.napcat_dir,
+        extra_glob_patterns=["onebot11_*.json"],
+        extra_relative_paths=[
+            Path("config") / "onebot11.json",
+            Path("napcat") / "config" / "onebot11.json",
+            Path("NapCatQQ") / "config" / "onebot11.json",
+            Path("NapCat") / "napcat" / "config" / "onebot11.json",
+            Path("NapCatRuntime") / "napcat" / "config" / "onebot11.json",
+            Path("NapCatQQ") / "packages" / "napcat-develop" / "config" / "onebot11.json",
+        ],
+    )
+    webui_candidates = _candidate_config_paths(
+        "webui.json",
+        workdir=settings.workdir,
+        project_root=project_root,
+        napcat_dir=settings.napcat_dir,
+        extra_relative_paths=[
+            Path("config") / "webui.json",
+            Path("napcat") / "config" / "webui.json",
+            Path("NapCatQQ") / "config" / "webui.json",
+            Path("NapCat") / "napcat" / "config" / "webui.json",
+            Path("NapCatRuntime") / "napcat" / "config" / "webui.json",
+            Path("NapCatQQ") / "packages" / "napcat-webui-backend" / "webui.json",
+        ],
+    )
+    return {
+        "selected": {
+            "project_root": str(project_root),
+            "napcat_dir": str(settings.napcat_dir) if settings.napcat_dir is not None else None,
+            "workdir": str(settings.workdir) if settings.workdir is not None else None,
+            "launcher_path": str(settings.napcat_launcher_path) if settings.napcat_launcher_path is not None else None,
+            "onebot_config_path": str(settings.onebot_config_path) if settings.onebot_config_path is not None else None,
+            "webui_config_path": str(settings.webui_config_path) if settings.webui_config_path is not None else None,
+        },
+        "napcat_dir_candidates": [
+            {
+                "path": str(candidate),
+                "exists": candidate.exists(),
+                "score": _runtime_candidate_score(candidate),
+            }
+            for candidate in napcat_dir_candidate_paths
+        ],
+        "workdir_candidates": [
+            {
+                "path": str(candidate),
+                "exists": candidate.exists(),
+                "looks_like_runtime_workdir": _looks_like_runtime_workdir(candidate),
+                "looks_like_runtime_container": _looks_like_runtime_container(candidate),
+                "looks_like_runtime_launcher_root": _looks_like_runtime_launcher_root(candidate),
+                "score": _workdir_candidate_score(candidate),
+            }
+            for candidate in workdir_candidate_paths
+        ],
+        "onebot_config_candidates": [
+            {
+                "path": str(candidate),
+                "exists": candidate.exists(),
+            }
+            for candidate in onebot_candidates
+            if candidate is not None
+        ],
+        "webui_config_candidates": [
+            {
+                "path": str(candidate),
+                "exists": candidate.exists(),
+            }
+            for candidate in webui_candidates
+            if candidate is not None
+        ],
+        "napcat_dir_ambiguous": _candidates_are_ambiguous(
+            [
+                _runtime_candidate_score(candidate)
+                for candidate in napcat_dir_candidate_paths
+                if _runtime_candidate_score(candidate) > 0
+            ]
+        ),
+        "workdir_ambiguous": _candidates_are_ambiguous(
+            [
+                _workdir_candidate_score(candidate)
+                for candidate in workdir_candidate_paths
+                if _workdir_candidate_score(candidate) > 0
+            ]
+        ),
+    }
+
+
 def _resolve_project_root() -> Path:
     env_value = os.getenv("PROJECT_ROOT")
     if env_value:
@@ -136,12 +271,14 @@ def _resolve_napcat_dir(project_root: Path) -> Path | None:
         project_root / "vendor" / "NapCat",
         project_root / "vendor" / "NapCatQQ",
     ]
+    ranked_candidates: list[tuple[int, Path]] = []
     for candidate in candidates:
-        if _looks_like_runtime_workdir(candidate) or _looks_like_runtime_launcher_root(candidate):
-            return candidate.resolve()
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
+        score = _runtime_candidate_score(candidate)
+        if score > 0:
+            ranked_candidates.append((score, candidate.resolve()))
+    if ranked_candidates:
+        ranked_candidates.sort(key=lambda item: (-item[0], len(str(item[1]))))
+        return _select_unique_best_candidate(ranked_candidates)
     return None
 
 
@@ -178,10 +315,27 @@ def _resolve_workdir(project_root: Path, napcat_dir: Path | None) -> Path | None
     env_value = os.getenv("NAPCAT_WORKDIR")
     if env_value:
         return _resolve_relative_path(env_value, project_root=project_root, base_dir=project_root)
-    for root in _search_roots(project_root):
-        direct_candidate = root
-        if _looks_like_runtime_workdir(direct_candidate):
-            return direct_candidate
+    workdir_candidates: list[Path] = []
+    if napcat_dir is not None:
+        workdir_candidates.extend([napcat_dir, napcat_dir / "napcat"])
+    workdir_candidates.extend(
+        [
+            project_root / "NapCat",
+            project_root / "NapCat" / "napcat",
+            project_root / "NapCatRuntime",
+            project_root / "NapCatRuntime" / "napcat",
+        ]
+    )
+    ranked_candidates: list[tuple[int, Path]] = []
+    for candidate in _dedupe_paths(workdir_candidates):
+        if candidate is None:
+            continue
+        score = _workdir_candidate_score(candidate)
+        if score > 0:
+            ranked_candidates.append((score, candidate.resolve()))
+    if ranked_candidates:
+        ranked_candidates.sort(key=lambda item: (-item[0], len(str(item[1]))))
+        return _select_unique_best_candidate(ranked_candidates)
     if napcat_dir is not None:
         if _looks_like_runtime_workdir(napcat_dir):
             return napcat_dir
@@ -191,13 +345,49 @@ def _resolve_workdir(project_root: Path, napcat_dir: Path | None) -> Path | None
     return None
 
 
-def _resolve_config_path(explicit: str | None, candidates: list[Path | None]) -> Path | None:
+def _resolve_config_path(
+    explicit: str | None,
+    *,
+    project_root: Path,
+    base_dir: Path,
+    candidates: list[Path | None],
+) -> Path | None:
     if explicit:
-        return Path(explicit).resolve()
+        explicit_path = Path(explicit)
+        if explicit_path.is_absolute():
+            resolved = explicit_path.resolve()
+            if not resolved.exists():
+                raise FileNotFoundError(f"explicit config path {resolved} does not exist")
+            return resolved
+        resolution_candidates = [
+            (base_dir / explicit_path).resolve(),
+            (project_root / explicit_path).resolve(),
+        ]
+        for candidate in resolution_candidates:
+            if candidate.exists():
+                return candidate
+        raise FileNotFoundError(f"explicit config path {explicit_path} could not be resolved to an existing file")
     for candidate in candidates:
         if candidate is not None and candidate.exists():
             return candidate.resolve()
     return None
+
+
+def _select_unique_best_candidate(ranked_candidates: list[tuple[int, Path]]) -> Path | None:
+    if not ranked_candidates:
+        return None
+    best_score = ranked_candidates[0][0]
+    best = [candidate for score, candidate in ranked_candidates if score == best_score]
+    if len(best) == 1:
+        return best[0]
+    return None
+
+
+def _candidates_are_ambiguous(scores: list[int]) -> bool:
+    if not scores:
+        return False
+    best = max(scores)
+    return sum(1 for score in scores if score == best) > 1
 
 
 def _candidate_config_paths(
@@ -218,7 +408,7 @@ def _candidate_config_paths(
         candidates.extend(_glob_config_candidates(napcat_dir / "napcat" / "config", extra_glob_patterns or []))
         candidates.append(napcat_dir / "config" / filename)
         candidates.append(napcat_dir / "napcat" / "config" / filename)
-    for root in _search_roots(project_root):
+    for root in [project_root]:
         for relative_path in extra_relative_paths:
             candidates.append(root / relative_path)
     return _dedupe_paths(candidates)
@@ -239,10 +429,14 @@ def _search_roots(project_root: Path | None = None) -> list[Path]:
 
 
 def _looks_like_runtime_workdir(path: Path) -> bool:
-    return (
-        (path / "config" / "onebot11.json").exists()
-        or (path / "config" / "webui.json").exists()
-    )
+    config_dir = path / "config"
+    if not config_dir.exists() or not config_dir.is_dir():
+        return False
+    if (config_dir / "webui.json").exists():
+        return True
+    if (config_dir / "plugins.json").exists() or (config_dir / "napcat.json").exists():
+        return True
+    return any(config_dir.glob("onebot11*.json")) or any(config_dir.glob("napcat_protocol*.json"))
 
 
 def _looks_like_runtime_launcher_root(path: Path) -> bool:
@@ -264,6 +458,66 @@ def _looks_like_runtime_launcher_root(path: Path) -> bool:
             Path("packages") / "napcat-shell-loader" / "launcher.bat",
             Path("packages") / "napcat-shell-loader" / "launcher-win10-user.bat",
             Path("packages") / "napcat-shell-loader" / "launcher-user.bat",
+        ]
+    )
+
+
+def _runtime_candidate_score(path: Path) -> int:
+    if not path.exists() or not path.is_dir():
+        return 0
+    score = 0
+    if _looks_like_runtime_workdir(path):
+        score += 6
+    if _looks_like_runtime_workdir(path / "napcat"):
+        score += 5
+    if _looks_like_runtime_launcher_root(path):
+        score += 4
+    if _looks_like_runtime_launcher_root(path / "napcat"):
+        score += 3
+    if _looks_like_runtime_container(path):
+        score += 4
+    if _looks_like_runtime_container(path / "napcat"):
+        score += 3
+    return score
+
+
+def _workdir_candidate_score(path: Path) -> int:
+    if not path.exists() or not path.is_dir():
+        return 0
+    score = 0
+    if _looks_like_runtime_workdir(path):
+        score += 8
+    config_dir = path / "config"
+    if (config_dir / "webui.json").exists():
+        score += 3
+    if (config_dir / "plugins.json").exists():
+        score += 2
+    if (config_dir / "napcat.json").exists():
+        score += 2
+    if any(config_dir.glob("onebot11*.json")):
+        score += 2
+    if any(config_dir.glob("napcat_protocol*.json")):
+        score += 2
+    if _looks_like_runtime_launcher_root(path):
+        score += 2
+    if _looks_like_runtime_container(path):
+        score += 1
+    return score
+
+
+def _looks_like_runtime_container(path: Path) -> bool:
+    return any(
+        candidate.exists()
+        for candidate in [
+            path / "node.exe",
+            path / "wrapper.node",
+            path / "index.js",
+            path / "NapCatWinBootMain.exe",
+            path / "NapCatWinBootHook.dll",
+            path / "napcat" / "napcat.mjs",
+            path / "napcat" / "config",
+            path / "config" / "plugins.json",
+            path / "config" / "napcat.json",
         ]
     )
 

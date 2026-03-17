@@ -9,6 +9,8 @@ from prompt_toolkit.layout.processors import Processor, Transformation, Transfor
 from qq_data_core import roll_explicit_datetime_literal
 
 _DATE_TOKEN_RE = re.compile(r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
+_EXPORT_OPTIONS_WITH_VALUE = {"--format", "--out", "--limit", "--data-count", "--timeout", "--poll"}
+_FORMAT_ALIASES = {"astxt", "asjsonl"}
 _RIGHT_FIELD_JUMPS = {
     4: 7,
     7: 10,
@@ -23,6 +25,68 @@ _LEFT_FIELD_JUMPS = {
     14: 13,
     17: 16,
 }
+
+
+def _iter_token_spans(text: str):
+    length = len(text)
+    position = 0
+    while position < length:
+        while position < length and text[position].isspace():
+            position += 1
+        if position >= length:
+            break
+        start = position
+        in_quote: str | None = None
+        while position < length:
+            char = text[position]
+            if in_quote is not None:
+                if char == "\\" and position + 1 < length:
+                    position += 2
+                    continue
+                if char == in_quote:
+                    in_quote = None
+                position += 1
+                continue
+            if char in {"'", '"'}:
+                in_quote = char
+                position += 1
+                continue
+            if char.isspace():
+                break
+            position += 1
+        end = position
+        yield start, end, text[start:end]
+
+
+def _iter_export_date_token_spans(text: str):
+    if not text.lstrip().startswith("/export"):
+        return
+    tokens = list(_iter_token_spans(text))
+    if not tokens:
+        return
+
+    remaining_target_tokens = 0
+    for index, (start, end, token) in enumerate(tokens[1:], start=1):
+        lowered = token.casefold()
+        if remaining_target_tokens > 0:
+            remaining_target_tokens -= 1
+            continue
+        if token.startswith("--"):
+            option_name, separator, _option_value = token.partition("=")
+            if not separator and option_name.casefold() in _EXPORT_OPTIONS_WITH_VALUE:
+                remaining_target_tokens = 1
+            continue
+        if index == 1 and lowered in {"group", "friend"}:
+            remaining_target_tokens = 1
+            continue
+        if index == 1 and (
+            lowered.startswith("group_asbatch=") or lowered.startswith("friend_asbatch=")
+        ):
+            continue
+        if lowered in _FORMAT_ALIASES:
+            continue
+        if _DATE_TOKEN_RE.fullmatch(token):
+            yield start, end, token
 
 
 class ExportCommandLexer(Lexer):
@@ -82,9 +146,9 @@ def roll_export_date_token(text: str, *, cursor_position: int, delta: int) -> tu
 def find_export_date_token_range(text: str, cursor_position: int) -> tuple[int, int] | None:
     if not text.lstrip().startswith("/export"):
         return None
-    for match in _DATE_TOKEN_RE.finditer(text):
-        if match.start() <= cursor_position <= match.end():
-            return match.start(), match.end()
+    for start, end, _token in _iter_export_date_token_spans(text):
+        if start <= cursor_position <= end:
+            return start, end
     return None
 
 
@@ -133,11 +197,11 @@ def _highlight_export_date_tokens(text: str) -> list[tuple[str, str]]:
 
     fragments: list[tuple[str, str]] = []
     position = 0
-    for match in _DATE_TOKEN_RE.finditer(text):
-        if match.start() > position:
-            fragments.append(("", text[position:match.start()]))
-        fragments.append(("class:export-date-literal", match.group(0)))
-        position = match.end()
+    for start, end, token in _iter_export_date_token_spans(text):
+        if start > position:
+            fragments.append(("", text[position:start]))
+        fragments.append(("class:export-date-literal", token))
+        position = end
     if position < len(text):
         fragments.append(("", text[position:]))
     return fragments
@@ -149,12 +213,12 @@ def _build_export_display_fragments(text: str) -> tuple[list[tuple[str, str]], l
     source_position = 0
     display_position = 0
 
-    for match in _DATE_TOKEN_RE.finditer(text):
-        if match.start() < source_position:
+    for start, end, token in _iter_export_date_token_spans(text):
+        if start < source_position:
             continue
 
-        if match.start() > source_position:
-            plain = text[source_position:match.start()]
+        if start > source_position:
+            plain = text[source_position:start]
             fragments.append(("", plain))
             for _ in plain:
                 source_to_display[source_position] = display_position
@@ -162,12 +226,11 @@ def _build_export_display_fragments(text: str) -> tuple[list[tuple[str, str]], l
                 display_position += 1
                 source_to_display[source_position] = display_position
 
-        token = match.group(0)
         token_fragments, token_map = _build_date_token_display(token)
         fragments.extend(token_fragments)
         for offset, mapped_position in enumerate(token_map):
-            source_to_display[match.start() + offset] = display_position + mapped_position
-        source_position = match.end()
+            source_to_display[start + offset] = display_position + mapped_position
+        source_position = end
         display_position += len(render_export_date_literal_display(token))
 
     if source_position < len(text):

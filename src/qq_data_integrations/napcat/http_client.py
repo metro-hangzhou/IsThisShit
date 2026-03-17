@@ -17,6 +17,10 @@ class NapCatApiTimeoutError(NapCatApiError):
     pass
 
 
+class NapCatApiResponseError(NapCatApiError):
+    pass
+
+
 class NapCatHttpClient:
     def __init__(
         self,
@@ -62,9 +66,33 @@ class NapCatHttpClient:
             raise NapCatApiTimeoutError(
                 f"NapCat action timed out: {action}"
             ) from exc
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("status") not in {None, "ok"}:
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise NapCatApiResponseError(
+                f"NapCat action returned HTTP {response.status_code}: {action}"
+            ) from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise NapCatApiResponseError(
+                f"NapCat action returned non-JSON response: {action}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise NapCatApiResponseError(
+                f"NapCat action returned unexpected JSON payload: {action}"
+            )
+        if "status" not in payload:
+            raise NapCatApiResponseError(
+                f"NapCat action returned JSON without status: {action}"
+            )
+        if payload.get("retcode") not in {None, 0}:
+            raise NapCatApiError(
+                payload.get("message")
+                or payload.get("msg")
+                or f"NapCat action returned retcode={payload.get('retcode')}: {action}"
+            )
+        if payload.get("status") != "ok":
             raise NapCatApiError(
                 payload.get("message")
                 or payload.get("msg")

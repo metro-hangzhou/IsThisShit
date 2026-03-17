@@ -46,6 +46,14 @@ class NapCatHistoryProvider:
         self._disable_parse_mult_forward_hydration = False
         self._known_forward_history_failures = 0
 
+    def reset_export_state(self) -> None:
+        self._fast_available = None
+        self._fast_tail_bulk_available = None
+        self._known_unavailable_forward_ids.clear()
+        self._known_unavailable_history_keys.clear()
+        self._disable_parse_mult_forward_hydration = False
+        self._known_forward_history_failures = 0
+
     def fetch_snapshot(self, request: ExportRequest) -> SourceChatSnapshot:
         return self.fetch_snapshot_before(
             request,

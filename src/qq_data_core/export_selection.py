@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 from typing import Literal
 
 from .models import ExportBundleResult, NormalizedMessage, NormalizedSegment, NormalizedSnapshot
@@ -40,12 +41,35 @@ PROFILE_SEGMENT_TYPES: dict[ExportProfile, set[str] | None] = {
 }
 
 
+def _count_segments_in_messages(messages: list[NormalizedMessage]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for message in messages:
+        for segment in message.segments:
+            counts[segment.type] += 1
+    return counts
+
+
+def _coerce_segment_counts(value: object) -> Counter[str]:
+    counter = Counter()
+    if not isinstance(value, dict):
+        return counter
+    for key, raw in value.items():
+        try:
+            counter[str(key)] = int(raw)
+        except (TypeError, ValueError):
+            continue
+    return counter
+
+
 def apply_export_profile(snapshot: NormalizedSnapshot, profile: ExportProfile) -> NormalizedSnapshot:
     allowed = PROFILE_SEGMENT_TYPES[profile]
     if allowed is None:
         return snapshot
 
     source_message_count = len(snapshot.messages)
+    source_segment_counts = _coerce_segment_counts(snapshot.metadata.get("source_segment_counts"))
+    if not source_segment_counts:
+        source_segment_counts = _count_segments_in_messages(snapshot.messages)
     filtered_messages: list[NormalizedMessage] = []
     dropped_messages = 0
     for message in snapshot.messages:
@@ -56,11 +80,13 @@ def apply_export_profile(snapshot: NormalizedSnapshot, profile: ExportProfile) -
             continue
         filtered_messages.append(rebuilt)
 
-    metadata = dict(snapshot.metadata)
+    metadata = deepcopy(snapshot.metadata)
     metadata["export_profile"] = profile
     metadata["source_message_count"] = source_message_count
     metadata["dropped_message_count"] = dropped_messages
     metadata["kept_message_count"] = len(filtered_messages)
+    metadata["source_segment_counts"] = dict(source_segment_counts)
+    metadata["kept_segment_counts"] = dict(_count_segments_in_messages(filtered_messages))
     return snapshot.model_copy(update={"messages": filtered_messages, "metadata": metadata})
 
 
@@ -73,10 +99,15 @@ def trim_snapshot_to_last_messages(
         return snapshot
     messages = list(snapshot.messages)
     trimmed_messages = messages[-data_count:]
-    metadata = dict(snapshot.metadata)
+    metadata = deepcopy(snapshot.metadata)
+    source_segment_counts = _coerce_segment_counts(metadata.get("source_segment_counts"))
+    if not source_segment_counts:
+        source_segment_counts = _count_segments_in_messages(messages)
     metadata["requested_data_count"] = data_count
     metadata["source_message_count"] = len(messages)
     metadata["trimmed_message_count"] = len(trimmed_messages)
+    metadata["source_segment_counts"] = dict(source_segment_counts)
+    metadata["kept_segment_counts"] = dict(_count_segments_in_messages(trimmed_messages))
     return snapshot.model_copy(update={"messages": trimmed_messages, "metadata": metadata})
 
 
@@ -87,6 +118,7 @@ def build_export_content_summary(
     profile: ExportProfile,
 ) -> dict[str, object]:
     segment_counts = Counter()
+    source_segment_counts = _coerce_segment_counts(snapshot.metadata.get("source_segment_counts"))
     expected_assets = Counter()
     actual_assets = Counter()
     missing_assets = Counter()
@@ -98,6 +130,9 @@ def build_export_content_summary(
             segment_counts[segment.type] += 1
             for asset_key in _collect_segment_asset_keys(segment):
                 expected_assets[asset_key] += 1
+
+    if not source_segment_counts:
+        source_segment_counts = Counter(segment_counts)
 
     for asset in bundle.assets:
         key = _asset_key(asset.asset_type, asset.asset_role)
@@ -128,6 +163,9 @@ def build_export_content_summary(
         "oldest_timestamp_iso": oldest_timestamp_iso,
         "latest_timestamp_iso": latest_timestamp_iso,
         "segment_counts": {key: int(segment_counts[key]) for key in CONTENT_SEGMENT_ORDER},
+        "source_segment_counts": {
+            key: int(source_segment_counts[key]) for key in CONTENT_SEGMENT_ORDER
+        },
         "expected_assets": {key: int(expected_assets[key]) for key in ASSET_TYPE_ORDER},
         "actual_assets": {key: int(actual_assets[key]) for key in ASSET_TYPE_ORDER},
         "missing_assets": {key: int(missing_assets[key]) for key in ASSET_TYPE_ORDER},
@@ -138,6 +176,7 @@ def build_export_content_summary(
 
 def format_export_content_summary(summary: dict[str, object]) -> list[str]:
     content_counts = summary.get("segment_counts") or {}
+    source_content_counts = summary.get("source_segment_counts") or {}
     expected_assets = summary.get("expected_assets") or {}
     actual_assets = summary.get("actual_assets") or {}
     missing_assets = summary.get("missing_assets") or {}
@@ -160,13 +199,13 @@ def format_export_content_summary(summary: dict[str, object]) -> list[str]:
     lines.append(
         "  content_export=["
         + ", ".join(
-            f"{key}:{int(content_counts.get(key, 0))}/{int(content_counts.get(key, 0))}"
+            f"{key}:{int(content_counts.get(key, 0))}/{int(source_content_counts.get(key, content_counts.get(key, 0)))}"
             for key in CONTENT_SEGMENT_ORDER
         )
         + "]"
     )
     lines.append(
-        "  asset_materialization=["
+        "  final_asset_result=["
         + ", ".join(
             (
                 f"{key}:{int(actual_assets.get(key, 0))}/{int(expected_assets.get(key, 0))}"
@@ -177,9 +216,14 @@ def format_export_content_summary(summary: dict[str, object]) -> list[str]:
         )
         + "]"
     )
+    if any(int(value) for value in expected_assets.values()):
+        lines.append(
+            "  note=若上方出现 remote_downloads(subqueue)，它只统计远程 URL 下载子队列；"
+            "最终结果请以 final_asset_result / final_missing_reason 为准"
+        )
     if missing_breakdown:
         lines.append(
-            "  missing_breakdown=["
+            "  final_missing_reason=["
             + ", ".join(
                 f"{key}:{int(value)}"
                 for key, value in missing_breakdown.items()
@@ -223,9 +267,9 @@ def format_export_content_summary_compact(summary: dict[str, object]) -> str:
         f"msgs={message_count}/{source_message_count} "
         f"req={requested_data_count} "
         f"segment_types={segment_type_count} "
-        f"assets={actual_total}/{expected_total} "
-        f"missing={missing_total} "
-        f"expired={expired_total} "
+        f"final_assets={actual_total}/{expected_total} "
+        f"final_missing={missing_total} "
+        f"expired_occurrences={expired_total} "
         f"errors={error_total}"
     )
 
@@ -247,9 +291,9 @@ def format_watch_export_result_summary(summary: dict[str, object]) -> str:
     return (
         f"m={message_count}/{source_message_count} "
         f"req={requested_data_count} "
-        f"a={actual_total}/{expected_total} "
-        f"miss={missing_total} "
-        f"expired={expired_total}"
+        f"final_a={actual_total}/{expected_total} "
+        f"final_miss={missing_total} "
+        f"expired_occurrences={expired_total}"
     )
 
 
@@ -280,8 +324,9 @@ def _rebuild_message(message: NormalizedMessage, segments: list[NormalizedSegmen
     content = " ".join(part for part in content_parts if part).strip()
     if not content:
         return None
-    text_content = "".join(text_parts).strip()
+    text_content = " ".join(part for part in text_parts if part).strip()
     return message.model_copy(
+        deep=True,
         update={
             "segments": segments,
             "content": content,
@@ -331,7 +376,12 @@ def _segment_text_value(segment: NormalizedSegment) -> str:
     if segment.type in {"text", "system"}:
         return (segment.text or "").strip()
     if segment.type == "forward":
-        return str(segment.extra.get("preview_text") or segment.summary or "").strip()
+        return str(
+            segment.extra.get("detailed_text")
+            or segment.extra.get("preview_text")
+            or segment.summary
+            or ""
+        ).strip()
     if segment.type == "share":
         parts = [
             segment.summary,
@@ -339,6 +389,13 @@ def _segment_text_value(segment: NormalizedSegment) -> str:
             str(segment.extra.get("tag") or "").strip() or None,
         ]
         return " ".join(part for part in parts if part).strip()
+    if segment.type == "reply":
+        reply_text = (
+            segment.text
+            or str(segment.extra.get("reply_text") or "").strip()
+            or ""
+        )
+        return reply_text.strip()
     return ""
 
 

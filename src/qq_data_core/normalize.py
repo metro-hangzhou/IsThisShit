@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 from datetime import datetime
@@ -51,19 +52,24 @@ def _message_sender(payload: dict[str, Any]) -> dict[str, Any]:
     return _safe_mapping(payload.get("sender"))
 
 
-def _parse_timestamp(payload: dict[str, Any]) -> datetime:
+def _parse_timestamp(
+    payload: dict[str, Any],
+    *,
+    fallback_timestamp: datetime | None = None,
+) -> datetime:
     raw_message = _message_raw(payload)
     timestamp = payload.get("timestamp")
     if isinstance(timestamp, str):
-        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(
-            EXPORT_TIMEZONE
-        )
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=EXPORT_TIMEZONE)
+        return parsed.astimezone(EXPORT_TIMEZONE)
     epoch_seconds = (
         payload.get("time")
         or raw_message.get("msgTime")
     )
     if epoch_seconds is None:
-        return datetime.now(EXPORT_TIMEZONE)
+        return fallback_timestamp or datetime.now(EXPORT_TIMEZONE)
     return datetime.fromtimestamp(int(epoch_seconds), tz=EXPORT_TIMEZONE)
 
 
@@ -404,7 +410,7 @@ def _normalize_forward_nodes(
             inherited_parent_context=inherited_parent_context,
         )
         content = " ".join(part for part in content_parts if part).strip()
-        node_text = content or text_content
+        node_text = text_content or content
         normalized_node = {
             "sender_id": sender_id or None,
             "sender_name": sender_name,
@@ -414,6 +420,7 @@ def _normalize_forward_nodes(
             "uploaded_file_names": uploaded_file_names,
             "emoji_tokens": emoji_tokens,
             "segments": [_segment_dump(segment) for segment in segments],
+            "reply_to": _reply_to.model_dump(mode="json") if _reply_to is not None else None,
         }
         normalized_nodes.append(normalized_node)
         if node_text:
@@ -442,6 +449,21 @@ def _extract_onebot_segments(message: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return payload
     return []
+
+
+def _onebot_segments_have_expanded_forward_content(message: dict[str, Any]) -> bool:
+    for segment in _extract_onebot_segments(message):
+        if not isinstance(segment, dict):
+            continue
+        segment_type = str(segment.get("type") or "").strip().lower()
+        data = _safe_mapping(segment.get("data"))
+        if segment_type == "node":
+            if isinstance(data.get("message") or data.get("content"), list):
+                return True
+        if segment_type == "forward":
+            if isinstance(data.get("content") or data.get("message"), list):
+                return True
+    return False
 
 
 def _extract_onebot_parent_context(message: dict[str, Any]) -> dict[str, Any]:
@@ -801,16 +823,24 @@ def _normalize_exporter_elements(
 
         if element_type == REPLY_ELEMENT:
             reply = element.get("replyElement", {})
+            reply_text = _clean_text(
+                reply.get("content") or reply.get("summary") or reply.get("text")
+            )
             segments.append(
                 NormalizedSegment(
                     type="reply",
+                    text=reply_text or None,
                     extra={
                         "sender_uid": reply.get("senderUid"),
                         "reply_msg_time": reply.get("replyMsgTime"),
                         "reply_msg_id": reply.get("replayMsgId"),
+                        "reply_text": reply_text or None,
                     },
                 )
             )
+            if reply_text:
+                content_parts.append(reply_text)
+                text_parts.append(reply_text)
             if reply_to is None:
                 reply_to = _build_reply_ref(message, reply)
             continue
@@ -825,7 +855,7 @@ def _normalize_exporter_elements(
         content_parts.append(f"[unsupported:{element_type}]")
 
     content = " ".join(part for part in content_parts if part).strip()
-    text_content = "".join(text_parts).strip()
+    text_content = " ".join(part for part in text_parts if part).strip()
     return (
         segments,
         image_file_names,
@@ -1196,7 +1226,7 @@ def _normalize_onebot_segments(
         content_parts.append(f"[unsupported:{segment_type}]")
 
     content = " ".join(part for part in content_parts if part).strip()
-    text_content = "".join(text_parts).strip()
+    text_content = " ".join(part for part in text_parts if part).strip()
     return (
         segments,
         image_file_names,
@@ -1215,9 +1245,30 @@ def normalize_message(
     chat_id: str,
     chat_name: str | None = None,
     include_raw: bool = False,
+    fallback_timestamp: datetime | None = None,
 ) -> NormalizedMessage:
-    timestamp = _parse_timestamp(message)
-    if _extract_onebot_segments(message):
+    timestamp = _parse_timestamp(message, fallback_timestamp=fallback_timestamp)
+    if _onebot_segments_have_expanded_forward_content(message):
+        (
+            segments,
+            image_file_names,
+            uploaded_file_names,
+            emoji_tokens,
+            content_parts,
+            text_content,
+            reply_to,
+        ) = _normalize_onebot_segments(message)
+    elif _extract_exporter_elements(message):
+        (
+            segments,
+            image_file_names,
+            uploaded_file_names,
+            emoji_tokens,
+            content_parts,
+            text_content,
+            reply_to,
+        ) = _normalize_exporter_elements(message)
+    elif _extract_onebot_segments(message):
         (
             segments,
             image_file_names,
@@ -1290,7 +1341,9 @@ def normalize_message(
         segments=segments,
         reply_to=reply_to,
         extra=extra,
-        raw_message=message if include_raw else None,
+        # Keep a detached debug snapshot so later in-process mutation of the
+        # source payload cannot rewrite previously captured forensic/raw views.
+        raw_message=deepcopy(message) if include_raw else None,
     )
 
 
@@ -1299,6 +1352,7 @@ def normalize_snapshot(
     *,
     include_raw: bool = False,
 ) -> NormalizedSnapshot:
+    fallback_timestamp = snapshot.exported_at.astimezone(EXPORT_TIMEZONE)
     messages = [
         normalize_message(
             message,
@@ -1306,14 +1360,16 @@ def normalize_snapshot(
             chat_id=snapshot.chat_id,
             chat_name=snapshot.chat_name,
             include_raw=include_raw,
+            fallback_timestamp=fallback_timestamp,
         )
         for message in snapshot.messages
     ]
+    messages.sort(key=lambda item: (item.timestamp_ms, item.message_seq or "", item.message_id or ""))
     return NormalizedSnapshot(
         chat_type=snapshot.chat_type,
         chat_id=snapshot.chat_id,
         chat_name=snapshot.chat_name,
         exported_at=snapshot.exported_at,
-        metadata=snapshot.metadata,
+        metadata=deepcopy(snapshot.metadata),
         messages=messages,
     )

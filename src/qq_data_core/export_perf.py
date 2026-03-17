@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
 
 from .models import EXPORT_TIMEZONE
+from .paths import build_timestamp_token
 
 MATERIALIZE_STEP_TRACE_SAMPLE_INTERVAL = 100
 MATERIALIZE_SLOW_STEP_WARN_S = 5.0
@@ -30,9 +32,10 @@ class ExportPerfTraceWriter:
         self._lock = Lock()
         export_perf_dir = state_dir / "export_perf"
         export_perf_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(EXPORT_TIMEZONE).strftime("%Y%m%d_%H%M%S")
+        stamp = build_timestamp_token(include_pid=True)
         self.path = export_perf_dir / f"{mode}_{chat_type}_{chat_id}_{stamp}.jsonl"
-        self._handle = self.path.open("a", encoding="utf-8", newline="\n")
+        self._temp_path = self.path.with_name(f"{self.path.name}.tmp")
+        self._handle = self._temp_path.open("a", encoding="utf-8", newline="\n")
         self._started_at = datetime.now(EXPORT_TIMEZONE)
         self._pages_scanned = 0
         self._retry_events = 0
@@ -148,4 +151,6 @@ class ExportPerfTraceWriter:
             if self._closed:
                 return
             self._closed = True
+            self._handle.flush()
             self._handle.close()
+            os.replace(self._temp_path, self.path)

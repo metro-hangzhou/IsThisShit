@@ -67,7 +67,6 @@ from qq_data_core import (
     trim_snapshot_to_last_messages,
 )
 from qq_data_core.models import EXPORT_TIMEZONE
-from qq_data_integrations import discover_qq_media_roots
 from qq_data_integrations.napcat import ChatTarget, NapCatGateway, NapCatSettings
 
 
@@ -176,6 +175,7 @@ class WatchConversationView:
         self._history_page_size = max(20, self._history_limit)
         self._oldest_history_anchor: str | None = None
         self._history_exhausted = False
+        self._download_notice_text = ""
         self._message_area = TextArea(
             text="",
             read_only=True,
@@ -249,12 +249,11 @@ class WatchConversationView:
         )
         self._pump_task: asyncio.Task[None] | None = None
         self._export_task: asyncio.Task[None] | None = None
+        self._history_load_task: asyncio.Task[None] | None = None
         self._export_started_monotonic: float | None = None
         self._export_perf_trace: ExportPerfTraceWriter | None = None
         self._last_export_progress_emit = 0.0
         self._last_export_progress_current = -1
-        self._qq_media_roots = discover_qq_media_roots()
-        self._media_cache_dir = self._settings.state_dir / "media_index"
         self._logger = get_cli_logger("watch")
         self._exit_reason = "unknown"
 
@@ -305,8 +304,20 @@ class WatchConversationView:
             self._pump_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._pump_task
+        if self._history_load_task is not None:
+            if not self._history_load_task.done():
+                self._logger.info(
+                    "watch_history_load_waiting_for_completion_on_shutdown chat_id=%s",
+                    self._request.chat_id,
+                )
+            with suppress(asyncio.CancelledError):
+                await self._history_load_task
         if self._export_task is not None:
-            self._export_task.cancel()
+            if not self._export_task.done():
+                self._logger.info(
+                    "watch_export_waiting_for_completion_on_shutdown chat_id=%s",
+                    self._request.chat_id,
+                )
             with suppress(asyncio.CancelledError):
                 await self._export_task
 
@@ -381,33 +392,74 @@ class WatchConversationView:
 
     def _scroll_relative(self, delta: int) -> None:
         previous_scroll_top = self._scroll_top
-        loaded_older_count = 0
         if delta < 0 and previous_scroll_top + delta < 0:
-            loaded_older_count = self._load_older_history()
-        if loaded_older_count > 0:
-            self._refresh_message_area()
+            self._queue_load_older_history(previous_scroll_top=previous_scroll_top, requested_delta=delta)
+            return
 
         line_count = max(1, self._message_area.buffer.document.line_count)
         max_scroll = max(0, line_count - self._visible_window_height())
         requested_scroll = previous_scroll_top + delta
-        if loaded_older_count > 0:
-            requested_scroll += loaded_older_count
         self._scroll_top = min(max_scroll, max(0, requested_scroll))
         self._follow_tail = self._scroll_top >= max_scroll
         self._sync_cursor_to_view()
         self._status_text = self._build_status_text()
         self._invalidate()
 
-    def _load_older_history(self) -> int:
+    def _queue_load_older_history(self, *, previous_scroll_top: int, requested_delta: int) -> None:
         if self._history_exhausted:
-            return 0
-        if not self._oldest_history_anchor:
-            self._history_exhausted = True
-            return 0
+            self._notice_text = "更早历史已经全部加载完了。"
+            self._invalidate()
+            return
+        if self._history_load_task is not None and not self._history_load_task.done():
+            self._notice_text = "正在加载更早历史，请稍等..."
+            self._invalidate()
+            return
+        self._notice_text = "正在加载更早历史..."
+        self._invalidate()
+        self._history_load_task = self._app.create_background_task(
+            self._load_older_history_async(
+                previous_scroll_top=previous_scroll_top,
+                requested_delta=requested_delta,
+            )
+        )
 
-        previous_anchor = self._oldest_history_anchor
+    async def _load_older_history_async(self, *, previous_scroll_top: int, requested_delta: int) -> None:
         try:
-            snapshot = self._gateway.fetch_history_before(
+            previous_anchor = self._oldest_history_anchor
+            if not previous_anchor:
+                self._history_exhausted = True
+                self._status_text = self._build_status_text()
+                self._invalidate()
+                return
+            snapshot = await asyncio.to_thread(self._fetch_older_history_before, previous_anchor)
+            added = self._ingest_snapshot(snapshot)
+            if added <= 0 or self._oldest_history_anchor == previous_anchor:
+                self._history_exhausted = True
+            if added > 0:
+                self._refresh_message_area()
+                line_count = max(1, self._message_area.buffer.document.line_count)
+                max_scroll = max(0, line_count - self._visible_window_height())
+                requested_scroll = previous_scroll_top + requested_delta + added
+                self._scroll_top = min(max_scroll, max(0, requested_scroll))
+                self._follow_tail = self._scroll_top >= max_scroll
+                self._sync_cursor_to_view()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._notice_text = _friendly_watch_runtime_notice(
+                "加载更早历史失败",
+                exc,
+                suffix="当前窗口仍可继续使用，可稍后再试。",
+            )
+        finally:
+            self._status_text = self._build_status_text()
+            self._invalidate()
+            self._history_load_task = None
+
+    def _fetch_older_history_before(self, previous_anchor: str):
+        history_gateway = NapCatGateway(self._settings)
+        try:
+            return history_gateway.fetch_history_before(
                 ExportRequest(
                     chat_type=self._request.chat_type,
                     chat_id=self._request.chat_id,
@@ -417,21 +469,8 @@ class WatchConversationView:
                 before_message_seq=previous_anchor,
                 count=self._history_page_size,
             )
-        except Exception as exc:
-            self._notice_text = _friendly_watch_runtime_notice(
-                "加载更早历史失败",
-                exc,
-                suffix="当前窗口仍可继续使用，可稍后再试。",
-            )
-            return 0
-
-        added = self._ingest_snapshot(snapshot)
-        if (
-            added <= 0
-            or self._oldest_history_anchor == previous_anchor
-        ):
-            self._history_exhausted = True
-        return added
+        finally:
+            history_gateway.close()
 
     def _page_delta(self) -> int:
         render_info = self._message_area.window.render_info
@@ -463,6 +502,10 @@ class WatchConversationView:
             return
         command = argv[0].lower()
         if command == "/exit":
+            if self._export_task is not None and not self._export_task.done():
+                self._notice_text = "导出仍在运行，当前窗口会在导出完成后再退出。"
+                self._invalidate()
+                return
             self._exit_reason = "command_exit"
             self._app.exit()
             return
@@ -481,7 +524,18 @@ class WatchConversationView:
         self._invalidate()
 
     def _handle_export(self, command: str, argv: list[str]) -> None:
-        positionals, options = _parse_options(argv)
+        positionals, options = _parse_options(
+            argv,
+            allowed_options={
+                "format",
+                "out",
+                "limit",
+                "data-count",
+                "include-raw",
+                "strict-missing",
+            },
+            command_name=command,
+        )
         parsed = parse_watch_export_command(command, positionals, options, default_limit=max(200, self._history_limit))
         if parsed.fmt not in {"jsonl", "txt"}:
             self._notice_text = "当前窗口导出仅支持 txt/jsonl；可用 asTXT、asJSONL 或 --format 指定。"
@@ -559,16 +613,10 @@ class WatchConversationView:
         except Exception as exc:
             self._logger.exception("watch_export_failed chat_id=%s", self._request.chat_id)
             if self._export_perf_trace is not None:
-                cleanup_stats = cleanup_gateway_media_cache(
-                    self._gateway,
-                    trace=self._export_perf_trace,
-                    logger=self._logger,
-                )
                 self._export_perf_trace.write_event(
                     "export_failed",
                     {
                         "error": str(exc),
-                        "remote_cache_cleanup": cleanup_stats,
                     },
                 )
             self._notice_text = _friendly_watch_runtime_notice(
@@ -639,6 +687,10 @@ class WatchConversationView:
     def _apply_export_progress(self, update: dict[str, Any]) -> None:
         phase = str(update.get("phase") or "")
         now = time.monotonic()
+        if phase == "download_assets":
+            self._download_notice_text = self._format_watch_download_progress(update)
+            self._invalidate()
+            return
         if phase == "materialize_assets":
             current = int(update.get("current") or 0)
             total = int(update.get("total") or 0)
@@ -798,7 +850,40 @@ class WatchConversationView:
             )
         self._invalidate()
 
+    def _format_watch_download_progress(self, update: dict[str, Any]) -> str | None:
+        stage = str(update.get("stage") or "progress")
+        total = int(update.get("candidate_total") or update.get("download_total") or 0)
+        completed = int(update.get("completed") or update.get("download_completed") or 0)
+        failed = int(update.get("failed") or update.get("download_failed") or 0)
+        inflight = int(update.get("active") or update.get("download_inflight") or 0)
+        queued = int(update.get("queued") or 0)
+        cached = int(update.get("cached") or update.get("download_cached") or 0)
+        eager = int(update.get("eager_remote_candidates") or 0)
+        token = int(update.get("public_token_candidates") or 0)
+        context = int(update.get("context_candidates") or 0)
+        last_asset_type = str(update.get("last_asset_type") or "").strip()
+        last_file_name = str(update.get("last_file_name") or "").strip()
+        last_status = str(update.get("last_status") or "").strip()
+        if stage in {"done", "complete"} and not total:
+            return ""
+        parts = [f"remote_downloads(subqueue): {stage}"]
+        parts.append(f"candidates={total}")
+        parts.append(f"ok={completed}")
+        parts.append(f"cached={cached}")
+        parts.append(f"failed={failed}")
+        parts.append(f"queued={queued}")
+        parts.append(f"inflight={inflight}")
+        if stage == "start":
+            parts.append(f"sources=eager:{eager}/token:{token}/context:{context}")
+        if last_asset_type and last_status:
+            last_label = last_asset_type
+            if last_file_name:
+                last_label = f"{last_label}:{last_file_name}"
+            parts.append(f"last={last_status}@{last_label}")
+        return " ".join(parts)
+
     def _execute_export_sync(self, parsed, progress_callback=None) -> tuple[ExportBundleResult, int, dict[str, object], dict[str, Any]]:
+        export_gateway = NapCatGateway(self._settings)
         history_page_size = max(100, parsed.limit, min(parsed.data_count or 0, 500))
         out_path = parsed.out_path or build_default_output_path(
             self._settings.export_dir,
@@ -806,90 +891,100 @@ class WatchConversationView:
             chat_id=self._request.chat_id,
             fmt=parsed.fmt,
         )
-        request = ExportRequest(
-            chat_type=self._request.chat_type,
-            chat_id=self._request.chat_id,
-            chat_name=self._request.chat_name,
-            limit=parsed.data_count or parsed.limit,
-            include_raw=parsed.include_raw,
-        )
-        if parsed.interval is None:
-            if parsed.data_count:
-                snapshot = self._gateway.fetch_snapshot_tail(
-                    request,
-                    data_count=parsed.data_count,
-                    page_size=history_page_size,
-                    progress_callback=progress_callback,
-                )
-            else:
-                snapshot = self._gateway.fetch_snapshot(request)
-        else:
-            if interval_is_full_history(parsed.interval):
-                snapshot = self._gateway.fetch_full_snapshot(
-                    request,
-                    page_size=history_page_size,
-                    progress_callback=progress_callback,
-                )
-                resolved_since = snapshot.metadata.get("resolved_since")
-                resolved_until = snapshot.metadata.get("resolved_until")
-                if resolved_since:
-                    snapshot.metadata["resolved_since"] = format_export_datetime(
-                        datetime.fromisoformat(str(resolved_since))
-                    )
-                if resolved_until:
-                    snapshot.metadata["resolved_until"] = format_export_datetime(
-                        datetime.fromisoformat(str(resolved_until))
-                    )
-            else:
-                bounds = None
-                if interval_needs_history_bounds(parsed.interval):
-                    special_kinds = interval_special_kinds(parsed.interval)
-                    bounds = self._gateway.get_history_bounds(
-                        request,
-                        page_size=history_page_size,
-                        need_earliest="earliest_content" in special_kinds,
-                        need_final="final_content" in special_kinds,
-                        progress_callback=progress_callback,
-                    )
-                interval_start, interval_end = resolve_interval(parsed.interval, bounds=bounds)
-                interval_request = request.model_copy(update={"since": interval_start, "until": interval_end})
+        cleanup_done = False
+        try:
+            request = ExportRequest(
+                chat_type=self._request.chat_type,
+                chat_id=self._request.chat_id,
+                chat_name=self._request.chat_name,
+                limit=parsed.data_count or parsed.limit,
+                include_raw=parsed.include_raw,
+            )
+            if parsed.interval is None:
                 if parsed.data_count:
-                    snapshot = self._gateway.fetch_snapshot_tail_between(
-                        interval_request,
+                    snapshot = export_gateway.fetch_snapshot_tail(
+                        request,
                         data_count=parsed.data_count,
                         page_size=history_page_size,
                         progress_callback=progress_callback,
                     )
                 else:
-                    snapshot = self._gateway.fetch_snapshot_between(
-                        interval_request,
+                    snapshot = export_gateway.fetch_snapshot(request)
+            else:
+                if interval_is_full_history(parsed.interval):
+                    snapshot = export_gateway.fetch_full_snapshot(
+                        request,
                         page_size=history_page_size,
                         progress_callback=progress_callback,
                     )
-                snapshot.metadata["resolved_since"] = format_export_datetime(min(interval_start, interval_end))
-                snapshot.metadata["resolved_until"] = format_export_datetime(max(interval_start, interval_end))
-                snapshot.metadata["interval_mode"] = "closed"
-        normalized = self._service.build_snapshot(snapshot, include_raw=parsed.include_raw)
-        normalized = trim_snapshot_to_last_messages(normalized, data_count=parsed.data_count)
-        normalized = apply_export_profile(normalized, parsed.profile)
-        bundle = self._service.write_bundle(
-            normalized,
-            out_path,
-            fmt=parsed.fmt,
-            media_resolution_mode="napcat_only",
-            media_download_manager=(
-                self._gateway.build_media_download_manager()
-                if hasattr(self._gateway, "build_media_download_manager")
-                else None
-            ),
-            progress_callback=progress_callback,
-        )
-        cleanup_stats = cleanup_gateway_media_cache(
-            self._gateway,
-            logger=self._logger,
-        )
-        content_summary = build_export_content_summary(normalized, bundle, profile=parsed.profile)
-        return bundle, len(normalized.messages), content_summary, cleanup_stats
+                    resolved_since = snapshot.metadata.get("resolved_since")
+                    resolved_until = snapshot.metadata.get("resolved_until")
+                    if resolved_since:
+                        snapshot.metadata["resolved_since"] = format_export_datetime(
+                            datetime.fromisoformat(str(resolved_since))
+                        )
+                    if resolved_until:
+                        snapshot.metadata["resolved_until"] = format_export_datetime(
+                            datetime.fromisoformat(str(resolved_until))
+                        )
+                else:
+                    bounds = None
+                    if interval_needs_history_bounds(parsed.interval):
+                        special_kinds = interval_special_kinds(parsed.interval)
+                        bounds = export_gateway.get_history_bounds(
+                            request,
+                            page_size=history_page_size,
+                            need_earliest="earliest_content" in special_kinds,
+                            need_final="final_content" in special_kinds,
+                            progress_callback=progress_callback,
+                        )
+                    interval_start, interval_end = resolve_interval(parsed.interval, bounds=bounds)
+                    interval_request = request.model_copy(update={"since": interval_start, "until": interval_end})
+                    if parsed.data_count:
+                        snapshot = export_gateway.fetch_snapshot_tail_between(
+                            interval_request,
+                            data_count=parsed.data_count,
+                            page_size=history_page_size,
+                            progress_callback=progress_callback,
+                        )
+                    else:
+                        snapshot = export_gateway.fetch_snapshot_between(
+                            interval_request,
+                            page_size=history_page_size,
+                            progress_callback=progress_callback,
+                        )
+                    snapshot.metadata["resolved_since"] = format_export_datetime(min(interval_start, interval_end))
+                    snapshot.metadata["resolved_until"] = format_export_datetime(max(interval_start, interval_end))
+                    snapshot.metadata["interval_mode"] = "closed"
+            normalized = self._service.build_snapshot(snapshot, include_raw=parsed.include_raw)
+            normalized = trim_snapshot_to_last_messages(normalized, data_count=parsed.data_count)
+            normalized = apply_export_profile(normalized, parsed.profile)
+            bundle = self._service.write_bundle(
+                normalized,
+                out_path,
+                fmt=parsed.fmt,
+                media_resolution_mode="napcat_only",
+                media_download_manager=(
+                    export_gateway.build_media_download_manager()
+                    if hasattr(export_gateway, "build_media_download_manager")
+                    else None
+                ),
+                progress_callback=progress_callback,
+            )
+            cleanup_stats = cleanup_gateway_media_cache(
+                export_gateway,
+                logger=self._logger,
+            )
+            cleanup_done = True
+            content_summary = build_export_content_summary(normalized, bundle, profile=parsed.profile)
+            return bundle, len(normalized.messages), content_summary, cleanup_stats
+        finally:
+            if not cleanup_done:
+                cleanup_gateway_media_cache(
+                    export_gateway,
+                    logger=self._logger,
+                )
+            export_gateway.close()
 
     def _build_key_bindings(self) -> KeyBindings:
         bindings = KeyBindings()
@@ -1050,10 +1145,12 @@ class WatchConversationView:
         self._command_input.buffer.document = Document(text=new_text, cursor_position=new_cursor)
 
     def _get_status_line(self) -> str:
+        lines: list[str] = []
         if self._notice_text:
-            lines = [self._notice_text, self._status_text]
-        else:
-            lines = [self._status_text]
+            lines.append(self._notice_text)
+        if self._download_notice_text:
+            lines.append(self._download_notice_text)
+        lines.append(self._status_text)
         return "\n".join(self._wrap_lines(lines))
 
     def _get_help_line(self) -> str:
@@ -1316,7 +1413,14 @@ def _friendly_watch_runtime_notice(prefix: str, exc: Exception, *, suffix: str) 
     return f"{prefix}：{message}。{suffix}"
 
 
-def _parse_options(argv: list[str]) -> tuple[list[str], dict[str, Any]]:
+
+
+def _parse_options(
+    argv: list[str],
+    *,
+    allowed_options: set[str] | None = None,
+    command_name: str | None = None,
+) -> tuple[list[str], dict[str, Any]]:
     positionals: list[str] = []
     options: dict[str, Any] = {}
     index = 0
@@ -1328,6 +1432,13 @@ def _parse_options(argv: list[str]) -> tuple[list[str], dict[str, Any]]:
             continue
 
         key = token[2:]
+        option_name = key.split("=", 1)[0]
+        if allowed_options is not None and option_name not in allowed_options:
+            supported = ", ".join(f"--{name}" for name in sorted(allowed_options))
+            prefix = f"{command_name} " if command_name else ""
+            raise ValueError(
+                f"{prefix}不支持参数 --{option_name}。支持的参数：{supported or '无'}"
+            )
         if "=" in key:
             option_name, option_value = key.split("=", 1)
             options[option_name] = option_value

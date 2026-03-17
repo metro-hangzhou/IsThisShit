@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
 import orjson
 from pypinyin import lazy_pinyin
 
+from qq_data_core.paths import atomic_write_bytes
 from .http_client import NapCatHttpClient
 from .models import ChatTarget, MetadataCache
+from qq_data_core.models import EXPORT_TIMEZONE
 
 
 ChatType = Literal["group", "private"]
@@ -20,6 +23,8 @@ class NapCatTargetLookupError(LookupError):
 
 
 class NapCatMetadataDirectory:
+    CACHE_TTL = timedelta(minutes=5)
+
     def __init__(
         self,
         client: NapCatHttpClient,
@@ -41,6 +46,13 @@ class NapCatMetadataDirectory:
             self._cache[chat_type] = self._refresh(chat_type)
         elif self._cache[chat_type] is None:
             self._cache[chat_type] = self._load_cache(chat_type)
+        cache = self._cache[chat_type]
+        if cache is not None and self._is_stale(cache):
+            with_refresh_fallback = cache
+            try:
+                self._cache[chat_type] = self._refresh(chat_type)
+            except Exception:
+                self._cache[chat_type] = with_refresh_fallback
         return list(self._cache[chat_type].targets if self._cache[chat_type] is not None else [])
 
     def search(
@@ -130,7 +142,17 @@ class NapCatMetadataDirectory:
     def _persist_cache(self, chat_type: ChatType, cache: MetadataCache) -> None:
         path = self._cache_path(chat_type)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(orjson.dumps(cache.model_dump(mode="json"), option=orjson.OPT_INDENT_2))
+        atomic_write_bytes(path, orjson.dumps(cache.model_dump(mode="json"), option=orjson.OPT_INDENT_2))
+
+    def _is_stale(self, cache: MetadataCache) -> bool:
+        refreshed_at = cache.refreshed_at
+        if refreshed_at is None:
+            return True
+        try:
+            refreshed = refreshed_at.astimezone(EXPORT_TIMEZONE)
+        except Exception:
+            return True
+        return datetime.now(EXPORT_TIMEZONE) - refreshed > self.CACHE_TTL
 
     def _cache_path(self, chat_type: ChatType) -> Path:
         file_name = "groups.json" if chat_type == "group" else "friends.json"

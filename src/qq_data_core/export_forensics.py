@@ -10,6 +10,7 @@ from typing import Any, Literal
 import orjson
 
 from .models import EXPORT_TIMEZONE, MaterializedAsset, NormalizedMessage
+from .paths import build_timestamp_token
 
 StrictMissingMode = Literal["off", "collect", "abort", "threshold"]
 ForensicDepth = Literal["standard", "deep"]
@@ -116,7 +117,7 @@ class ExportForensicsCollector:
         self._chat_id = chat_id
         self._policy = policy
         self._command_context = dict(command_context or {})
-        stamp = datetime.now(EXPORT_TIMEZONE).strftime("%Y%m%d_%H%M%S")
+        stamp = build_timestamp_token(include_pid=True)
         self._run_id = f"{chat_type}_{chat_id}_{stamp}"
         self._run_dir = self._state_dir / "export_forensics" / self._run_id
         self._preflight_path = self._run_dir / "preflight.json"
