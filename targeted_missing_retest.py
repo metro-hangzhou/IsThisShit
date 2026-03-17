@@ -17,7 +17,7 @@ EXPORT_TIME_FORMAT = "%Y-%m-%d_%H-%M-%S"
 
 def _bootstrap_repo_imports() -> None:
     repo_root = Path(__file__).resolve().parent
-    candidates = [repo_root / "src", repo_root]
+    candidates = [repo_root / "runtime_site_packages", repo_root / "src", repo_root]
     for candidate in reversed(candidates):
         candidate_str = str(candidate)
         if candidate.exists() and candidate_str not in sys.path:
