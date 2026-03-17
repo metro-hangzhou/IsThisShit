@@ -93,11 +93,8 @@ goto run_cli
 :close_existing_cli
 if /I "%CLI_KILL_EXISTING%"=="0" goto :eof
 if not exist "%_POWERSHELL%" goto :eof
-set "_KILLED_COUNT="
-for /f "usebackq delims=" %%I in (`"%_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -Command "$repo=(Resolve-Path '.').Path.ToLowerInvariant(); $targets=Get-CimInstance Win32_Process | Where-Object { $cmd=[string]$_.CommandLine; $name=[string]$_.Name; $cmd -and $cmd.ToLowerInvariant().Contains($repo) -and $cmd -match '(^|[ ''\"=])app\.py([ ''\"$]|$)' -and $name -match '^(python|py)(w)?\.exe$' }; $targets | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }; ($targets | Measure-Object).Count"` ) do (
-  set "_KILLED_COUNT=%%I"
-)
-if defined _KILLED_COUNT if not "!_KILLED_COUNT!"=="0" echo Closed !_KILLED_COUNT! existing CLI process^(es^).
+if not exist "%~dp0close_existing_cli.ps1" goto :eof
+"%_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%~dp0close_existing_cli.ps1" -RepoPath "%cd%" >nul 2>nul
 goto :eof
 
 :update_main_branch
