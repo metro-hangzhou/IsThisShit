@@ -27,6 +27,10 @@ def _bootstrap_repo_imports() -> None:
 _bootstrap_repo_imports()
 
 
+def _json_dumps_safe(payload: Any, *, indent: int | None = None) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=indent, default=str)
+
+
 @dataclass(frozen=True, slots=True)
 class Strategy:
     name: str
@@ -423,7 +427,7 @@ def _run_cluster_strategy(
         trace.write_event(str(update.get("phase") or "progress"), update)
         phase = str(update.get("phase") or "")
         if phase in {"materialize_asset_substep", "download_assets", "materialize_assets", "interval_scan", "write_data_file"}:
-            progress_lines.append(json.dumps(update, ensure_ascii=False))
+            progress_lines.append(_json_dumps_safe(update))
 
     returncode = 0
     error_message: str | None = None
@@ -527,8 +531,8 @@ def _run_cluster_strategy(
         f"cli_log_path={get_cli_log_path() or ''}",
         f"forensic_summary_path={forensic_summary_path or ''}",
         f"cleanup_stats={cleanup_stats or {}}",
-        f"content_summary={json.dumps(content_summary, ensure_ascii=False) if content_summary is not None else ''}",
-        f"summary={json.dumps(summary, ensure_ascii=False) if summary is not None else ''}",
+        f"content_summary={_json_dumps_safe(content_summary) if content_summary is not None else ''}",
+        f"summary={_json_dumps_safe(summary) if summary is not None else ''}",
         "--- progress ---",
         *progress_lines,
     ]
@@ -633,7 +637,7 @@ def _none_if_blank(value: object) -> str | None:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(_json_dumps_safe(payload, indent=2), encoding="utf-8")
 
 if __name__ == "__main__":
     raise SystemExit(main())
