@@ -268,7 +268,16 @@ class SlashRepl:
             self._prime_target_cache("group", quiet=True)
             self._prime_target_cache("private", quiet=True)
         except Exception as exc:
-            self._console.print(f"note: {exc}")
+            log_path = get_cli_log_path()
+            self._console.print(
+                "\n".join(
+                    [
+                        f"note: {exc}",
+                        "note: 群/好友补全依赖 onebot_http；当前不可用时，像 /export group ssj 这样的目标补全不会弹出。",
+                        f"note: 如需排查，请把 CLI 日志发回来：{log_path or ''}",
+                    ]
+                )
+            )
 
     def _handle_status(self) -> None:
         from qq_data_cli.startup_capture import capture_startup_snapshot
@@ -1264,7 +1273,14 @@ class SlashRepl:
             self._ensure_endpoint_ready("onebot_http")
             gateway = self._require_gateway()
             gateway.list_targets(chat_type, refresh=True, limit=32)
-        except Exception:
+        except Exception as exc:
+            self._logger.warning(
+                "completion_prime_failed chat_type=%s quiet=%s has_cached_targets=%s error=%s",
+                chat_type,
+                quiet,
+                has_cached_targets,
+                str(exc or "").strip() or exc.__class__.__name__,
+            )
             if has_cached_targets:
                 self._completion_prime_failed_at[chat_type] = monotonic()
                 return
