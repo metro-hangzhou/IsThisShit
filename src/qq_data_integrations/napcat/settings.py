@@ -15,7 +15,7 @@ class NapCatSettings(BaseModel):
     napcat_dir: Path | None = None
     napcat_launcher_path: Path | None = None
     auto_start_napcat: bool = True
-    auto_configure_onebot: bool = False
+    auto_configure_onebot: bool = True
     http_url: str = Field(default="http://127.0.0.1:3000")
     ws_url: str = Field(default="ws://127.0.0.1:3001")
     access_token: str | None = None
@@ -103,7 +103,7 @@ class NapCatSettings(BaseModel):
             auto_start_napcat=_parse_bool_env(os.getenv("NAPCAT_AUTO_START"), default=True),
             auto_configure_onebot=_parse_bool_env(
                 os.getenv("NAPCAT_AUTO_CONFIGURE_ONEBOT"),
-                default=False,
+                default=True,
             ),
             http_url=os.getenv("NAPCAT_HTTP_URL", http_defaults["url"]),
             ws_url=os.getenv("NAPCAT_WS_URL", ws_defaults["url"]),
