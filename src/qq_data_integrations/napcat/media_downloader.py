@@ -537,8 +537,8 @@ class NapCatMediaDownloader:
                         request,
                         substep="forward_missing_classification",
                         classification=classified_forward_missing,
-                        )
-                        return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
+                    )
+                    return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
         context_resolved = None
         if not self._has_forward_parent_hint(hint):
             context_resolved = self._resolve_via_context_only(
