@@ -57,6 +57,7 @@ class NapCatMediaDownloader:
         self._prefetched_forward_media: dict[tuple[Any, ...], tuple[Path | None, str | None]] = {}
         self._prefetched_forward_media_payloads: dict[tuple[Any, ...], dict[str, Any] | None] = {}
         self._shared_media_outcomes: dict[tuple[Any, ...], tuple[Path | None, str | None]] = {}
+        self._public_token_action_outcomes: dict[tuple[str, str], dict[str, Any] | None] = {}
         self._remote_base_url = (
             remote_base_url
             or getattr(client, "_base_url", None)
@@ -121,6 +122,7 @@ class NapCatMediaDownloader:
         self._prefetched_forward_media.clear()
         self._prefetched_forward_media_payloads.clear()
         self._shared_media_outcomes.clear()
+        self._public_token_action_outcomes.clear()
         self._old_context_failure_buckets.clear()
         self._old_context_skip_logged.clear()
         self._old_context_expired_buckets.clear()
@@ -368,14 +370,6 @@ class NapCatMediaDownloader:
                 classified_forward_missing = self._classify_forward_missing(request)
                 if classified_forward_missing is not None:
                     return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
-            direct_forward_file_id = None
-            if asset_type == "file":
-                direct_forward_file_id = self._resolve_via_direct_file_id(
-                    request,
-                    trace_callback=trace_callback,
-                )
-                if direct_forward_file_id not in {None, (None, None)}:
-                    return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
             passive_forward_resolved = self._download_via_forward_context(
                 request,
                 materialize=False,
@@ -400,13 +394,12 @@ class NapCatMediaDownloader:
                 )
                 if targeted_forward_download not in {None, (None, None)}:
                     return self._remember_shared_outcome(shared_key, request, targeted_forward_download)
-            if asset_type != "file":
-                direct_forward_file_id = self._resolve_via_direct_file_id(
-                    request,
-                    trace_callback=trace_callback,
-                )
-                if direct_forward_file_id not in {None, (None, None)}:
-                    return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
+            direct_forward_file_id = self._resolve_via_direct_file_id(
+                request,
+                trace_callback=trace_callback,
+            )
+            if direct_forward_file_id not in {None, (None, None)}:
+                return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
         context_resolved = None
         if not self._has_forward_parent_hint(hint):
             context_resolved = self._resolve_via_context_only(
@@ -1209,8 +1202,27 @@ class NapCatMediaDownloader:
         if not normalized_action or not token:
             return None
         timeout_s = self.PUBLIC_TOKEN_ACTION_TIMEOUT_S
+        cache_key = (normalized_action, token)
 
         primary_substep = f"public_token_{normalized_action}"
+        if cache_key in self._public_token_action_outcomes:
+            cached_payload = self._public_token_action_outcomes[cache_key]
+            if request is not None:
+                self._emit_asset_substep_trace(
+                    trace_callback,
+                    request,
+                    stage="done",
+                    substep=primary_substep,
+                    timeout_s=timeout_s,
+                    status="cached" if cached_payload is not None else "cached_skip",
+                    elapsed_s=0.0,
+                    detail=(
+                        "reused cached public token result"
+                        if cached_payload is not None
+                        else "skipped repeated public token retry after cached failure"
+                    ),
+                )
+            return cached_payload
         if request is not None:
             self._emit_asset_substep_trace(
                 trace_callback,
@@ -1250,6 +1262,7 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
+            self._public_token_action_outcomes[cache_key] = None
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
@@ -1264,7 +1277,7 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
-            pass
+            payload = None
         else:
             elapsed_s = monotonic() - started
             if request is not None:
@@ -1284,6 +1297,7 @@ class NapCatMediaDownloader:
                     timeout_s=timeout_s,
                     elapsed_s=elapsed_s,
                 )
+            self._public_token_action_outcomes[cache_key] = payload
             return payload
 
         # Compatibility fallback for runtimes that still expect `file_id`.
@@ -1327,6 +1341,7 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
+            self._public_token_action_outcomes[cache_key] = None
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
@@ -1341,6 +1356,7 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
+            self._public_token_action_outcomes[cache_key] = None
             return None
         elapsed_s = monotonic() - started
         if request is not None:
@@ -1360,6 +1376,7 @@ class NapCatMediaDownloader:
                 timeout_s=timeout_s,
                 elapsed_s=elapsed_s,
             )
+        self._public_token_action_outcomes[cache_key] = payload
         return payload
 
     def _resolve_from_fast_payload(

@@ -12,16 +12,21 @@ from qq_data_integrations.napcat.fast_history_client import (
     NapCatFastHistoryTimeoutError,
     NapCatFastHistoryUnavailable,
 )
-from qq_data_integrations.napcat.http_client import NapCatApiError
+from qq_data_integrations.napcat.http_client import NapCatApiError, NapCatApiTimeoutError
 from qq_data_integrations.napcat.media_downloader import NapCatMediaDownloader
 
 
 class _FakeClient:
     def __init__(
-        self, payload: dict[str, str] | None = None, *, fail: bool = False
+        self,
+        payload: dict[str, str] | None = None,
+        *,
+        fail: bool = False,
+        timeout_for: set[str] | None = None,
     ) -> None:
         self.payload = payload or {}
         self.fail = fail
+        self.timeout_for = set(timeout_for or set())
         self.calls: list[tuple[object, ...]] = []
         self.timeouts: list[tuple[str, float | None]] = []
 
@@ -34,6 +39,8 @@ class _FakeClient:
     ):
         self.calls.append(("image", file_id, file))
         self.timeouts.append(("image", timeout))
+        if "image" in self.timeout_for:
+            raise NapCatApiTimeoutError("NapCat action timed out: get_image")
         if self.fail:
             raise NapCatApiError("boom")
         return self.payload
@@ -47,6 +54,8 @@ class _FakeClient:
     ):
         self.calls.append(("file", file_id, file))
         self.timeouts.append(("file", timeout))
+        if "file" in self.timeout_for:
+            raise NapCatApiTimeoutError("NapCat action timed out: get_file")
         if self.fail:
             raise NapCatApiError("boom")
         return self.payload
@@ -61,6 +70,8 @@ class _FakeClient:
     ):
         self.calls.append(("record", file_id, file, out_format))
         self.timeouts.append(("record", timeout))
+        if "record" in self.timeout_for:
+            raise NapCatApiTimeoutError("NapCat action timed out: get_record")
         if self.fail:
             raise NapCatApiError("boom")
         return self.payload
@@ -441,12 +452,24 @@ def test_media_downloader_resolve_for_export_downloads_remote_url_from_direct_fi
         assert client.calls == [("file", "/2e3b729d-c6ab-4236-93f9-660bb90bfe3c", None)]
 
 
-def test_media_downloader_prefers_direct_file_id_before_forward_hydration_for_forward_file() -> None:
-    with _repo_temp_dir("media_downloader_forward_direct_file_id_first") as tmp_path:
+def test_media_downloader_prefers_forward_hydration_before_direct_file_id_for_forward_file() -> None:
+    with _repo_temp_dir("media_downloader_forward_context_first") as tmp_path:
         exported_file = tmp_path / "forward-uploaded.bin"
         exported_file.write_bytes(b"forward-file")
         client = _FakeClient({"file": str(exported_file)})
-        fast_client = _FakeFastClient(forward_exception=RuntimeError("should-not-run"))
+        fast_client = _FakeFastClient(
+            forward_payload={
+                "assets": [
+                    {
+                        "asset_type": "file",
+                        "file_name": "uploaded_file",
+                        "file_id": "/8311cda0-18b5-11f1-bb89-5254001607c6",
+                        "public_action": "get_file",
+                        "public_file_token": "forward-token-1",
+                    }
+                ]
+            }
+        )
         downloader = NapCatMediaDownloader(  # type: ignore[arg-type]
             client,
             fast_client=fast_client,  # type: ignore[arg-type]
@@ -468,9 +491,11 @@ def test_media_downloader_prefers_direct_file_id_before_forward_hydration_for_fo
             }
         )
 
-        assert resolved == (exported_file.resolve(), "napcat_segment_file_id_get_file")
-        assert client.calls == [("file", "/8311cda0-18b5-11f1-bb89-5254001607c6", None)]
-        assert fast_client.forward_calls == []
+        assert resolved == (exported_file.resolve(), "napcat_public_token_get_file")
+        assert client.calls == [("file", None, "forward-token-1")]
+        assert fast_client.forward_calls == [
+            ("forward-parent-msg", "forward-parent-element", "751365230", 2)
+        ]
 
 
 def test_media_downloader_classifies_old_public_token_remote_miss_as_expired() -> None:
@@ -598,12 +623,15 @@ def test_media_downloader_does_not_auto_classify_non_old_public_action_remote_mi
             remote_cache_dir=tmp_path / "cache",
             remote_transport=httpx.MockTransport(handler),
         )
+        recent_timestamp_ms = int(
+            (datetime.now(timezone.utc) - timedelta(days=3)).timestamp() * 1000
+        )
 
         resolved = downloader.resolve_for_export(
             {
                 "asset_type": "image",
                 "file_name": "recent-expired.png",
-                "timestamp_ms": 1771113600000,
+                "timestamp_ms": recent_timestamp_ms,
                 "download_hint": {
                     "message_id_raw": "msg-recent-expired",
                     "element_id": "element-recent-expired",
@@ -614,10 +642,62 @@ def test_media_downloader_does_not_auto_classify_non_old_public_action_remote_mi
         )
 
         assert resolved == (None, None)
-        assert client.calls == [
-            ("image", None, "token-recent-expired"),
-            ("image", None, "token-recent-expired"),
+        assert client.calls == [("image", None, "token-recent-expired")]
+
+
+def test_media_downloader_caches_failed_public_token_attempts_within_forward_resolution() -> None:
+    client = _FakeClient(timeout_for={"file"})
+    fast_client = _FakeFastClient(
+        forward_payload_sequence=[
+            {
+                "assets": [
+                    {
+                        "asset_type": "video",
+                        "file_name": "demo.mp4",
+                        "public_action": "get_file",
+                        "public_file_token": "timeout-token-1",
+                    }
+                ]
+            },
+            {
+                "assets": [
+                    {
+                        "asset_type": "video",
+                        "file_name": "demo.mp4",
+                        "public_action": "get_file",
+                        "public_file_token": "timeout-token-1",
+                    }
+                ],
+                "targeted_mode": "single_target_download",
+            },
         ]
+    )
+    downloader = NapCatMediaDownloader(  # type: ignore[arg-type]
+        client,
+        fast_client=fast_client,  # type: ignore[arg-type]
+    )
+
+    resolved = downloader.resolve_for_export(
+        {
+            "asset_type": "video",
+            "file_name": "demo.mp4",
+            "download_hint": {
+                "_forward_parent": {
+                    "message_id_raw": "forward-parent-msg",
+                    "element_id": "forward-parent-element",
+                    "peer_uid": "751365230",
+                    "chat_type_raw": 2,
+                }
+            },
+        }
+    )
+
+    assert resolved == (None, None)
+    assert client.calls == [("file", None, "timeout-token-1")]
+    assert fast_client.forward_calls == [
+        ("forward-parent-msg", "forward-parent-element", "751365230", 2),
+        ("forward-parent-msg", "forward-parent-element", "751365230", 2),
+    ]
 
 
 def test_media_downloader_classifies_stale_non_old_public_action_remote_miss_as_expired() -> None:
