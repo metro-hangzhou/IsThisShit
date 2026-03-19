@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from dataclasses import dataclass
 from hashlib import sha1
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
@@ -30,6 +32,30 @@ RequestKind = Literal[
     "same_sender",
 ]
 FinalStatus = Literal["resolved", "uncertain", "unrecoverable", "info"]
+
+_FORWARD_TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("video", re.compile(r"\[video:(?P<name>[^\]\r\n]+)\]")),
+    ("file", re.compile(r"\[(?:uploaded_file_name|file):(?P<name>[^\]\r\n]+)\]")),
+)
+
+
+@dataclass(slots=True)
+class ForwardDegradedAssetCandidate:
+    asset_id: str
+    message_id: str | None
+    message_uid: str | None
+    asset_type: str
+    resource_state: str
+    file_name: str | None
+    digest: str | None = None
+    exported_rel_path: str | None = None
+    source_path: str | None = None
+    lineage: Any | None = None
+    resolver: str | None = None
+    forward_degraded: bool = True
+    forward_parent_message_id: str | None = None
+    forward_depth: int | None = None
+    context_excerpt: str | None = None
 
 
 class AnalysisEvidenceRef(BaseModel):
@@ -454,6 +480,15 @@ class ExpiredAssetInferencePreprocessor:
             annotations=[],
             metadata={
                 "status": status,
+                "asset_type": _asset_type(asset),
+                "file_name": _asset_file_name(asset),
+                "resource_state": _resource_state(asset),
+                "forward_degraded": _bool_value(getattr(asset, "forward_degraded", None)),
+                "forward_parent_message_id": _string_or_none(
+                    getattr(asset, "forward_parent_message_id", None)
+                ),
+                "forward_depth": _int_or_none(getattr(asset, "forward_depth", None)),
+                "context_excerpt": _string_or_none(getattr(asset, "context_excerpt", None)),
                 "hypothesis_text": hypothesis_text,
                 "same_asset_occurrence_ids": [_asset_id(item) for item in same_asset_occurrences if _asset_id(item)],
                 "round_traces": [item.model_dump(mode="json") for item in round_traces],
@@ -479,6 +514,15 @@ class ExpiredAssetInferencePreprocessor:
             tags=list(asset_view.labels),
             metadata={
                 "status": status,
+                "asset_type": _asset_type(asset),
+                "file_name": _asset_file_name(asset),
+                "resource_state": _resource_state(asset),
+                "forward_degraded": _bool_value(getattr(asset, "forward_degraded", None)),
+                "forward_parent_message_id": _string_or_none(
+                    getattr(asset, "forward_parent_message_id", None)
+                ),
+                "forward_depth": _int_or_none(getattr(asset, "forward_depth", None)),
+                "context_excerpt": _string_or_none(getattr(asset, "context_excerpt", None)),
                 "budget_snapshot": budget_snapshot,
                 "signal_summary": signal_summary,
                 "hypothesis_text": hypothesis_text,
@@ -575,6 +619,7 @@ class ExpiredAssetInferencePreprocessor:
     ) -> dict[str, Any]:
         return {
             "asset_id": _asset_id(asset),
+            "asset_type": _asset_type(asset),
             "file_name": _asset_file_name(asset),
             "resource_state": _resource_state(asset),
             "same_asset_occurrence_count": len(
@@ -585,17 +630,29 @@ class ExpiredAssetInferencePreprocessor:
                 }
             ),
             "context_message_count": len(aggregate_messages),
+            "forward_degraded": _bool_value(getattr(asset, "forward_degraded", None)),
+            "forward_parent_message_id": _string_or_none(
+                getattr(asset, "forward_parent_message_id", None)
+            ),
+            "forward_depth": getattr(asset, "forward_depth", None),
+            "context_excerpt": _string_or_none(getattr(asset, "context_excerpt", None)),
             "signal": dict(final_signal_summary),
         }
 
 
 def _base_evidence(asset: Any, message: Any | None) -> list[AnalysisEvidenceRef]:
+    note_parts = [
+        f"resource_state={_resource_state(asset)}",
+        f"asset_type={_asset_type(asset)}",
+    ]
+    if _bool_value(getattr(asset, "forward_degraded", None)):
+        note_parts.append("forward_degraded=true")
     refs = [
         AnalysisEvidenceRef(
             kind="asset",
             asset_id=_asset_id(asset),
             message_id=_message_id_from_asset(asset),
-            note=f"resource_state={_resource_state(asset)}; asset_type={_asset_type(asset)}",
+            note="; ".join(part for part in note_parts if part),
         )
     ]
     if message is not None:
@@ -909,6 +966,15 @@ def _string_or_none(value: Any) -> str | None:
     return text or None
 
 
+def _int_or_none(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_nontrivial_text(value: Any) -> bool:
     text = _string_or_none(value)
     if not text:
@@ -931,16 +997,110 @@ def _dedupe_preserve_order(values: Sequence[str]) -> list[str]:
     return output
 
 
+def _forward_degraded_assets_from_messages(
+    messages: Sequence[Any],
+    existing_assets: Sequence[Any],
+) -> list[ForwardDegradedAssetCandidate]:
+    existing_keys = {
+        (
+            _message_id_from_asset(asset) or "",
+            (_asset_type(asset) or "").strip().lower(),
+            (_asset_file_name(asset) or "").strip().lower(),
+        )
+        for asset in existing_assets
+        if _asset_type(asset) and _asset_file_name(asset)
+    }
+    output: list[ForwardDegradedAssetCandidate] = []
+    seen: set[str] = set()
+    for message in messages:
+        for candidate in _forward_degraded_assets_from_message(message):
+            dedupe_key = (
+                f"{candidate.message_id or ''}|"
+                f"{candidate.asset_type.lower()}|"
+                f"{(candidate.file_name or '').lower()}"
+            )
+            if dedupe_key in seen:
+                continue
+            if (
+                candidate.message_id or "",
+                candidate.asset_type.lower(),
+                (candidate.file_name or "").lower(),
+            ) in existing_keys:
+                continue
+            seen.add(dedupe_key)
+            output.append(candidate)
+    return output
+
+
+def _forward_degraded_assets_from_message(
+    message: Any,
+) -> list[ForwardDegradedAssetCandidate]:
+    output: list[ForwardDegradedAssetCandidate] = []
+    for segment_index, segment in enumerate(getattr(message, "segments", []) or []):
+        if _string_or_none(getattr(segment, "type", None)) != "forward":
+            continue
+        extra = getattr(segment, "extra", None) or {}
+        preview_lines = [
+            str(item).strip()
+            for item in (extra.get("preview_lines") or [])
+            if str(item).strip()
+        ]
+        detailed_text = _string_or_none(extra.get("detailed_text"))
+        forward_depth = extra.get("forward_depth")
+        for source_hint, text in (
+            *[(f"preview_line:{index}", line) for index, line in enumerate(preview_lines)],
+            ("detailed_text", detailed_text),
+        ):
+            if not text:
+                continue
+            for asset_type, file_name in _extract_forward_degraded_tokens(text):
+                asset_id = _make_id(
+                    "forward_degraded_asset",
+                    _message_id(message),
+                    segment_index,
+                    asset_type,
+                    file_name,
+                )
+                output.append(
+                    ForwardDegradedAssetCandidate(
+                        asset_id=asset_id,
+                        message_id=_message_id(message),
+                        message_uid=_string_or_none(getattr(message, "message_uid", None)),
+                        asset_type=asset_type,
+                        resource_state="missing",
+                        file_name=file_name,
+                        lineage=getattr(message, "lineage", None),
+                        resolver="forward_bundle_expander",
+                        forward_parent_message_id=_message_id(message),
+                        forward_depth=_int_or_none(forward_depth),
+                        context_excerpt=preview_text(text, 180) or None,
+                    )
+                )
+    return output
+
+
+def _extract_forward_degraded_tokens(value: str) -> list[tuple[str, str]]:
+    output: list[tuple[str, str]] = []
+    if not value:
+        return output
+    for asset_type, pattern in _FORWARD_TOKEN_PATTERNS:
+        for match in pattern.finditer(value):
+            file_name = _string_or_none(match.group("name"))
+            if not file_name:
+                continue
+            output.append((asset_type, file_name))
+    return output
+
+
 def _assets_from_context(context: Any) -> Sequence[Any]:
     direct = getattr(context, "assets", None)
-    if direct is not None:
-        return direct
     corpus = getattr(context, "corpus", None)
-    if corpus is not None:
-        nested = getattr(corpus, "assets", None)
-        if nested is not None:
-            return nested
-    return []
+    nested = getattr(corpus, "assets", None) if corpus is not None else None
+    assets = list(direct if direct is not None else (nested if nested is not None else []))
+    synthetic = _forward_degraded_assets_from_messages(_messages_from_context(context), assets)
+    if synthetic:
+        assets.extend(synthetic)
+    return assets
 
 
 def _messages_from_context(context: Any) -> Sequence[Any]:

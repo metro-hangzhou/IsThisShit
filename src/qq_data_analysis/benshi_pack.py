@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from pathlib import Path
+import re
 from typing import Any, Mapping, Sequence
 
 from qq_data_process.utils import preview_text, stable_digest
@@ -14,12 +15,17 @@ from .models import (
     BenshiAssetAggregateSummary,
     BenshiAssetSummary,
     BenshiDistributionBaselineSummary,
+    BenshiExpiredInferenceAggregateSummary,
+    BenshiExpiredInferenceSummaryItem,
     BenshiForwardAggregateSummary,
+    BenshiForwardDegradedAssetHint,
     BenshiForwardSummary,
     BenshiMissingMediaGap,
     BenshiOntologyDimension,
     BenshiOntologyPack,
     BenshiOntologyPopularForm,
+    BenshiReactionAggregateSummary,
+    BenshiReactionPatternSummary,
     BenshiOntologyTaxonomyItem,
     BenshiParticipantRoleCandidate,
     BenshiPreprocessOverlayItem,
@@ -41,6 +47,88 @@ _DEBUGISH_LABELS = {
     "strict_focus_non_target",
     "low_signal_chatter",
 }
+_REACTION_MODE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "amused_break": (
+        "绷",
+        "绷不住",
+        "蚌",
+        "蚌埠住了",
+        "笑死",
+        "乐死",
+        "草",
+        "艹",
+        "典中典",
+    ),
+    "mockery": (
+        "小丑",
+        "幽默",
+        "逆天",
+        "离谱",
+        "抽象",
+        "好似",
+        "典",
+        "节目效果",
+        "贵物",
+        "唐",
+    ),
+    "uniform_feedback": (
+        "？？",
+        "??",
+        "。。。",
+        "......",
+        "哈哈",
+        "哈哈哈",
+    ),
+    "meme_catch": (
+        "补档",
+        "返场",
+        "回放",
+        "库存",
+        "又来了",
+        "这下",
+        "接上了",
+        "串起来了",
+        "典中典",
+    ),
+    "disgust": (
+        "恶心",
+        "臭",
+        "有病",
+        "病得不轻",
+        "脑残",
+        "nt",
+        "真是屎",
+        "想吐",
+        "司马",
+        "晦气",
+    ),
+    "spectator": (
+        "围观",
+        "这啥",
+        "什么东西",
+        "什么情况",
+        "哪来的",
+        "咋回事",
+        "怎么回事",
+        "谁发的",
+        "这也行",
+        "什么鬼",
+        "真的假的",
+    ),
+}
+_REACTION_PATTERN_LABELS: dict[str, str] = {
+    "repeat_echo": "复读/回声",
+    "amused_break": "绷/乐",
+    "mockery": "嘲笑/阴阳",
+    "uniform_feedback": "整齐反馈",
+    "meme_catch": "接梗/顺嘴接",
+    "disgust": "嫌弃/排斥",
+    "spectator": "围观/惊诧",
+}
+_REACTION_SHORT_TEXT_MAX = 22
+_REACTION_PUNCT_ONLY_PATTERN = re.compile(r"^[\s\?\!？！，。\.~～…、]+$")
+_REACTION_SPLIT_PATTERN = re.compile(r"[:：]\s*", re.IGNORECASE)
+_FORWARD_TOKEN_PATTERN = re.compile(r"\[(video|uploaded_file_name|uploaded_file|file):([^\]]+)\]")
 
 
 class BenshiAnalysisPackBuilder:
@@ -50,12 +138,14 @@ class BenshiAnalysisPackBuilder:
         max_forward_summaries: int = 24,
         max_recurrence_summaries: int = 24,
         max_missing_media_gaps: int = 32,
+        max_expired_inference_items: int = 24,
         max_overlay_items: int = 24,
         distribution_baseline_path: str | Path | None = None,
     ) -> None:
         self.max_forward_summaries = max_forward_summaries
         self.max_recurrence_summaries = max_recurrence_summaries
         self.max_missing_media_gaps = max_missing_media_gaps
+        self.max_expired_inference_items = max_expired_inference_items
         self.max_overlay_items = max_overlay_items
         self.distribution_baseline_path = (
             Path(distribution_baseline_path)
@@ -69,6 +159,7 @@ class BenshiAnalysisPackBuilder:
             max_forward_summaries=self.max_forward_summaries,
             max_recurrence_summaries=self.max_recurrence_summaries,
             max_missing_media_gaps=self.max_missing_media_gaps,
+            max_expired_inference_items=self.max_expired_inference_items,
             max_overlay_items=self.max_overlay_items,
             distribution_baseline_path=self.distribution_baseline_path,
         )
@@ -80,6 +171,7 @@ def build_benshi_analysis_pack(
     max_forward_summaries: int = 24,
     max_recurrence_summaries: int = 24,
     max_missing_media_gaps: int = 32,
+    max_expired_inference_items: int = 24,
     max_overlay_items: int = 24,
     distribution_baseline_path: str | Path | None = None,
 ) -> BenshiAnalysisPack:
@@ -97,10 +189,26 @@ def build_benshi_analysis_pack(
         max_items=max_recurrence_summaries,
     )
     participant_role_candidates = _build_participant_role_candidates(materials)
+    reaction_summary, reaction_patterns = _build_reaction_summary(
+        materials,
+        participant_role_candidates=participant_role_candidates,
+        forward_summaries=forward_summaries,
+    )
     asset_summaries = _build_asset_summaries(materials)
     missing_media_gaps = _build_missing_media_gaps(
         materials,
         max_items=max_missing_media_gaps,
+    )
+    forward_degraded_asset_hints = _build_forward_degraded_asset_hints(
+        forward_summaries,
+        max_items=max_missing_media_gaps,
+    )
+    (
+        expired_inference_summary,
+        expired_inference_items,
+    ) = _build_expired_inference_summary(
+        materials,
+        max_items=max_expired_inference_items,
     )
     forward_aggregate = _build_forward_aggregate_summary(
         materials,
@@ -109,18 +217,22 @@ def build_benshi_analysis_pack(
     recurrence_aggregate = _build_recurrence_aggregate_summary(recurrence_summaries)
     asset_aggregate = _build_asset_aggregate_summary(asset_summaries)
     shi_component_summaries = _build_shi_component_summaries(
-        materials=materials,
-        selected_messages=selected_messages,
-        participant_role_candidates=participant_role_candidates,
-        forward_summary=forward_aggregate,
-        recurrence_summary=recurrence_aggregate,
-        asset_summary=asset_aggregate,
-        missing_media_gaps=missing_media_gaps,
-    )
+            materials=materials,
+            selected_messages=selected_messages,
+            participant_role_candidates=participant_role_candidates,
+            forward_summary=forward_aggregate,
+            recurrence_summary=recurrence_aggregate,
+            asset_summary=asset_aggregate,
+            missing_media_gaps=missing_media_gaps,
+            reaction_summary=reaction_summary,
+            forward_degraded_asset_hints=forward_degraded_asset_hints,
+        )
     shi_description_profile = _build_shi_description_profile(
         materials=materials,
         component_summaries=shi_component_summaries,
         missing_media_gaps=missing_media_gaps,
+        reaction_summary=reaction_summary,
+        forward_degraded_asset_hints=forward_degraded_asset_hints,
     )
     ontology_pack = _build_benshi_ontology_pack()
     distribution_baseline_summary, distribution_warnings = _load_distribution_baseline_summary(
@@ -137,7 +249,10 @@ def build_benshi_analysis_pack(
             forward_summaries=forward_summaries,
             recurrence_summaries=recurrence_summaries,
             missing_media_gaps=missing_media_gaps,
+            forward_degraded_asset_hints=forward_degraded_asset_hints,
+            expired_inference_summary=expired_inference_summary,
             overlay_summary=overlay_summary,
+            reaction_summary=reaction_summary,
         ),
         stats=materials.stats,
         selected_messages=selected_messages,
@@ -146,13 +261,18 @@ def build_benshi_analysis_pack(
         recurrence_summary=recurrence_aggregate,
         recurrence_summaries=recurrence_summaries,
         participant_role_candidates=participant_role_candidates,
+        reaction_summary=reaction_summary,
+        reaction_patterns=reaction_patterns,
         asset_summary=asset_aggregate,
         asset_summaries=asset_summaries,
         shi_component_summaries=shi_component_summaries,
         shi_description_profile=shi_description_profile,
         ontology_pack=ontology_pack,
         distribution_baseline_summary=distribution_baseline_summary,
+        expired_inference_summary=expired_inference_summary,
+        expired_inference_items=expired_inference_items,
         missing_media_gaps=missing_media_gaps,
+        forward_degraded_asset_hints=forward_degraded_asset_hints,
         preprocess_overlay_summary=overlay_summary,
         warnings=warnings,
     )
@@ -425,6 +545,299 @@ def _build_participant_role_candidates(
     return candidates
 
 
+def _build_reaction_summary(
+    materials: AnalysisMaterials,
+    *,
+    participant_role_candidates: Sequence[BenshiParticipantRoleCandidate],
+    forward_summaries: Sequence[BenshiForwardSummary],
+) -> tuple[BenshiReactionAggregateSummary, list[BenshiReactionPatternSummary]]:
+    dominant_senders = {
+        item.sender_id
+        for item in participant_role_candidates
+        if {"dominant_sender", "forward_dumper"} & set(item.candidate_roles)
+    }
+    reaction_records: list[dict[str, Any]] = []
+    repeated_phrase_buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    reactor_ids: set[str] = set()
+    reply_participation_count = 0
+    short_reaction_count = 0
+
+    for message in materials.messages:
+        if not _is_reaction_candidate_message(message):
+            continue
+        if dominant_senders and message.sender_id in dominant_senders:
+            continue
+        normalized_text = _reaction_message_text(message)
+        if not normalized_text:
+            continue
+        reaction_modes = _reaction_modes_for_text(normalized_text)
+        if not reaction_modes and not _looks_like_short_reaction_text(normalized_text):
+            continue
+        reaction_records.append(
+            {
+                "scope": "top_level",
+                "message_uid": message.message_uid,
+                "message_id": message.message_id,
+                "timestamp_iso": message.timestamp_iso,
+                "sender_id": message.sender_id,
+                "sender_name": message.sender_name,
+                "forward_summary_id": None,
+                "text": normalized_text,
+                "normalized_text": _normalize_reaction_text(normalized_text),
+                "pattern_ids": list(reaction_modes),
+            }
+        )
+        reactor_ids.add(message.sender_id)
+        if message.features.has_reply:
+            reply_participation_count += 1
+        if len(normalized_text) <= _REACTION_SHORT_TEXT_MAX:
+            short_reaction_count += 1
+        normalized_key = _normalize_reaction_text(normalized_text)
+        if normalized_key:
+            repeated_phrase_buckets[normalized_key].append(reaction_records[-1])
+
+    for summary in forward_summaries:
+        for reaction_line in _extract_forward_internal_reaction_lines(summary):
+            text = reaction_line["text"]
+            reaction_modes = _reaction_modes_for_text(text)
+            if not reaction_modes and not _looks_like_short_reaction_text(text):
+                continue
+            normalized_key = _normalize_reaction_text(text)
+            record = {
+                "scope": "forward_internal",
+                "message_uid": None,
+                "message_id": None,
+                "timestamp_iso": summary.outer_timestamp_iso,
+                "sender_id": reaction_line.get("sender_key"),
+                "sender_name": reaction_line.get("sender_name"),
+                "forward_summary_id": summary.summary_id,
+                "text": text,
+                "normalized_text": normalized_key,
+                "pattern_ids": list(reaction_modes),
+            }
+            reaction_records.append(record)
+            if reaction_line.get("sender_key"):
+                reactor_ids.add(str(reaction_line["sender_key"]))
+            if len(text) <= _REACTION_SHORT_TEXT_MAX:
+                short_reaction_count += 1
+            if normalized_key:
+                repeated_phrase_buckets[normalized_key].append(record)
+
+    for repeated_records in repeated_phrase_buckets.values():
+        if len(repeated_records) < 2:
+            continue
+        distinct_reactors = {
+            str(item.get("sender_id") or item.get("sender_name") or "")
+            for item in repeated_records
+            if item.get("sender_id") or item.get("sender_name")
+        }
+        derived_mode = (
+            "uniform_feedback"
+            if len(repeated_records) >= 3 or len(distinct_reactors) >= 2
+            else "repeat_echo"
+        )
+        for item in repeated_records:
+            if derived_mode not in item["pattern_ids"]:
+                item["pattern_ids"].append(derived_mode)
+
+    mode_counter: Counter[str] = Counter()
+    reactors_by_mode: dict[str, set[str]] = defaultdict(set)
+    representative_by_mode: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    scope_counter: Counter[str] = Counter()
+
+    for record in reaction_records:
+        if not record["pattern_ids"]:
+            continue
+        scope_counter.update([str(record.get("scope") or "unknown")])
+        reactor_key = _reaction_actor_key(record)
+        for mode in record["pattern_ids"]:
+            mode_counter[mode] += 1
+            if reactor_key:
+                reactors_by_mode[mode].add(reactor_key)
+            if len(representative_by_mode[mode]) < 4:
+                representative_by_mode[mode].append(record)
+
+    pattern_summaries: list[BenshiReactionPatternSummary] = []
+    for label, count in mode_counter.most_common():
+        representatives = representative_by_mode[label]
+        top_level_count = sum(
+            1 for item in representatives if item.get("scope") == "top_level"
+        )
+        forward_internal_count = sum(
+            1 for item in representatives if item.get("scope") == "forward_internal"
+        )
+        representative_message_uids = [
+            str(item.get("message_uid"))
+            for item in representatives
+            if item.get("message_uid")
+        ]
+        representative_forward_ids = [
+            str(item.get("forward_summary_id"))
+            for item in representatives
+            if item.get("forward_summary_id")
+        ]
+        cue_texts = list(
+            dict.fromkeys(
+                preview_text(str(item.get("text") or ""), 80) or "<empty>"
+                for item in representatives
+            )
+        )[:4]
+        scope_label = "mixed"
+        if top_level_count and not forward_internal_count:
+            scope_label = "top_level"
+        elif forward_internal_count and not top_level_count:
+            scope_label = "forward_internal"
+        pattern_summaries.append(
+            BenshiReactionPatternSummary(
+                pattern_id=label,
+                pattern_label=_REACTION_PATTERN_LABELS.get(label, label),
+                scope=scope_label,
+                score=round(count + len(reactors_by_mode[label]) * 0.35, 3),
+                message_count=count,
+                reactor_count=len(reactors_by_mode[label]),
+                top_level_count=sum(
+                    1 for item in reaction_records
+                    if label in item["pattern_ids"] and item.get("scope") == "top_level"
+                ),
+                forward_internal_count=sum(
+                    1
+                    for item in reaction_records
+                    if label in item["pattern_ids"] and item.get("scope") == "forward_internal"
+                ),
+                representative_message_uids=representative_message_uids,
+                representative_forward_ids=representative_forward_ids,
+                representative_excerpts=cue_texts,
+                cue_texts=cue_texts,
+                notes=[
+                    f"{_REACTION_PATTERN_LABELS.get(label, label)}出现 {count} 次。",
+                    f"涉及 {len(reactors_by_mode[label])} 名参与者。",
+                ],
+            )
+        )
+
+    dominant_modes = [item.pattern_label for item in pattern_summaries[:4]]
+    notes: list[str] = []
+    if reaction_records:
+        notes.append(
+            f"窗口内识别出 {len(reaction_records)} 条疑似‘吃史反应’，参与者 {len(reactor_ids)} 人。"
+        )
+        if dominant_modes:
+            notes.append("主导反应模式为：" + " / ".join(dominant_modes) + "。")
+        if reply_participation_count:
+            notes.append(f"其中 {reply_participation_count} 条带 reply 结构，说明存在显式接球/点评。")
+        if scope_counter.get("forward_internal"):
+            notes.append(
+                f"其中 {scope_counter['forward_internal']} 条来自 forward 内层围观/点评片段。"
+            )
+    else:
+        notes.append("当前窗口缺少明确的外围吃史反应，可能更偏单人倾倒或材料窗口。")
+
+    summary = BenshiReactionAggregateSummary(
+        reaction_message_count=len(reaction_records),
+        reactor_count=len(reactor_ids),
+        reply_participation_count=reply_participation_count,
+        short_reaction_count=short_reaction_count,
+        top_level_count=scope_counter.get("top_level", 0),
+        forward_internal_count=scope_counter.get("forward_internal", 0),
+        disbelief_count=mode_counter.get("amused_break", 0) + mode_counter.get("spectator", 0),
+        ridicule_count=mode_counter.get("mockery", 0),
+        disgust_count=mode_counter.get("disgust", 0),
+        curiosity_count=mode_counter.get("spectator", 0),
+        echo_count=mode_counter.get("repeat_echo", 0) + mode_counter.get("uniform_feedback", 0),
+        amused_break_count=mode_counter.get("amused_break", 0),
+        mockery_count=mode_counter.get("mockery", 0),
+        uniform_feedback_count=mode_counter.get("uniform_feedback", 0),
+        meme_catch_count=mode_counter.get("meme_catch", 0),
+        spectator_count=mode_counter.get("spectator", 0),
+        pattern_counts=dict(sorted(mode_counter.items())),
+        scope_counts=dict(sorted(scope_counter.items())),
+        dominant_modes=dominant_modes,
+        representative_message_uids=[
+            str(item.get("message_uid"))
+            for item in reaction_records
+            if item.get("message_uid")
+        ][:8],
+        representative_forward_ids=[
+            str(item.get("forward_summary_id"))
+            for item in reaction_records
+            if item.get("forward_summary_id")
+        ][:8],
+        notes=notes,
+    )
+    return summary, pattern_summaries
+
+
+def _build_forward_degraded_asset_hints(
+    forward_summaries: Sequence[BenshiForwardSummary],
+    *,
+    max_items: int,
+) -> list[BenshiForwardDegradedAssetHint]:
+    grouped: dict[tuple[str, str | None], dict[str, Any]] = {}
+    for summary in forward_summaries:
+        text_pool = [*summary.preview_lines]
+        if summary.detailed_text:
+            text_pool.append(summary.detailed_text)
+        if summary.preview_text:
+            text_pool.append(summary.preview_text)
+        for chunk in text_pool:
+            for asset_type, file_name in _extract_forward_degraded_tokens(chunk):
+                normalized_file_name = file_name.strip() or None
+                key = (asset_type, normalized_file_name)
+                bucket = grouped.setdefault(
+                    key,
+                    {
+                        "asset_type": asset_type,
+                        "file_name": normalized_file_name,
+                        "occurrence_count": 0,
+                        "outer_message_uids": set(),
+                        "outer_message_ids": set(),
+                        "preview_examples": [],
+                        "timestamp_iso": summary.outer_timestamp_iso,
+                        "sender_id": summary.outer_sender_id,
+                        "sender_name": summary.outer_sender_name,
+                        "context_excerpt": summary.preview_text or summary.detailed_text,
+                    },
+                )
+                bucket["occurrence_count"] += 1
+                if summary.outer_message_uid:
+                    bucket["outer_message_uids"].add(summary.outer_message_uid)
+                if summary.outer_message_id:
+                    bucket["outer_message_ids"].add(summary.outer_message_id)
+                if chunk and len(bucket["preview_examples"]) < 4:
+                    bucket["preview_examples"].append(preview_text(chunk, 140) or chunk)
+
+    output: list[BenshiForwardDegradedAssetHint] = []
+    for (asset_type, file_name), item in sorted(
+        grouped.items(),
+        key=lambda pair: (-pair[1]["occurrence_count"], pair[0][0], pair[0][1] or ""),
+    ):
+        notes = ["该位点来自 deep/nested forward 预览文本，只能作为 context-only 证据。"]
+        if item["occurrence_count"] >= 2:
+            notes.append(f"该退化位点在窗口里重复出现 {item['occurrence_count']} 次。")
+        output.append(
+            BenshiForwardDegradedAssetHint(
+                hint_id=f"fwdhint_{stable_digest(asset_type, file_name, item['occurrence_count'], length=16)}",
+                asset_type=asset_type,
+                file_name=file_name,
+                evidence_state="inferred",
+                confidence_label="context_only",
+                occurrence_count=item["occurrence_count"],
+                outer_message_count=len(item["outer_message_uids"]),
+                outer_message_uids=sorted(item["outer_message_uids"]),
+                outer_message_ids=sorted(item["outer_message_ids"]),
+                representative_timestamp_iso=item["timestamp_iso"],
+                representative_sender_id=item["sender_id"],
+                representative_sender_name=item["sender_name"],
+                representative_context_excerpt=preview_text(item["context_excerpt"] or "", 180) or None,
+                preview_examples=list(item["preview_examples"]),
+                notes=notes,
+            )
+        )
+        if len(output) >= max_items:
+            break
+    return output
+
+
 def _build_asset_summaries(materials: AnalysisMaterials) -> list[BenshiAssetSummary]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     message_uids_by_type: dict[str, set[str]] = defaultdict(set)
@@ -466,6 +879,173 @@ def _build_asset_summaries(materials: AnalysisMaterials) -> list[BenshiAssetSumm
             )
         )
     return output
+
+
+def _build_expired_inference_summary(
+    materials: AnalysisMaterials,
+    *,
+    max_items: int,
+) -> tuple[BenshiExpiredInferenceAggregateSummary, list[BenshiExpiredInferenceSummaryItem]]:
+    annotation_records = _collect_expired_inference_annotations(materials)
+    items: list[BenshiExpiredInferenceSummaryItem] = []
+    final_status_counts = Counter()
+    resource_state_counts = Counter()
+    asset_type_counts = Counter()
+    signal_reason_counts = Counter()
+    request_kind_counts = Counter()
+    total_round_count = 0
+    same_asset_linked_count = 0
+    with_hypothesis_count = 0
+
+    for message, annotation, matched_assets in annotation_records:
+        metadata = _as_mapping(annotation.get("metadata"))
+        signal_summary = _as_mapping(metadata.get("signal_summary"))
+        signal = _as_mapping(signal_summary.get("signal"))
+        round_traces = _list_of_mappings(metadata.get("round_traces"))
+        request_kinds = [
+            request_kind
+            for request_kind in (
+                _string_or_none(item.get("request_kind")) for item in round_traces
+            )
+            if request_kind
+        ]
+        primary_asset = matched_assets[0] if matched_assets else None
+        asset_type = (
+            _string_or_none(
+                (primary_asset or {}).get("asset_type") or (primary_asset or {}).get("type")
+            )
+            or _string_or_none(metadata.get("asset_type"))
+            or _string_or_none(signal_summary.get("asset_type"))
+            or "unknown"
+        )
+        file_name = (
+            _string_or_none((primary_asset or {}).get("file_name"))
+            or _string_or_none(metadata.get("file_name"))
+            or _string_or_none(signal_summary.get("file_name"))
+        )
+        resource_state = (
+            _string_or_none(signal_summary.get("resource_state"))
+            or _string_or_none(metadata.get("resource_state"))
+            or _value_from_prefixed_labels(annotation.get("tags"), "resource_state:")
+            or "unknown"
+        )
+        final_status = (
+            _string_or_none(metadata.get("status"))
+            or _value_from_prefixed_labels(annotation.get("tags"), "status:")
+            or "info"
+        )
+        hypothesis_text = _string_or_none(metadata.get("hypothesis_text"))
+        signal_reason = _string_or_none(signal.get("reason"))
+        forward_degraded = _bool_value(
+            metadata.get("forward_degraded")
+            if metadata.get("forward_degraded") is not None
+            else signal_summary.get("forward_degraded")
+        )
+        forward_parent_message_id = (
+            _string_or_none(metadata.get("forward_parent_message_id"))
+            or _string_or_none(signal_summary.get("forward_parent_message_id"))
+        )
+        forward_depth = _int_value(
+            metadata.get("forward_depth")
+            if metadata.get("forward_depth") is not None
+            else signal_summary.get("forward_depth")
+        )
+        context_excerpt = (
+            _string_or_none(metadata.get("context_excerpt"))
+            or _string_or_none(signal_summary.get("context_excerpt"))
+        )
+        same_asset_occurrence_count = _int_value(
+            signal_summary.get("same_asset_occurrence_count")
+            or len(_string_list(metadata.get("same_asset_occurrence_ids")))
+        )
+        if same_asset_occurrence_count > 0:
+            same_asset_linked_count += 1
+        if hypothesis_text:
+            with_hypothesis_count += 1
+        final_status_counts.update([final_status])
+        resource_state_counts.update([resource_state])
+        asset_type_counts.update([asset_type])
+        if signal_reason:
+            signal_reason_counts.update([signal_reason])
+        request_kind_counts.update(request_kinds)
+        total_round_count += len(round_traces)
+
+        notes: list[str] = []
+        if not matched_assets:
+            notes.append("source_asset_not_located_in_message_assets")
+        if file_name:
+            notes.append(f"file_name:{file_name}")
+        if forward_degraded:
+            notes.append("forward_degraded:true")
+        if forward_parent_message_id:
+            notes.append(f"forward_parent_message_id:{forward_parent_message_id}")
+        if forward_depth > 0:
+            notes.append(f"forward_depth:{forward_depth}")
+        if context_excerpt:
+            notes.append(f"context_excerpt:{preview_text(context_excerpt, 180) or context_excerpt}")
+        if _bool_value(signal.get("budget_exhausted")):
+            notes.append("budget_exhausted")
+        if round_traces and any(not _bool_value(item.get("granted")) for item in round_traces):
+            notes.append("contains_rejected_context_round")
+
+        items.append(
+            BenshiExpiredInferenceSummaryItem(
+                summary_id=_string_or_none(annotation.get("annotation_id"))
+                or f"expinf_{stable_digest(message.message_uid, annotation.get('summary'), length=16)}",
+                message_uid=message.message_uid,
+                message_id=message.message_id,
+                timestamp_iso=message.timestamp_iso,
+                sender_id=message.sender_id,
+                sender_name=message.sender_name,
+                asset_id=_string_or_none(signal_summary.get("asset_id"))
+                or _string_or_none((primary_asset or {}).get("asset_id")),
+                processed_asset_ids=_string_list(annotation.get("target_ids")),
+                asset_type=asset_type,
+                resource_state=resource_state,
+                final_status=final_status,
+                confidence=_float_value(annotation.get("confidence")),
+                hypothesis_text=hypothesis_text,
+                decision_summary=_string_or_none(annotation.get("decision_summary"))
+                or _string_or_none(annotation.get("summary")),
+                signal_reason=signal_reason,
+                snippet_count=_int_value(signal.get("snippet_count")),
+                explicit_chars=_int_value(signal.get("explicit_chars")),
+                same_asset_occurrence_count=same_asset_occurrence_count,
+                round_count=len(round_traces),
+                request_kinds=request_kinds,
+                evidence_message_ids=_string_list(annotation.get("source_message_ids")),
+                source_asset_ids=_string_list(annotation.get("source_asset_ids")),
+                notes=notes,
+            )
+        )
+
+    items.sort(
+        key=lambda item: (
+            _expired_inference_status_rank(item.final_status),
+            -item.confidence,
+            -item.same_asset_occurrence_count,
+            item.timestamp_iso,
+            item.summary_id,
+        )
+    )
+
+    aggregate = BenshiExpiredInferenceAggregateSummary(
+        inference_count=len(items),
+        resolved_count=final_status_counts.get("resolved", 0),
+        uncertain_count=final_status_counts.get("uncertain", 0),
+        unrecoverable_count=final_status_counts.get("unrecoverable", 0),
+        info_count=final_status_counts.get("info", 0),
+        with_hypothesis_count=with_hypothesis_count,
+        resource_state_counts=dict(sorted(resource_state_counts.items())),
+        asset_type_counts=dict(sorted(asset_type_counts.items())),
+        final_status_counts=dict(sorted(final_status_counts.items())),
+        signal_reason_counts=dict(sorted(signal_reason_counts.items())),
+        request_kind_counts=dict(sorted(request_kind_counts.items())),
+        total_round_count=total_round_count,
+        same_asset_linked_count=same_asset_linked_count,
+        representative_summary_ids=[item.summary_id for item in items[:8]],
+    )
+    return aggregate, items[:max_items]
 
 
 def _build_forward_aggregate_summary(
@@ -559,6 +1139,8 @@ def _build_shi_component_summaries(
     recurrence_summary: BenshiRecurrenceAggregateSummary,
     asset_summary: BenshiAssetAggregateSummary,
     missing_media_gaps: Sequence[BenshiMissingMediaGap],
+    reaction_summary: BenshiReactionAggregateSummary,
+    forward_degraded_asset_hints: Sequence[BenshiForwardDegradedAssetHint],
 ) -> list[BenshiShiComponentSummary]:
     short_asset_message_count = 0
     content_blob_parts: list[str] = []
@@ -595,6 +1177,7 @@ def _build_shi_component_summaries(
     )
     dominant_sender_ratio = top_sender_messages / max(1, materials.stats.message_count)
     missing_types = {item.asset_type for item in missing_media_gaps}
+    degraded_types = {item.asset_type for item in forward_degraded_asset_hints}
     image_reference_count = asset_summary.asset_type_reference_counts.get("image", 0)
     component_candidates: list[BenshiShiComponentSummary] = []
 
@@ -650,6 +1233,18 @@ def _build_shi_component_summaries(
                 f"复现簇={recurrence_summary.repeated_asset_cluster_count}，重复转运={recurrence_summary.repeated_transport_count}。",
             ],
             evidence_message_uids=[item.message_uid for item in selected_messages if item.has_forward or item.asset_count][:6],
+        )
+    if reaction_summary.reaction_message_count >= 2 or reaction_summary.reply_participation_count >= 1:
+        add_component(
+            "反应史",
+            "social",
+            0.76,
+            [
+                f"窗口内有 {reaction_summary.reaction_message_count} 条外围吃史反应。",
+                "群友的问号、复读、阴阳和接球已经参与到这坨史的成立过程里。",
+            ],
+            evidence_message_uids=list(reaction_summary.representative_message_uids[:6]),
+            notes=list(reaction_summary.dominant_modes[:4]),
         )
     if dominant_sender_ratio >= 0.65 and forward_summary.forward_message_count >= max(3, materials.stats.message_count // 4):
         add_component(
@@ -761,6 +1356,22 @@ def _build_shi_component_summaries(
             ],
             evidence_message_uids=[item.message_uid for item in selected_messages if item.missing_media_count][:6],
         )
+    elif {"video", "file"} & degraded_types:
+        add_component(
+            "视频壳缺本体",
+            "uncertainty",
+            0.66,
+            [
+                f"deep forward 预览里有 {len(forward_degraded_asset_hints)} 个视频/文件壳子位点。",
+                "本体没被直接看见，但上下文已经说明这些媒体在整坨史里占了位置。",
+            ],
+            evidence_message_uids=[
+                message_uid
+                for item in forward_degraded_asset_hints[:6]
+                for message_uid in item.outer_message_uids[:2]
+            ][:6],
+            notes=["context_only", "deep_forward_preview"],
+        )
 
     component_candidates.sort(
         key=lambda item: (-item.score, item.component_family, item.component_label)
@@ -773,6 +1384,8 @@ def _build_shi_description_profile(
     materials: AnalysisMaterials,
     component_summaries: Sequence[BenshiShiComponentSummary],
     missing_media_gaps: Sequence[BenshiMissingMediaGap],
+    reaction_summary: BenshiReactionAggregateSummary,
+    forward_degraded_asset_hints: Sequence[BenshiForwardDegradedAssetHint],
 ) -> BenshiShiDescriptionProfile:
     dominant_labels = [item.component_label for item in component_summaries[:6]]
     component_phrase = "、".join(dominant_labels[:4]) or "搬运结构"
@@ -783,6 +1396,8 @@ def _build_shi_description_profile(
     ]
     if missing_media_gaps:
         taboo_notes.append("这窗存在失活媒体位点，描述时必须保留未知区。")
+    if forward_degraded_asset_hints:
+        taboo_notes.append("deep forward 里有只能靠 preview 看到的退化媒体位点，不能把 preview 直接当成看过本体。")
 
     return BenshiShiDescriptionProfile(
         base_definition=(
@@ -791,11 +1406,12 @@ def _build_shi_description_profile(
         ),
         description_strategy=(
             "先交代这窗是原生还是外源/二手，再交代 forward、图串、返场、单人倾倒这些搬运结构，"
-            "最后再说抽象点、包浆点和未知边界。"
+            "然后补上群友是怎么吃这坨史的，最后再说抽象点、包浆点和未知边界。"
         ),
         description_axes=[
             "来源路径：原生、外源、二手还是返场回放",
             "搬运结构：forward、套娃、图串、单人倾倒、中转站感",
+            "吃史反应：群友是在问号、复读、阴阳还是嫌恶式共振",
             "史味机制：认知落差、包浆、工业复读、截图壳、配文壳",
             "媒体依赖：是靠文本立、靠图壳立，还是靠缺失媒体周边语境勉强成立",
             "未知边界：哪些媒体位点缺失，哪些结论只能保守说",
@@ -804,6 +1420,7 @@ def _build_shi_description_profile(
         good_description_patterns=[
             f"这窗更像一批 {component_phrase} 叠在一起的搬运拼盘，不是单条神贴。",
             "真正的史味不只在内容本身，还在套娃转发、返场补档和群体回声形成的包浆。",
+            "描述时最好把‘这坨史是什么’和‘群友怎么吃这坨史’并排说，不要只盯内容壳子。",
             "先说结构，再说气味，再说未知区，这样描述才不会把史写成空洞吐槽。",
         ],
         bad_description_patterns=[
@@ -816,6 +1433,7 @@ def _build_shi_description_profile(
             "单人主导的高密度外源搬运拼盘",
             "套娃 forward 和图串返场味儿很重的二手史",
             "不是单条爆点，而是中转站式库存清仓",
+            "群友反应主要靠问号、短吐槽和接球回声来完成吃史动作",
         ],
     )
 
@@ -979,11 +1597,20 @@ def _build_missing_media_gaps(
     max_items: int,
 ) -> list[BenshiMissingMediaGap]:
     output: list[BenshiMissingMediaGap] = []
+    seen_keys: set[tuple[str, str, str]] = set()
     for message in materials.messages:
         context_excerpt = _message_context_excerpt(message)
         for asset in message.assets:
             if not _asset_is_missing(asset):
                 continue
+            dedupe_key = (
+                message.message_uid,
+                _string_or_none(asset.get("asset_type") or asset.get("type")) or "unknown",
+                _string_or_none(asset.get("file_name")) or "",
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
             reason = _asset_missing_reason(asset)
             output.append(
                 BenshiMissingMediaGap(
@@ -1005,7 +1632,135 @@ def _build_missing_media_gaps(
             )
             if len(output) >= max_items:
                 return output
+        for gap in _forward_degraded_missing_media_gaps(message):
+            dedupe_key = (
+                gap.message_uid,
+                gap.asset_type,
+                gap.file_name or "",
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            output.append(gap)
+            if len(output) >= max_items:
+                return output
     return output
+
+
+def _forward_degraded_missing_media_gaps(
+    message: AnalysisMessageRecord,
+) -> list[BenshiMissingMediaGap]:
+    output: list[BenshiMissingMediaGap] = []
+    for annotation in _message_preprocess_annotations(message):
+        if annotation.get("label") != "forward_bundle_expander":
+            continue
+        metadata = _as_mapping(annotation.get("metadata"))
+        details = _as_mapping(metadata.get("details"))
+        inner_asset_refs = _list_of_mappings(details.get("inner_asset_refs"))
+        preview_text_value = _string_or_none(details.get("preview_text"))
+        detailed_text = _string_or_none(details.get("detailed_text"))
+        preview_lines = _string_list(details.get("preview_lines"))
+        token_refs = list(inner_asset_refs)
+        if not token_refs:
+            for value in [*preview_lines, preview_text_value, detailed_text]:
+                for asset_type, file_name in _extract_forward_degraded_tokens(value):
+                    token_refs.append(
+                        {
+                            "asset_type": asset_type,
+                            "file_name": file_name,
+                            "resource_state": "missing",
+                            "resolver": "forward_bundle_expander",
+                            "forward_degraded": True,
+                        }
+                    )
+        for item in token_refs:
+            asset_type = _string_or_none(item.get("asset_type") or item.get("type"))
+            if asset_type not in {"video", "file"}:
+                continue
+            if not _bool_value(item.get("forward_degraded")) and _string_or_none(item.get("resolver")) != "forward_token_only":
+                continue
+            file_name = _string_or_none(item.get("file_name"))
+            reason_parts = ["deep_forward_token_only"]
+            source_hint = _string_or_none(item.get("source_hint"))
+            if source_hint:
+                reason_parts.append(source_hint)
+            output.append(
+                BenshiMissingMediaGap(
+                    gap_id=f"gap_{stable_digest(message.message_uid, asset_type, file_name, 'forward_degraded', length=16)}",
+                    message_uid=message.message_uid,
+                    message_id=message.message_id,
+                    timestamp_iso=message.timestamp_iso,
+                    sender_id=message.sender_id,
+                    sender_name=message.sender_name,
+                    asset_id=None,
+                    asset_type=asset_type,
+                    file_name=file_name,
+                    status="forward_degraded_asset",
+                    resolver=_string_or_none(item.get("resolver")) or "forward_bundle_expander",
+                    exported_rel_path=None,
+                    context_excerpt=preview_text(
+                        preview_text_value
+                        or detailed_text
+                        or " / ".join(preview_lines),
+                        220,
+                    ),
+                    reason=";".join(reason_parts),
+                )
+            )
+    return output
+
+
+def _collect_expired_inference_annotations(
+    materials: AnalysisMaterials,
+) -> list[tuple[AnalysisMessageRecord, dict[str, Any], list[dict[str, Any]]]]:
+    best_by_annotation_id: dict[
+        str,
+        tuple[int, int, AnalysisMessageRecord, dict[str, Any], list[dict[str, Any]]],
+    ] = {}
+
+    for message in materials.messages:
+        for annotation in _message_preprocess_annotations(message):
+            if annotation.get("label") != "expired_asset_inference_preprocessor":
+                continue
+            annotation_id = _string_or_none(annotation.get("annotation_id")) or stable_digest(
+                message.message_uid,
+                annotation.get("summary"),
+                annotation.get("source_asset_ids"),
+                length=16,
+            )
+            matched_assets = _match_annotation_assets(message.assets, annotation)
+            rank = (1 if matched_assets else 0, len(matched_assets))
+            current = best_by_annotation_id.get(annotation_id)
+            if current is None or rank > (current[0], current[1]):
+                best_by_annotation_id[annotation_id] = (
+                    rank[0],
+                    rank[1],
+                    message,
+                    annotation,
+                    matched_assets,
+                )
+
+    output = [
+        (message, annotation, matched_assets)
+        for _, _, message, annotation, matched_assets in best_by_annotation_id.values()
+    ]
+    output.sort(key=lambda item: (item[0].timestamp_ms, item[0].message_uid))
+    return output
+
+
+def _match_annotation_assets(
+    assets: Sequence[dict[str, Any]],
+    annotation: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    source_asset_ids = _string_list(annotation.get("source_asset_ids"))
+    if not source_asset_ids:
+        return []
+    assets_by_id = {
+        asset_id: asset
+        for asset in assets
+        if (asset_id := _string_or_none(asset.get("asset_id")))
+    }
+    return [assets_by_id[asset_id] for asset_id in source_asset_ids if asset_id in assets_by_id]
 
 
 def _build_preprocess_overlay_summary(
@@ -1097,7 +1852,10 @@ def _build_pack_summary(
     forward_summaries: Sequence[BenshiForwardSummary],
     recurrence_summaries: Sequence[BenshiRecurrenceSummary],
     missing_media_gaps: Sequence[BenshiMissingMediaGap],
+    forward_degraded_asset_hints: Sequence[BenshiForwardDegradedAssetHint],
+    expired_inference_summary: BenshiExpiredInferenceAggregateSummary,
     overlay_summary: BenshiPreprocessOverlaySummary | None,
+    reaction_summary: BenshiReactionAggregateSummary,
 ) -> str:
     parts = [
         f"窗口内共有 {len(materials.messages)} 条已选消息，发送者 {materials.stats.sender_count} 人。",
@@ -1107,14 +1865,84 @@ def _build_pack_summary(
         parts.append(f"预处理层整理出 {len(forward_summaries)} 个 forward 摘要。")
     if recurrence_summaries:
         parts.append(f"检测到 {len(recurrence_summaries)} 个保守 recurrence 摘要。")
+    if reaction_summary.reaction_message_count:
+        parts.append(
+            "群友吃史反应约 "
+            f"{reaction_summary.reaction_message_count} 条，主模式="
+            f"{'/'.join(reaction_summary.dominant_modes[:3]) or 'unclear'}。"
+        )
     if missing_media_gaps:
         parts.append(f"当前 pack 仍有 {len(missing_media_gaps)} 个媒体缺口待解释。")
+    if forward_degraded_asset_hints:
+        parts.append(
+            "deep forward 里还有 "
+            f"{len(forward_degraded_asset_hints)} 个只能靠 preview 保守判断的退化媒体位点。"
+        )
+    if expired_inference_summary.inference_count:
+        parts.append(
+            "expired inference 已汇总 "
+            f"{expired_inference_summary.inference_count} 条结果，"
+            f"resolved={expired_inference_summary.resolved_count}，"
+            f"uncertain={expired_inference_summary.uncertain_count}，"
+            f"unrecoverable={expired_inference_summary.unrecoverable_count}。"
+        )
     if overlay_summary is not None and overlay_summary.delivery_profile:
         parts.append(
             "输入已叠加 preprocess overlay，"
             f"delivery_profile={overlay_summary.delivery_profile}。"
         )
     return " ".join(parts)
+
+
+def _is_reaction_candidate_message(message: AnalysisMessageRecord) -> bool:
+    semantics = classify_message_input_semantics(message)
+    if any(label in _DEBUGISH_LABELS for label in semantics.labels):
+        return False
+    if message.features.has_forward:
+        return False
+    text = (semantics.processed_text or message.text_content or message.content or "").strip()
+    if not text:
+        return False
+    if len(text) <= 40:
+        return True
+    if message.features.has_reply and len(text) <= 120:
+        return True
+    return False
+
+
+def _reaction_modes_for_text(text: str) -> list[str]:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return []
+    modes: list[str] = []
+    for label, keywords in _REACTION_MODE_KEYWORDS.items():
+        if any(keyword.lower() in normalized for keyword in keywords):
+            modes.append(label)
+    if not modes and ("?" in normalized or "？" in normalized):
+        modes.append("curiosity")
+    return modes
+
+
+def _extract_forward_degraded_tokens(text: str | None) -> list[tuple[str, str]]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return []
+    tokens: list[tuple[str, str]] = []
+    for token_type, raw_value in _FORWARD_TOKEN_PATTERN.findall(normalized):
+        asset_type = _normalize_forward_token_type(token_type)
+        if asset_type not in {"video", "file"}:
+            continue
+        tokens.append((asset_type, raw_value.strip()))
+    return tokens
+
+
+def _normalize_forward_token_type(token_type: str) -> str:
+    lowered = (token_type or "").strip().lower()
+    if lowered == "video":
+        return "video"
+    if lowered in {"uploaded_file_name", "uploaded_file", "file"}:
+        return "file"
+    return lowered or "unknown"
 
 
 def _message_preprocess_annotations(message: AnalysisMessageRecord) -> list[dict[str, Any]]:
@@ -1227,6 +2055,150 @@ def _float_value(value: Any) -> float:
         return float(value or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _value_from_prefixed_labels(labels: Any, prefix: str) -> str | None:
+    for item in _string_list(labels):
+        if item.startswith(prefix):
+            return item[len(prefix) :].strip() or None
+    return None
+
+
+def _expired_inference_status_rank(status: str) -> int:
+    order = {
+        "resolved": 0,
+        "uncertain": 1,
+        "unrecoverable": 2,
+        "info": 3,
+    }
+    return order.get((status or "").strip().lower(), 9)
+
+
+def _is_reaction_candidate_message(message: AnalysisMessageRecord) -> bool:
+    text = _reaction_message_text(message)
+    if not text:
+        return False
+    if len(text) <= _REACTION_SHORT_TEXT_MAX:
+        return True
+    if message.features.has_reply and len(text) <= 64:
+        return True
+    if _reaction_modes_for_text(text):
+        return True
+    return False
+
+
+def _reaction_message_text(message: AnalysisMessageRecord) -> str:
+    semantics = classify_message_input_semantics(message)
+    text = (
+        semantics.processed_text
+        or message.text_content
+        or message.content
+        or ""
+    ).strip()
+    if not text:
+        return ""
+    return preview_text(text, 160) or ""
+
+
+def _extract_forward_internal_reaction_lines(
+    summary: BenshiForwardSummary,
+) -> list[dict[str, Any]]:
+    source_lines = [
+        line.strip()
+        for line in summary.preview_lines
+        if isinstance(line, str) and line.strip()
+    ]
+    if not source_lines and summary.detailed_text:
+        source_lines = [
+            line.strip()
+            for line in str(summary.detailed_text).splitlines()
+            if line.strip()
+        ]
+
+    output: list[dict[str, Any]] = []
+    for line in source_lines:
+        sender_name: str | None = None
+        text = line
+        if "：" in line or ":" in line:
+            parts = _REACTION_SPLIT_PATTERN.split(line, maxsplit=1)
+            if len(parts) == 2:
+                sender_name = parts[0].strip() or None
+                text = parts[1].strip()
+        if not text or _FORWARD_TOKEN_PATTERN.search(text):
+            continue
+        if len(text) > 64 and not _reaction_modes_for_text(text):
+            continue
+        output.append(
+            {
+                "sender_name": sender_name,
+                "sender_key": sender_name or stable_digest(summary.summary_id, line, length=12),
+                "text": preview_text(text, 120) or text,
+            }
+        )
+    return output
+
+
+def _reaction_modes_for_text(text: str) -> list[str]:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return []
+
+    matches: list[str] = []
+    for mode, keywords in _REACTION_MODE_KEYWORDS.items():
+        if any(keyword.lower() in normalized for keyword in keywords):
+            matches.append(mode)
+    if _REACTION_PUNCT_ONLY_PATTERN.match(normalized):
+        matches.append("uniform_feedback")
+    if "?" in normalized or "？" in normalized:
+        matches.append("spectator")
+    if len(normalized) <= 8 and any(token in normalized for token in ("典", "绷", "蚌", "草", "艹")):
+        matches.append("amused_break")
+    if "接" in normalized and any(token in normalized for token in ("梗", "上", "住", "续")):
+        matches.append("meme_catch")
+    return list(dict.fromkeys(matches))
+
+
+def _normalize_reaction_text(text: str) -> str:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return ""
+    normalized = re.sub(r"\s+", "", normalized)
+    if _REACTION_PUNCT_ONLY_PATTERN.match(normalized):
+        return normalized
+    normalized = re.sub(r"[，。、“”\"'‘’·,\.!！~～…\-_=]+", "", normalized)
+    return normalized[:48]
+
+
+def _looks_like_short_reaction_text(text: str) -> bool:
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    if len(normalized) <= _REACTION_SHORT_TEXT_MAX:
+        return True
+    if _REACTION_PUNCT_ONLY_PATTERN.match(normalized):
+        return True
+    return False
+
+
+def _reaction_actor_key(record: Mapping[str, Any]) -> str | None:
+    sender_id = _string_or_none(record.get("sender_id"))
+    sender_name = _string_or_none(record.get("sender_name"))
+    forward_summary_id = _string_or_none(record.get("forward_summary_id"))
+    if sender_id:
+        return sender_id
+    if sender_name:
+        return f"name:{sender_name}"
+    if forward_summary_id:
+        return f"forward:{forward_summary_id}"
+    return None
 
 
 def _contains_any(text: str, needles: Sequence[str]) -> int:

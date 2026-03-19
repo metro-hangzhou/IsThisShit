@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .benshi_pack import build_benshi_analysis_pack
+from .benshi_prompting import build_expired_inference_summary
 from .models import AnalysisAgentOutput, AnalysisEvidenceItem, AnalysisMaterials
 from .models import BenshiAnalysisPack
 from .summary import build_input_semantics_lines
@@ -29,6 +30,8 @@ class BenshiPreparedPack:
     transport_signals: list[str] = field(default_factory=list)
     cultural_cues: list[str] = field(default_factory=list)
     participant_roles: list[dict[str, Any]] = field(default_factory=list)
+    reaction_summary: dict[str, Any] = field(default_factory=dict)
+    reaction_patterns: list[dict[str, Any]] = field(default_factory=list)
     pack: BenshiAnalysisPack | None = None
 
 
@@ -60,6 +63,7 @@ class BenshiMasterAgent:
         self, materials: AnalysisMaterials, prepared: BenshiPreparedPack | Any
     ) -> AnalysisAgentOutput:
         pack = self._coerce_pack(materials, prepared)
+        expired_inference_summary = build_expired_inference_summary(materials)
         shi_presence = self._judge_shi_presence(pack)
         shi_types = self._infer_shi_type_candidates(pack)
         quality_band = self._infer_quality_band(pack, shi_presence, shi_types)
@@ -77,13 +81,33 @@ class BenshiMasterAgent:
             quality_band,
             shi_component_analysis,
         )
-        cultural_interpretation = self._build_cultural_interpretation(
-            pack, shi_presence, shi_types, quality_band
+        crowd_reaction_layer = self._build_crowd_reaction_layer(pack)
+        group_consumption_layer = self._build_group_consumption_layer(
+            pack,
+            crowd_reaction_layer,
+            shi_component_analysis,
         )
-        register_layer = self._build_register_layer(pack, shi_presence, shi_types, quality_band)
+        cultural_interpretation = self._build_cultural_interpretation(
+            pack, shi_presence, shi_types, quality_band, crowd_reaction_layer
+        )
+        joint_analysis_layer = self._build_joint_analysis_layer(
+            pack,
+            shi_presence,
+            shi_types,
+            shi_component_analysis,
+            group_consumption_layer,
+        )
+        register_layer = self._build_register_layer(
+            pack,
+            shi_presence,
+            shi_types,
+            quality_band,
+            crowd_reaction_layer,
+        )
         reply_probe = self._build_reply_probe_placeholder(pack, shi_presence, shi_types)
         ontology_summary = self._build_ontology_summary(pack)
         distribution_baseline_summary = self._build_distribution_baseline_summary(pack)
+        expired_inference_summary = self._build_expired_inference_summary(pack)
 
         report_lines = [
             "## Benshi Master",
@@ -121,6 +145,36 @@ class BenshiMasterAgent:
                 report_lines.append(
                     f"  - relay_shape: {distribution_baseline_summary['relay_shape']}"
                 )
+        if expired_inference_summary is not None:
+            report_lines.append("- 失活逆推汇总:")
+            report_lines.append(
+                "  - "
+                f"inference={expired_inference_summary['inference_count']} "
+                f"resolved={expired_inference_summary['resolved_count']} "
+                f"uncertain={expired_inference_summary['uncertain_count']} "
+                f"unrecoverable={expired_inference_summary['unrecoverable_count']}"
+            )
+            if expired_inference_summary.get("asset_type_counts"):
+                report_lines.append(
+                    "  - asset_types: "
+                    + " / ".join(
+                        f"{key}:{value}"
+                        for key, value in expired_inference_summary["asset_type_counts"].items()
+                    )
+                )
+            for item in expired_inference_summary.get("top_items", [])[:4]:
+                degraded_note = " forward_degraded=true" if item.get("forward_degraded") else ""
+                report_lines.append(
+                    "  - "
+                    f"{item.get('file_name') or item.get('asset_type')}/{item.get('final_status')} "
+                    f"occ={item.get('same_asset_occurrence_count')} "
+                    f"reason={item.get('signal_reason') or '<none>'}"
+                    f"{degraded_note}"
+                )
+                if item.get("hypothesis_text"):
+                    report_lines.append(f"    - hypothesis: {item['hypothesis_text']}")
+                if item.get("decision_summary"):
+                    report_lines.append(f"    - decision: {item['decision_summary']}")
         report_lines.extend(build_input_semantics_lines(materials))
         if structured_evidence["direct_observations"]:
             report_lines.append("- 直接观察:")
@@ -133,6 +187,25 @@ class BenshiMasterAgent:
         if cultural_interpretation["why_this_is_shi"]:
             report_lines.append("- 为什么它是史:")
             for item in cultural_interpretation["why_this_is_shi"]:
+                report_lines.append(f"  - {item}")
+        if crowd_reaction_layer["dominant_patterns"] or crowd_reaction_layer["reaction_notes"]:
+            report_lines.append("- 群友/围观反应:")
+            if crowd_reaction_layer["dominant_patterns"]:
+                report_lines.append(
+                    "  - 主导反应: " + " / ".join(crowd_reaction_layer["dominant_patterns"])
+                )
+            for item in crowd_reaction_layer["reaction_notes"]:
+                report_lines.append(f"  - {item}")
+            for item in crowd_reaction_layer["representative_reactions"][:4]:
+                report_lines.append(
+                    "  - "
+                    f"{item.get('pattern_label')}[{item.get('scope')}] "
+                    f"{item.get('excerpt')}"
+                )
+        if group_consumption_layer.get("consumption_summary"):
+            report_lines.append("- 群友怎么吃:")
+            report_lines.append(f"  - {group_consumption_layer['consumption_summary']}")
+            for item in group_consumption_layer.get("how_group_ate_it", [])[:4]:
                 report_lines.append(f"  - {item}")
         if shi_component_analysis["dominant_components"]:
             report_lines.append("- 史成分分析:")
@@ -148,10 +221,34 @@ class BenshiMasterAgent:
             report_lines.append(
                 f"  - 建议描述方式: {shi_description_layer['how_to_describe_this_shi']}"
             )
+        if joint_analysis_layer.get("joint_verdict"):
+            report_lines.append("- 联合总判断:")
+            report_lines.append(f"  - {joint_analysis_layer['joint_verdict']}")
+            for item in joint_analysis_layer.get("integrated_findings", [])[:4]:
+                report_lines.append(f"  - {item}")
         if cultural_interpretation["resonance_notes"]:
             report_lines.append("- 共振/搬运机制:")
             for item in cultural_interpretation["resonance_notes"]:
                 report_lines.append(f"  - {item}")
+        if getattr(pack.pack, "reaction_summary", None) is not None:
+            reaction_summary = pack.pack.reaction_summary
+            if reaction_summary.reaction_message_count:
+                report_lines.append("- 群友怎么吃:")
+                report_lines.append(
+                    "  - "
+                    f"reaction_messages={reaction_summary.reaction_message_count} "
+                    f"reactors={reaction_summary.reactor_count} "
+                    f"modes={' / '.join(reaction_summary.dominant_modes[:4]) or 'unclear'}"
+                )
+        if getattr(pack.pack, "forward_degraded_asset_hints", None):
+            report_lines.append("- DeepForward 退化媒体:")
+            for item in pack.pack.forward_degraded_asset_hints[:4]:
+                report_lines.append(
+                    "  - "
+                    f"{item.asset_type}/{item.file_name or '<none>'} "
+                    f"occ={item.occurrence_count} "
+                    f"confidence={item.confidence_label}"
+                )
         report_lines.append("- 口吻层输出:")
         report_lines.append(f"  - {register_layer['rendered_commentary']}")
         report_lines.append("- 接茬探针:")
@@ -166,14 +263,47 @@ class BenshiMasterAgent:
             compact_payload={
                 "evidence_layer": structured_evidence,
                 "structured_evidence": structured_evidence,
+                "expired_inference_summary": expired_inference_summary,
                 "shi_component_analysis_layer": shi_component_analysis,
                 "shi_component_analysis": shi_component_analysis,
                 "shi_description_layer": shi_description_layer,
+                "group_consumption_layer": group_consumption_layer,
+                "crowd_reaction_layer": crowd_reaction_layer,
+                "crowd_reaction_summary": crowd_reaction_layer,
+                "crowd_reaction_items": crowd_reaction_layer.get("representative_reactions", []),
+                "joint_analysis_layer": joint_analysis_layer,
                 "cultural_interpretation_layer": cultural_interpretation,
                 "cultural_interpretation": cultural_interpretation,
                 "register_layer": register_layer,
                 "reply_probe_layer": reply_probe,
                 "reply_probe": reply_probe,
+                "expired_inference_summary": expired_inference_summary,
+                "expired_inference_items": (
+                    expired_inference_summary.get("top_items", [])
+                    if expired_inference_summary is not None
+                    else []
+                ),
+                "reaction_summary": (
+                    pack.pack.reaction_summary.model_dump(mode="json")
+                    if pack.pack is not None
+                    else {}
+                ),
+                "reaction_patterns": (
+                    [
+                        item.model_dump(mode="json")
+                        for item in pack.pack.reaction_patterns
+                    ]
+                    if pack.pack is not None
+                    else []
+                ),
+                "forward_degraded_asset_hints": (
+                    [
+                        item.model_dump(mode="json")
+                        for item in pack.pack.forward_degraded_asset_hints
+                    ]
+                    if pack.pack is not None
+                    else []
+                ),
                 "pack_summary": {
                     "target_id": pack.target_id,
                     "target_name": pack.target_name,
@@ -188,6 +318,8 @@ class BenshiMasterAgent:
                         for label, count in pack.top_tags
                     ],
                     "transport_signals": pack.transport_signals,
+                    "crowd_reaction_summary": crowd_reaction_layer,
+                    "expired_inference_summary": expired_inference_summary,
                     "ontology_summary": ontology_summary,
                     "distribution_baseline_summary": distribution_baseline_summary,
                 },
@@ -222,6 +354,57 @@ class BenshiMasterAgent:
         if distribution is None:
             return None
         return distribution.model_dump(mode="json")
+
+    def _build_expired_inference_summary(
+        self,
+        pack: BenshiPreparedPack,
+    ) -> dict[str, Any] | None:
+        pack_model = pack.pack
+        if pack_model is None:
+            return None
+        summary = pack_model.expired_inference_summary
+        items = pack_model.expired_inference_items
+        if summary.inference_count <= 0 and not items:
+            return None
+        return {
+            "inference_count": summary.inference_count,
+            "resolved_count": summary.resolved_count,
+            "uncertain_count": summary.uncertain_count,
+            "unrecoverable_count": summary.unrecoverable_count,
+            "info_count": summary.info_count,
+            "with_hypothesis_count": summary.with_hypothesis_count,
+            "resource_state_counts": dict(summary.resource_state_counts),
+            "asset_type_counts": dict(summary.asset_type_counts),
+            "final_status_counts": dict(summary.final_status_counts),
+            "signal_reason_counts": dict(summary.signal_reason_counts),
+            "request_kind_counts": dict(summary.request_kind_counts),
+            "total_round_count": summary.total_round_count,
+            "same_asset_linked_count": summary.same_asset_linked_count,
+            "representative_summary_ids": list(summary.representative_summary_ids),
+            "top_items": [
+                {
+                    "summary_id": item.summary_id,
+                    "message_uid": item.message_uid,
+                    "timestamp_iso": item.timestamp_iso,
+                    "file_name": _note_value(item.notes, "file_name"),
+                    "asset_type": item.asset_type,
+                    "resource_state": item.resource_state,
+                    "final_status": item.final_status,
+                    "forward_degraded": _note_bool(item.notes, "forward_degraded"),
+                    "forward_parent_message_id": _note_value(item.notes, "forward_parent_message_id"),
+                    "forward_depth": _note_int(item.notes, "forward_depth"),
+                    "confidence": item.confidence,
+                    "hypothesis_text": item.hypothesis_text,
+                    "decision_summary": item.decision_summary,
+                    "signal_reason": item.signal_reason,
+                    "same_asset_occurrence_count": item.same_asset_occurrence_count,
+                    "round_count": item.round_count,
+                    "request_kinds": list(item.request_kinds),
+                    "notes": list(item.notes),
+                }
+                for item in items[:8]
+            ],
+        }
 
     def _coerce_pack(
         self, materials: AnalysisMaterials, prepared: BenshiPreparedPack | Any
@@ -258,6 +441,8 @@ class BenshiMasterAgent:
             transport_signals=list(getattr(prepared, "transport_signals", [])),
             cultural_cues=list(getattr(prepared, "cultural_cues", [])),
             participant_roles=list(getattr(prepared, "participant_roles", [])),
+            reaction_summary=dict(getattr(prepared, "reaction_summary", {})),
+            reaction_patterns=list(getattr(prepared, "reaction_patterns", [])),
             pack=getattr(prepared, "pack", None),
         )
 
@@ -319,6 +504,8 @@ class BenshiMasterAgent:
             transport_signals=transport_signals,
             cultural_cues=cultural_cues,
             participant_roles=participant_roles,
+            reaction_summary=self._build_pack_reaction_summary(pack),
+            reaction_patterns=self._build_pack_reaction_patterns(pack),
             pack=pack,
         )
 
@@ -380,6 +567,52 @@ class BenshiMasterAgent:
             ][:8],
         }
 
+    def _build_pack_reaction_summary(self, pack: BenshiAnalysisPack) -> dict[str, Any]:
+        summary = pack.reaction_summary
+        pattern_counts = {
+            item.pattern_label: item.message_count for item in pack.reaction_patterns
+        }
+        return {
+            "reaction_message_count": summary.reaction_message_count,
+            "reactor_count": summary.reactor_count,
+            "reply_participation_count": summary.reply_participation_count,
+            "short_reaction_count": summary.short_reaction_count,
+            "top_level_count": summary.reaction_message_count,
+            "forward_internal_count": 0,
+            "amused_break_count": 0,
+            "mockery_count": summary.ridicule_count,
+            "uniform_feedback_count": summary.echo_count,
+            "meme_catch_count": 0,
+            "disgust_count": summary.disgust_count,
+            "spectator_count": 0,
+            "pattern_counts": pattern_counts,
+            "scope_counts": {"top_level": summary.reaction_message_count},
+            "dominant_modes": list(summary.dominant_modes),
+            "representative_message_uids": list(summary.representative_message_uids),
+            "representative_forward_ids": [],
+            "notes": list(summary.notes),
+        }
+
+    def _build_pack_reaction_patterns(self, pack: BenshiAnalysisPack) -> list[dict[str, Any]]:
+        return [
+            {
+                "pattern_id": item.pattern_label,
+                "pattern_label": item.pattern_label,
+                "scope": "mixed",
+                "score": item.score,
+                "message_count": item.message_count,
+                "reactor_count": item.reactor_count,
+                "top_level_count": item.message_count,
+                "forward_internal_count": 0,
+                "representative_message_uids": list(item.representative_message_uids),
+                "representative_forward_ids": [],
+                "representative_excerpts": list(item.representative_excerpts),
+                "cue_texts": [],
+                "notes": list(item.notes),
+            }
+            for item in pack.reaction_patterns[:8]
+        ]
+
     def _build_transport_signals(
         self, materials: AnalysisMaterials, top_tags: list[tuple[str, int]]
     ) -> list[str]:
@@ -420,6 +653,12 @@ class BenshiMasterAgent:
             signals.append("媒体负载=" + " / ".join(rich_types))
         if pack.missing_media_gaps:
             signals.append(f"有 {len(pack.missing_media_gaps)} 个失活或缺口媒体位点")
+        if pack.reaction_summary.reaction_message_count:
+            signals.append(
+                "群友反应="
+                f"{pack.reaction_summary.reaction_message_count} 条"
+                f"（主模式：{' / '.join(pack.reaction_summary.dominant_modes[:3]) or 'unclear'}）"
+            )
         return signals
 
     def _build_cultural_cues(
@@ -457,6 +696,10 @@ class BenshiMasterAgent:
             cues.append("反馈整齐度与机械复读倾向存在")
         if pack.asset_summary.asset_type_reference_counts.get("image", 0) >= max(1, pack.stats.message_count // 3):
             cues.append("视觉载荷高，图像承担了大量笑点或冲击")
+        if pack.reaction_summary.uniform_feedback_count or pack.reaction_summary.top_level_count >= 3:
+            cues.append("群友围观/复读/整齐反馈信号存在")
+        if pack.reaction_summary.forward_internal_count:
+            cues.append("forward 内部也带围观点评，不只是外层搬运壳")
         if not cues and transport_signals:
             cues.append("搬运结构明显，但文化解释还需后续 LLM 细化")
         return cues
@@ -544,6 +787,12 @@ class BenshiMasterAgent:
         ]
         if pack.transport_signals:
             direct_observations.append("搬运信号: " + "；".join(pack.transport_signals))
+        if pack.reaction_summary.get("reaction_message_count", 0):
+            direct_observations.append(
+                "群友/围观反应: "
+                f"{pack.reaction_summary['reaction_message_count']} 条，"
+                f"主模式={' / '.join(pack.reaction_summary.get('dominant_modes') or []) or 'unclear'}"
+            )
         context_inferences = [
             f"当前更像 {quality_band['top_type']} 主导的窗口"
         ]
@@ -552,6 +801,14 @@ class BenshiMasterAgent:
         if pack.missing_media_summary.get("present") and pack.missing_media_summary.get("missing_total", 0):
             context_inferences.append(
                 "存在缺失媒体，需要保留未知区，不把缺失内容硬推成事实"
+            )
+        expired_summary = self._build_expired_inference_summary(pack)
+        if expired_summary is not None:
+            context_inferences.append(
+                "失活逆推层已接入："
+                f"resolved={expired_summary['resolved_count']} / "
+                f"uncertain={expired_summary['uncertain_count']} / "
+                f"unrecoverable={expired_summary['unrecoverable_count']}。"
             )
         return {
             "target": {
@@ -564,8 +821,11 @@ class BenshiMasterAgent:
             "direct_observations": direct_observations,
             "context_inferences": context_inferences,
             "missing_media_gaps": pack.missing_media_summary,
+            "expired_inference_summary": expired_summary,
             "transport_pattern": pack.transport_signals,
             "participant_roles": pack.participant_roles or pack.top_people,
+            "crowd_reaction_summary": pack.reaction_summary,
+            "crowd_reaction_patterns": pack.reaction_patterns,
             "confidence": round(
                 min(
                     1.0,
@@ -576,6 +836,112 @@ class BenshiMasterAgent:
                 ),
                 3,
             ),
+        }
+
+    def _build_crowd_reaction_layer(
+        self,
+        pack: BenshiPreparedPack,
+    ) -> dict[str, Any]:
+        summary = dict(pack.reaction_summary)
+        patterns = list(pack.reaction_patterns)
+        if not summary and pack.pack is not None:
+            summary = self._build_pack_reaction_summary(pack.pack)
+            patterns = self._build_pack_reaction_patterns(pack.pack)
+
+        representative_reactions: list[dict[str, Any]] = []
+        for item in patterns[:6]:
+            representative_reactions.append(
+                {
+                    "pattern_id": item.get("pattern_id"),
+                    "pattern_label": item.get("pattern_label") or item.get("pattern_id"),
+                    "scope": item.get("scope") or "mixed",
+                    "message_count": item.get("message_count", 0),
+                    "reactor_count": item.get("reactor_count", 0),
+                    "excerpt": (item.get("representative_excerpts") or [None])[0],
+                    "cue_texts": list(item.get("cue_texts") or []),
+                    "representative_message_uids": list(item.get("representative_message_uids") or []),
+                    "representative_forward_ids": list(item.get("representative_forward_ids") or []),
+                    "notes": list(item.get("notes") or []),
+                }
+            )
+
+        reaction_notes = list(summary.get("notes") or [])
+        if summary.get("forward_internal_count", 0):
+            reaction_notes.append(
+                f"forward 内层围观/点评片段约 {summary['forward_internal_count']} 条。"
+            )
+        if summary.get("uniform_feedback_count", 0):
+            reaction_notes.append(
+                f"整齐反馈/回声约 {summary['uniform_feedback_count']} 条。"
+            )
+        if summary.get("meme_catch_count", 0):
+            reaction_notes.append(
+                f"接梗/顺嘴接约 {summary['meme_catch_count']} 条。"
+            )
+
+        return {
+            "reaction_message_count": summary.get("reaction_message_count", 0),
+            "reactor_count": summary.get("reactor_count", 0),
+            "reply_participation_count": summary.get("reply_participation_count", 0),
+            "top_level_count": summary.get("top_level_count", 0),
+            "forward_internal_count": summary.get("forward_internal_count", 0),
+            "pattern_counts": dict(summary.get("pattern_counts") or {}),
+            "dominant_patterns": list(summary.get("dominant_modes") or []),
+            "reaction_notes": reaction_notes[:8],
+            "representative_reactions": representative_reactions,
+        }
+
+    def _build_group_consumption_layer(
+        self,
+        pack: BenshiPreparedPack,
+        crowd_reaction_layer: dict[str, Any],
+        shi_component_analysis: dict[str, Any],
+    ) -> dict[str, Any]:
+        dominant_modes = list(crowd_reaction_layer.get("dominant_patterns") or [])
+        reaction_count = int(crowd_reaction_layer.get("reaction_message_count") or 0)
+        forward_internal_count = int(crowd_reaction_layer.get("forward_internal_count") or 0)
+        style = "反应稀薄或未成型"
+        if reaction_count >= 40 and forward_internal_count >= 10:
+            style = "围观接球+forward内层回声混合型"
+        elif reaction_count >= 40:
+            style = "短平快围观接球型"
+        elif dominant_modes:
+            style = "零散围观型"
+
+        consumption_summary = (
+            "这窗不只是有人在搬，群友也在持续把这坨料吃成史："
+            f"主导吃法是{' / '.join(dominant_modes[:4]) or '围观接球'}，"
+            "整体偏短平快接球、问号、绷乐和阴阳，不是认真核实型讨论。"
+        )
+        how_group_ate_it: list[str] = []
+        if reaction_count:
+            how_group_ate_it.append(
+                f"窗口内识别到约 {reaction_count} 条疑似吃史反应，说明这坨料不是冷投喂，而是被即时消费。"
+            )
+        if forward_internal_count:
+            how_group_ate_it.append(
+                f"其中约 {forward_internal_count} 条反应发生在 forward 内层或转运壳内部，说明这坨史在被搬进来前后都有人接球。"
+            )
+        if crowd_reaction_layer.get("dominant_patterns"):
+            how_group_ate_it.append(
+                "群友主要不是长篇展开，而是靠 "
+                + " / ".join(crowd_reaction_layer["dominant_patterns"][:4])
+                + " 这种短反应把史味抬起来。"
+            )
+        if "反应史" in (shi_component_analysis.get("dominant_components") or []):
+            how_group_ate_it.append("这窗里‘怎么吃’本身已经成为史成立的一部分，而不是附属现象。")
+
+        social_fuel_notes = list(crowd_reaction_layer.get("reaction_notes") or [])
+        unknown_boundaries = [
+            "反应层能说明群友是怎么接球的，但不能替代媒体本体或原事件完整上下文。"
+        ]
+        return {
+            "consumption_summary": consumption_summary,
+            "dominant_reaction_modes": dominant_modes,
+            "consumption_style": style,
+            "how_group_ate_it": how_group_ate_it[:6],
+            "social_fuel_notes": social_fuel_notes[:8],
+            "unknown_boundaries": unknown_boundaries,
         }
 
     def _build_shi_component_analysis(
@@ -664,6 +1030,15 @@ class BenshiMasterAgent:
             )
         if pack.missing_media_summary.get("missing_total", 0):
             component_rationale.append("窗口里有缺失媒体位点，所以成分层允许保留‘视频壳缺本体’这类未知项。")
+        expired_summary = self._build_expired_inference_summary(pack)
+        if expired_summary is not None and expired_summary.get("with_hypothesis_count", 0):
+            component_rationale.append(
+                "失活逆推层提供了部分 context-supported 假说，因此某些壳子/返场/补档判断不再只靠裸缺口数量。"
+            )
+        if pack.reaction_summary.get("reaction_message_count", 0):
+            component_rationale.append(
+                "群友反应层已经出现问号、复读、嫌弃或接梗，说明这坨史不是孤立素材，而是被围观共同加工过。"
+            )
         return {
             "definition": (
                 ontology.origin_definition
@@ -746,12 +1121,69 @@ class BenshiMasterAgent:
             "quality_band": quality_band["label"],
         }
 
+    def _build_joint_analysis_layer(
+        self,
+        pack: BenshiPreparedPack,
+        shi_presence: dict[str, Any],
+        shi_types: list[dict[str, Any]],
+        shi_component_analysis: dict[str, Any],
+        group_consumption_layer: dict[str, Any],
+    ) -> dict[str, Any]:
+        top_type = shi_types[0]["label"] if shi_types else "未定型"
+        dominant_components = list(shi_component_analysis.get("dominant_components") or [])
+        modality_coordination: list[str] = []
+        if pack.pack is not None and pack.pack.image_cluster_summaries:
+            modality_coordination.append(
+                f"图像侧可见 {len(pack.pack.image_cluster_summaries)} 个图像簇，说明这窗不是纯文本，而是有图串/单图返场和截图壳。"
+            )
+        if pack.reaction_summary.get("reaction_message_count", 0):
+            modality_coordination.append(
+                f"群友反应约 {pack.reaction_summary['reaction_message_count']} 条，说明这些内容被即时消费，而不是只被搬进来放着。"
+            )
+        if pack.pack is not None and pack.pack.forward_degraded_asset_hints:
+            modality_coordination.append(
+                f"deep forward 里还有 {len(pack.pack.forward_degraded_asset_hints)} 个退化媒体位点，它们只提供 context-only 线索，必须保守纳入联合判断。"
+            )
+        integrated_findings = [
+            "整窗的史味主要来自外源/二手材料被集中投喂后，又被图像返场、套娃 forward 和群体反应一起做熟。"
+        ]
+        if dominant_components:
+            integrated_findings.append(
+                "当前联合主轴是：" + " / ".join(dominant_components[:5]) + "。"
+            )
+        if group_consumption_layer.get("consumption_style"):
+            integrated_findings.append(
+                "群友吃法上更像 " + group_consumption_layer["consumption_style"] + "，说明‘怎么吃’已经参与了史的成形。"
+            )
+        if pack.pack is not None and pack.pack.image_caption_samples:
+            integrated_findings.append(
+                "图像 caption 也支持这窗是截图壳/平台壳/梗图壳与文本料混装，而不是单一纯文本现场。"
+            )
+        unknown_boundaries = [
+            "联合分析允许把文本、图像、反应和退化媒体线索放在一起看，但不同模态的置信度不能混为一层。"
+        ]
+        joint_verdict = (
+            f"这窗是 {shi_presence['label']} 的 {top_type} 倾向窗口；真正值得写的不是某一条孤立内容，"
+            "而是外源二手料如何被图片壳、forward 结构和群友接球一起腌出史味。"
+        )
+        return {
+            "joint_verdict": joint_verdict,
+            "shi_object_summary": (
+                "搬来的更像外源二手混装料，既有聊天/平台截图，也有图串和梗图壳，主轴在搬运结构。"
+            ),
+            "group_consumption_summary": group_consumption_layer.get("consumption_summary"),
+            "modality_coordination": modality_coordination,
+            "integrated_findings": integrated_findings[:6],
+            "unknown_boundaries": unknown_boundaries,
+        }
+
     def _build_cultural_interpretation(
         self,
         pack: BenshiPreparedPack,
         shi_presence: dict[str, Any],
         shi_types: list[dict[str, Any]],
         quality_band: dict[str, Any],
+        crowd_reaction_layer: dict[str, Any],
     ) -> dict[str, Any]:
         why_this_is_shi: list[str] = []
         if "认知落差明显" in pack.cultural_cues:
@@ -762,6 +1194,8 @@ class BenshiMasterAgent:
             why_this_is_shi.append("多层 forward 和二手转运结构本身就在给这坨史加包浆")
         if "反馈整齐度与机械复读倾向存在" in pack.cultural_cues:
             why_this_is_shi.append("它不只是被看见，还带起了重复扩散和机械复读，这说明搬运价值不低")
+        if crowd_reaction_layer.get("forward_internal_count", 0):
+            why_this_is_shi.append("连 forward 内层都能看到围观点评，说明这坨史在被搬进来之前就已经被人吃过一轮了")
         if not why_this_is_shi:
             why_this_is_shi.append("这段材料目前更像混合噪声，史感存在但还不够到一眼封神")
         top_type = shi_types[0]["label"] if shi_types else "未定型"
@@ -779,7 +1213,11 @@ class BenshiMasterAgent:
             "absurdity_mechanism": absurdity,
             "context_collapse_mechanism": "群聊语境被压缩后，仍能保留核心槽点",
             "packaging_or_patina_notes": pack.transport_signals or ["暂未看到显著包浆信号"],
-            "resonance_notes": pack.cultural_cues or ["当前共振线索有限"],
+            "resonance_notes": (
+                crowd_reaction_layer.get("reaction_notes")
+                or pack.cultural_cues
+                or ["当前共振线索有限"]
+            ),
             "quality_assessment": quality_band["label"],
             "classicness_potential": "中等" if quality_band["label"] in {"高价值", "中价值"} else "偏低/待观察",
         }
@@ -790,6 +1228,7 @@ class BenshiMasterAgent:
         shi_presence: dict[str, Any],
         shi_types: list[dict[str, Any]],
         quality_band: dict[str, Any],
+        crowd_reaction_layer: dict[str, Any],
     ) -> dict[str, Any]:
         top_type = shi_types[0]["label"] if shi_types else "未定型"
         commentary = (
@@ -803,6 +1242,12 @@ class BenshiMasterAgent:
         elif quality_band["label"] == "高价值":
             commentary = (
                 "这窗属于能端上桌细吃的史，不是单纯刷屏，而是本体、转运、围观反应都能咬出点东西。"
+            )
+        if crowd_reaction_layer.get("dominant_patterns"):
+            commentary += (
+                " 群友吃法上主要是"
+                + " / ".join(crowd_reaction_layer["dominant_patterns"][:3])
+                + "。"
             )
         return {
             "voice_profile": "cn_high_context_benshi_commentator_v1",
@@ -842,3 +1287,29 @@ class BenshiMasterAgent:
             "followup_confidence": 0.0,
             "note": "reply_probe 先保留占位，不在 deterministic skeleton 阶段硬生成。",
         }
+
+
+def _note_value(notes: list[str], prefix: str) -> str | None:
+    needle = f"{prefix}:"
+    for item in notes or []:
+        text = str(item or "").strip()
+        if text.startswith(needle):
+            value = text[len(needle) :].strip()
+            return value or None
+    return None
+
+
+def _note_bool(notes: list[str], prefix: str) -> bool:
+    value = (_note_value(notes, prefix) or "").strip().lower()
+    return value in {"1", "true", "yes", "y"}
+
+
+def _note_int(notes: list[str], prefix: str) -> int | None:
+    value = _note_value(notes, prefix)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None

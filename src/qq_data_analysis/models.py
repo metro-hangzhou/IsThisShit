@@ -395,6 +395,47 @@ class BenshiParticipantRoleCandidate(BaseModel):
     evidence_message_uids: list[str] = Field(default_factory=list)
 
 
+class BenshiReactionPatternSummary(BaseModel):
+    pattern_id: str | None = None
+    pattern_label: str
+    scope: str = "mixed"
+    score: float = 0.0
+    message_count: int = 0
+    reactor_count: int = 0
+    top_level_count: int = 0
+    forward_internal_count: int = 0
+    representative_message_uids: list[str] = Field(default_factory=list)
+    representative_forward_ids: list[str] = Field(default_factory=list)
+    representative_excerpts: list[str] = Field(default_factory=list)
+    cue_texts: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class BenshiReactionAggregateSummary(BaseModel):
+    reaction_message_count: int = 0
+    reactor_count: int = 0
+    reply_participation_count: int = 0
+    short_reaction_count: int = 0
+    top_level_count: int = 0
+    forward_internal_count: int = 0
+    disbelief_count: int = 0
+    ridicule_count: int = 0
+    disgust_count: int = 0
+    curiosity_count: int = 0
+    echo_count: int = 0
+    amused_break_count: int = 0
+    mockery_count: int = 0
+    uniform_feedback_count: int = 0
+    meme_catch_count: int = 0
+    spectator_count: int = 0
+    pattern_counts: dict[str, int] = Field(default_factory=dict)
+    scope_counts: dict[str, int] = Field(default_factory=dict)
+    dominant_modes: list[str] = Field(default_factory=list)
+    representative_message_uids: list[str] = Field(default_factory=list)
+    representative_forward_ids: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class BenshiAssetSummary(BaseModel):
     asset_type: str
     reference_count: int = 0
@@ -421,6 +462,49 @@ class BenshiImageClusterSummary(BaseModel):
     evidence_message_uids: list[str] = Field(default_factory=list)
 
 
+class BenshiExpiredInferenceSummaryItem(BaseModel):
+    summary_id: str
+    message_uid: str
+    message_id: str | None = None
+    timestamp_iso: str
+    sender_id: str
+    sender_name: str | None = None
+    asset_id: str | None = None
+    processed_asset_ids: list[str] = Field(default_factory=list)
+    asset_type: str
+    resource_state: str
+    final_status: str
+    confidence: float = 0.0
+    hypothesis_text: str | None = None
+    decision_summary: str | None = None
+    signal_reason: str | None = None
+    snippet_count: int = 0
+    explicit_chars: int = 0
+    same_asset_occurrence_count: int = 0
+    round_count: int = 0
+    request_kinds: list[str] = Field(default_factory=list)
+    evidence_message_ids: list[str] = Field(default_factory=list)
+    source_asset_ids: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class BenshiExpiredInferenceAggregateSummary(BaseModel):
+    inference_count: int = 0
+    resolved_count: int = 0
+    uncertain_count: int = 0
+    unrecoverable_count: int = 0
+    info_count: int = 0
+    with_hypothesis_count: int = 0
+    resource_state_counts: dict[str, int] = Field(default_factory=dict)
+    asset_type_counts: dict[str, int] = Field(default_factory=dict)
+    final_status_counts: dict[str, int] = Field(default_factory=dict)
+    signal_reason_counts: dict[str, int] = Field(default_factory=dict)
+    request_kind_counts: dict[str, int] = Field(default_factory=dict)
+    total_round_count: int = 0
+    same_asset_linked_count: int = 0
+    representative_summary_ids: list[str] = Field(default_factory=list)
+
+
 class BenshiMissingMediaGap(BaseModel):
     gap_id: str
     message_uid: str
@@ -436,6 +520,24 @@ class BenshiMissingMediaGap(BaseModel):
     exported_rel_path: str | None = None
     context_excerpt: str | None = None
     reason: str | None = None
+
+
+class BenshiForwardDegradedAssetHint(BaseModel):
+    hint_id: str
+    asset_type: str
+    file_name: str | None = None
+    evidence_state: MediaEvidenceState = "inferred"
+    confidence_label: MediaConfidenceLabel = "context_only"
+    occurrence_count: int = 0
+    outer_message_count: int = 0
+    outer_message_uids: list[str] = Field(default_factory=list)
+    outer_message_ids: list[str] = Field(default_factory=list)
+    representative_timestamp_iso: str | None = None
+    representative_sender_id: str | None = None
+    representative_sender_name: str | None = None
+    representative_context_excerpt: str | None = None
+    preview_examples: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class BenshiPreprocessOverlayItem(BaseModel):
@@ -584,6 +686,10 @@ class BenshiAnalysisPack(BaseModel):
     )
     recurrence_summaries: list[BenshiRecurrenceSummary] = Field(default_factory=list)
     participant_role_candidates: list[BenshiParticipantRoleCandidate] = Field(default_factory=list)
+    reaction_summary: BenshiReactionAggregateSummary = Field(
+        default_factory=BenshiReactionAggregateSummary
+    )
+    reaction_patterns: list[BenshiReactionPatternSummary] = Field(default_factory=list)
     asset_summary: BenshiAssetAggregateSummary = Field(default_factory=BenshiAssetAggregateSummary)
     asset_summaries: list[BenshiAssetSummary] = Field(default_factory=list)
     shi_component_summaries: list[BenshiShiComponentSummary] = Field(default_factory=list)
@@ -591,7 +697,16 @@ class BenshiAnalysisPack(BaseModel):
     ontology_pack: BenshiOntologyPack | None = None
     distribution_baseline_summary: BenshiDistributionBaselineSummary | None = None
     image_cluster_summaries: list[BenshiImageClusterSummary] = Field(default_factory=list)
+    expired_inference_summary: BenshiExpiredInferenceAggregateSummary = Field(
+        default_factory=BenshiExpiredInferenceAggregateSummary
+    )
+    expired_inference_items: list[BenshiExpiredInferenceSummaryItem] = Field(
+        default_factory=list
+    )
     missing_media_gaps: list[BenshiMissingMediaGap] = Field(default_factory=list)
+    forward_degraded_asset_hints: list[BenshiForwardDegradedAssetHint] = Field(
+        default_factory=list
+    )
     image_caption_samples: list[ImageCaptionSample] = Field(default_factory=list)
     preprocess_overlay_summary: BenshiPreprocessOverlaySummary | None = None
     warnings: list[str] = Field(default_factory=list)

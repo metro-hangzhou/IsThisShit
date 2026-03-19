@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from collections import Counter
+from typing import Any, Mapping
 
 from qq_data_process.utils import preview_text
 
@@ -51,11 +52,23 @@ class BenshiStructuredOutputContract(BaseModel):
             "analysis_mode",
             "voice_profile",
             "evidence_layer",
+            "group_consumption_layer",
             "shi_component_analysis",
             "shi_description_layer",
+            "joint_analysis_layer",
             "cultural_interpretation",
             "register_rendering",
             "reply_probe",
+        ]
+    )
+    group_consumption_layer_keys: list[str] = Field(
+        default_factory=lambda: [
+            "consumption_summary",
+            "dominant_reaction_modes",
+            "consumption_style",
+            "how_group_ate_it",
+            "social_fuel_notes",
+            "unknown_boundaries",
         ]
     )
     shi_component_analysis_keys: list[str] = Field(
@@ -78,6 +91,16 @@ class BenshiStructuredOutputContract(BaseModel):
             "how_to_describe_this_shi",
             "good_description_patterns",
             "bad_description_patterns",
+            "unknown_boundaries",
+        ]
+    )
+    joint_analysis_layer_keys: list[str] = Field(
+        default_factory=lambda: [
+            "joint_verdict",
+            "shi_object_summary",
+            "group_consumption_summary",
+            "modality_coordination",
+            "integrated_findings",
             "unknown_boundaries",
         ]
     )
@@ -154,6 +177,14 @@ class BenshiStructuredOutputContract(BaseModel):
                 ],
                 "confidence_notes": [],
             },
+            "group_consumption_layer": {
+                "consumption_summary": "这里要总结群友到底是怎么吃这坨史的。",
+                "dominant_reaction_modes": [],
+                "consumption_style": "短平快接球|围观惊诧|整齐反馈|阴阳嘲笑|混合型",
+                "how_group_ate_it": [],
+                "social_fuel_notes": [],
+                "unknown_boundaries": [],
+            },
             "shi_component_analysis": {
                 "definition": "这里解释‘史’到底是什么，不要只会说抽象。",
                 "component_candidates": [
@@ -186,6 +217,14 @@ class BenshiStructuredOutputContract(BaseModel):
                 "how_to_describe_this_shi": "写给后续分析器或群友看的描述建议。",
                 "good_description_patterns": [],
                 "bad_description_patterns": [],
+                "unknown_boundaries": [],
+            },
+            "joint_analysis_layer": {
+                "joint_verdict": "这里给出文本、图像、forward、群友反应、失活/缺口联合起来后的总判断。",
+                "shi_object_summary": "这里总结搬来的到底是什么路数的史。",
+                "group_consumption_summary": "这里总结群友是怎么吃这坨史的。",
+                "modality_coordination": [],
+                "integrated_findings": [],
                 "unknown_boundaries": [],
             },
             "cultural_interpretation": {
@@ -230,6 +269,181 @@ def resolve_benshi_prompt_scaffold(
     return BenshiPromptScaffold(reply_probe_enabled=reply_probe_enabled)
 
 
+def build_expired_inference_summary(
+    materials: Any,
+    *,
+    max_records: int = 8,
+) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    seen_annotation_ids: set[str] = set()
+    status_counts: Counter[str] = Counter()
+    asset_type_counts: Counter[str] = Counter()
+    resource_state_counts: Counter[str] = Counter()
+    resolved_hypothesis_count = 0
+    requested_context_rounds = 0
+
+    for message in getattr(materials, "messages", []) or []:
+        message_uid = getattr(message, "message_uid", None)
+        message_assets = getattr(message, "assets", None) or []
+        asset_by_id = {
+            str(item.get("asset_id")): item
+            for item in message_assets
+            if isinstance(item, dict) and item.get("asset_id") is not None
+        }
+        for annotation in _extract_expired_inference_annotations(getattr(message, "extra", None)):
+            annotation_id = str(annotation.get("annotation_id") or "")
+            if annotation_id and annotation_id in seen_annotation_ids:
+                continue
+            if annotation_id:
+                seen_annotation_ids.add(annotation_id)
+
+            metadata = _as_mapping(annotation.get("metadata"))
+            signal_summary = _as_mapping(metadata.get("signal_summary"))
+            round_traces = _as_list(metadata.get("round_traces"))
+            requested_context_rounds += sum(
+                1
+                for item in round_traces
+                if _bool_value(_as_mapping(item).get("need_more_context_to_analysis"))
+                or _as_mapping(item).get("requested_context")
+            )
+            source_asset_ids = [
+                str(item)
+                for item in _as_list(annotation.get("source_asset_ids"))
+                if str(item).strip()
+            ]
+            asset = next(
+                (
+                    asset_by_id.get(asset_id)
+                    for asset_id in source_asset_ids
+                    if asset_by_id.get(asset_id) is not None
+                ),
+                None,
+            )
+            status = _first_non_empty_str(
+                metadata.get("status"),
+                _tag_value(annotation.get("tags"), "status"),
+                "unknown",
+            )
+            resource_state = _first_non_empty_str(
+                metadata.get("resource_state"),
+                signal_summary.get("resource_state"),
+                _tag_value(annotation.get("tags"), "resource_state"),
+                (asset or {}).get("resource_state") if isinstance(asset, dict) else None,
+                "unknown",
+            )
+            asset_type = _first_non_empty_str(
+                metadata.get("asset_type"),
+                signal_summary.get("asset_type"),
+                (asset or {}).get("asset_type") if isinstance(asset, dict) else None,
+                (asset or {}).get("type") if isinstance(asset, dict) else None,
+                "unknown",
+            )
+            file_name = _first_non_empty_str(
+                metadata.get("file_name"),
+                signal_summary.get("file_name"),
+                (asset or {}).get("file_name") if isinstance(asset, dict) else None,
+            )
+            forward_degraded = _bool_value(
+                metadata.get("forward_degraded")
+                if metadata.get("forward_degraded") is not None
+                else signal_summary.get("forward_degraded")
+            )
+            forward_parent_message_id = _first_non_empty_str(
+                metadata.get("forward_parent_message_id"),
+                signal_summary.get("forward_parent_message_id"),
+            )
+            forward_depth = _int_value(
+                metadata.get("forward_depth")
+                if metadata.get("forward_depth") is not None
+                else signal_summary.get("forward_depth")
+            )
+            hypothesis_text = _first_non_empty_str(
+                metadata.get("hypothesis_text"),
+                signal_summary.get("hypothesis_text"),
+            )
+            if status == "resolved" and hypothesis_text:
+                resolved_hypothesis_count += 1
+
+            status_counts[status] += 1
+            asset_type_counts[asset_type] += 1
+            resource_state_counts[resource_state] += 1
+            records.append(
+                {
+                    "annotation_id": annotation_id or None,
+                    "message_uid": message_uid,
+                    "timestamp_iso": getattr(message, "timestamp_iso", None),
+                    "sender_id": getattr(message, "sender_id", None),
+                    "sender_name": getattr(message, "sender_name", None),
+                    "asset_id": source_asset_ids[0] if source_asset_ids else None,
+                    "asset_type": asset_type,
+                    "file_name": file_name,
+                    "status": status,
+                    "resource_state": resource_state,
+                    "forward_degraded": forward_degraded,
+                    "forward_parent_message_id": forward_parent_message_id,
+                    "forward_depth": forward_depth if forward_depth > 0 else None,
+                    "confidence": _float_value(annotation.get("confidence")),
+                    "decision_summary": _first_non_empty_str(
+                        annotation.get("decision_summary"),
+                        annotation.get("summary"),
+                    ),
+                    "hypothesis_text": hypothesis_text,
+                    "reason": _first_non_empty_str(signal_summary.get("reason")),
+                    "snippet_count": _int_value(signal_summary.get("snippet_count")),
+                    "explicit_chars": _int_value(signal_summary.get("explicit_chars")),
+                    "same_asset_occurrence_count": len(
+                        {
+                            str(item)
+                            for item in _as_list(metadata.get("same_asset_occurrence_ids"))
+                            if str(item).strip()
+                        }
+                    ),
+                    "context_excerpt": _first_non_empty_str(
+                        metadata.get("context_excerpt"),
+                        signal_summary.get("context_excerpt"),
+                        preview_text(
+                            getattr(message, "text_content", None)
+                            or getattr(message, "content", None)
+                            or "",
+                            180,
+                        ),
+                    ),
+                }
+            )
+
+    records.sort(
+        key=lambda item: (
+            _expired_status_priority(item.get("status")),
+            -(item.get("confidence") or 0.0),
+            str(item.get("timestamp_iso") or ""),
+            str(item.get("message_uid") or ""),
+        )
+    )
+
+    notes: list[str] = []
+    if records:
+        if status_counts.get("resolved", 0):
+            notes.append("存在 resolved 级别的 context-supported expired inference。")
+        if status_counts.get("uncertain", 0):
+            notes.append("存在 uncertain 级别的失活媒体推断，后续应保留保守边界。")
+        if status_counts.get("unrecoverable", 0):
+            notes.append("存在 unrecoverable 级别的失活媒体位点，不能伪造本体内容。")
+    else:
+        notes.append("当前 materials 未检测到 expired_asset_inference_preprocessor 注解。")
+
+    return {
+        "present": bool(records),
+        "annotation_count": len(records),
+        "status_counts": dict(sorted(status_counts.items())),
+        "asset_type_counts": dict(sorted(asset_type_counts.items())),
+        "resource_state_counts": dict(sorted(resource_state_counts.items())),
+        "resolved_hypothesis_count": resolved_hypothesis_count,
+        "requested_context_rounds": requested_context_rounds,
+        "top_records": records[:max_records],
+        "notes": notes,
+    }
+
+
 def build_benshi_master_system_prompt(scaffold: BenshiPromptScaffold) -> str:
     reply_probe_note = (
         "当前启用了 reply probe，你需要额外给出可接这坨史下话茬的候选。"
@@ -243,10 +457,11 @@ def build_benshi_master_system_prompt(scaffold: BenshiPromptScaffold) -> str:
         "analysis pack 里如果附带 `ontology_pack`，那就是本项目本地关于‘史’的原义、类型学、判准和 popular 形态约束。你必须优先服从这份 ontology，而不是临场自创定义。\n"
         "你必须分清五层：\n"
         "1. 直接证据：pack 里明确可见的文本、forward、reply、系统/分享、caption、媒体覆盖信息。\n"
-        "2. 上下文推断：可以推，但要写明是 context-only，不准装成看过媒体本体。\n"
-        "3. 成分拆解：把内容成分、包装成分、搬运成分、不确定性成分拆开。\n"
-        "4. 描述层：告诉后续系统应该怎么描述这坨史，哪些写法是空话或过界脑补。\n"
-        "5. unknown：证据不够、媒体缺失、上下文断裂时必须保留 unknown。\n"
+        "2. 联合证据：要把文本、forward 结构、图像 caption、群友反应和失活/退化媒体位点放在同一张图里看，而不是拆开各说各话。\n"
+        "3. 上下文推断：可以推，但要写明是 context-only，不准装成看过媒体本体。\n"
+        "4. 成分拆解：把内容成分、包装成分、搬运成分、社交反应成分、不确定性成分拆开。\n"
+        "5. 描述层：告诉后续系统应该怎么描述这坨史，哪些写法是空话或过界脑补。\n"
+        "6. unknown：证据不够、媒体缺失、上下文断裂时必须保留 unknown。\n"
         "你要像高强度冲浪网友一样懂梗、懂抽象、懂搬史文化，但不能把装懂当真懂。\n"
         f"{reply_probe_note}\n"
         "最终输出必须是一个 JSON 对象，外面不要再包 Markdown 解释。\n"
@@ -268,7 +483,9 @@ def build_benshi_master_user_tail(scaffold: BenshiPromptScaffold) -> list[str]:
     lines = [
         "请基于以上 analysis pack 输出一份 `BenshiMasterAgent` JSON 结果。",
         "输出必须先稳住证据层，再给史成分分析层、史描述层、文化解释层，最后才给更像群友的渲染层。",
+        "在 `evidence_layer` 之后，必须单独给出 `group_consumption_layer`，专门回答群友是怎么吃这坨史的。",
         "在 cultural_interpretation 之前，先单独给出 `shi_component_analysis` 和 `shi_description_layer`。",
+        "在 `shi_description_layer` 之后，必须单独给出 `joint_analysis_layer`，把文本、图像、forward、群友反应、失活/缺口联合起来后的全面判断写清楚。",
         "`shi_component_analysis` 负责回答：这坨东西为什么会被吃成史，具体有哪些成分，搬运结构和内容结构分别是什么。",
         "`shi_description_layer` 负责回答：应该怎么描述这坨史，哪些描述方式是对路的，哪些是空话或过界脑补。",
         "不要把 register_rendering 里的口吻污染到 evidence_layer。",
@@ -283,9 +500,16 @@ def build_benshi_master_user_tail(scaffold: BenshiPromptScaffold) -> list[str]:
         "不要给太万能、放哪都能说的空泛吐槽句；宁可少给几条，也要更贴当前这坨史的具体结构。",
         "如果存在 image_cluster_summaries，它们是程序先做过的一层图像簇摘要。你可以把它们当成“这一窗图片大致分成了哪些簇、哪些是图串、哪些是重复回放”的结构证据。",
         "如果存在 image_caption_samples，它们属于直接可见媒体证据的一部分；可以拿来解释图像簇的画面类型、截图/梗图/界面/聊天记录属性，但不要把 caption 外推成看见了所有图片。",
+        "如果存在 reaction_summary / reaction_patterns，你必须把它们当作‘群友怎么吃这坨史’的直接社会性证据，而不是附录；要说明群友是问号、嫌恶、阴阳、复读还是短平快接球。",
+        "如果存在 forward_degraded_asset_hints，它们表示 deep forward 里出现了视频/文件壳子，但本体未直接可见；这类位点只能作为 context-only 证据参与联合分析。",
+        "如果存在 expired_inference_summary，把它视为 `expired_asset_inference_preprocessor` 汇总出来的失活媒体上下文推断层，不是直接媒体观察。",
+        "对 expired_inference_summary 的 resolved/uncertain/unrecoverable 要分开使用：resolved 仍然只是 context-supported；uncertain 与 unrecoverable 必须反映到 unknown 或保守边界中。",
         "如果存在 ontology_pack，你必须显式区分：`史的原义`、`当前 popular shi 形态`、`这一窗实际体现出来的成分`。这三者不能混成一坨。",
         "如果存在 example_bank_context，把它当作本地校准示例库：学习它的判断结构、描述结构和负例边界，但不要机械复读原句。",
         "如果存在 distribution_baseline_context，把它当作集中式样本的背景先验：它可以帮助你理解这类样本通常怎么搬、怎么返场、怎么包浆，但不能覆盖当前 evidence_layer 的直接观察。",
+        "分析时要回答两件事：一是搬来的是什么史，二是群友吃这坨史吃得怎么样、吃出了什么反应模式。两者缺一不可。",
+        "`group_consumption_layer` 要解释：群友是在围观、接球、阴阳、绷乐、整齐反馈，还是在认真展开；它们如何把材料从普通截图/forward 抬成可消费的史。",
+        "`joint_analysis_layer` 要解释：文本说了什么、图像看见了什么、forward 结构怎样包浆、群友如何吃、哪些媒体只是 preview/壳子，这些合在一起后整窗到底是什么路数。",
         "不要输出额外解释文字，直接输出 JSON。",
         "JSON contract skeleton:",
         contract_stub,
@@ -300,6 +524,7 @@ def build_benshi_master_prompt_payload(
     max_forward_summaries: int = 8,
     max_recurrence_summaries: int = 8,
     max_missing_media_gaps: int = 8,
+    expired_inference_summary: dict[str, Any] | None = None,
     example_bank_context: dict[str, Any] | None = None,
     distribution_baseline_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -313,6 +538,49 @@ def build_benshi_master_prompt_payload(
                 pack.distribution_baseline_summary
             )
         )
+    resolved_expired_inference_summary = expired_inference_summary
+    if resolved_expired_inference_summary is None:
+        resolved_expired_inference_summary = {
+            "inference_count": pack.expired_inference_summary.inference_count,
+            "resolved_count": pack.expired_inference_summary.resolved_count,
+            "uncertain_count": pack.expired_inference_summary.uncertain_count,
+            "unrecoverable_count": pack.expired_inference_summary.unrecoverable_count,
+            "info_count": pack.expired_inference_summary.info_count,
+            "with_hypothesis_count": pack.expired_inference_summary.with_hypothesis_count,
+            "resource_state_counts": dict(pack.expired_inference_summary.resource_state_counts),
+            "asset_type_counts": dict(pack.expired_inference_summary.asset_type_counts),
+            "final_status_counts": dict(pack.expired_inference_summary.final_status_counts),
+            "signal_reason_counts": dict(pack.expired_inference_summary.signal_reason_counts),
+            "request_kind_counts": dict(pack.expired_inference_summary.request_kind_counts),
+            "total_round_count": pack.expired_inference_summary.total_round_count,
+            "same_asset_linked_count": pack.expired_inference_summary.same_asset_linked_count,
+            "representative_summary_ids": list(pack.expired_inference_summary.representative_summary_ids),
+            "top_items": [
+                {
+                    "summary_id": item.summary_id,
+                    "message_uid": item.message_uid,
+                    "timestamp_iso": item.timestamp_iso,
+                    "file_name": _note_value(item.notes, "file_name"),
+                    "sender_id": item.sender_id,
+                    "sender_name": item.sender_name,
+                    "asset_type": item.asset_type,
+                    "resource_state": item.resource_state,
+                    "final_status": item.final_status,
+                    "forward_degraded": _note_bool(item.notes, "forward_degraded"),
+                    "forward_parent_message_id": _note_value(item.notes, "forward_parent_message_id"),
+                    "forward_depth": _note_int(item.notes, "forward_depth"),
+                    "confidence": item.confidence,
+                    "hypothesis_text": preview_text(item.hypothesis_text or "", 180) or None,
+                    "decision_summary": preview_text(item.decision_summary or "", 180) or None,
+                    "signal_reason": item.signal_reason,
+                    "same_asset_occurrence_count": item.same_asset_occurrence_count,
+                    "round_count": item.round_count,
+                    "request_kinds": list(item.request_kinds[:4]),
+                    "notes": list(item.notes[:4]),
+                }
+                for item in pack.expired_inference_items[:8]
+            ],
+        }
     selected_messages = [
         _compact_selected_message(item)
         for item in _pick_prompt_selected_messages(
@@ -371,6 +639,18 @@ def build_benshi_master_prompt_payload(
                 "notes": [preview_text(note, 120) for note in item.notes[:3]],
             }
             for item in pack.participant_role_candidates[:8]
+        ],
+        "reaction_summary": pack.reaction_summary.model_dump(mode="json"),
+        "reaction_patterns": [
+            {
+                "pattern_label": item.pattern_label,
+                "score": item.score,
+                "message_count": item.message_count,
+                "reactor_count": item.reactor_count,
+                "representative_excerpts": list(item.representative_excerpts[:3]),
+                "notes": list(item.notes[:3]),
+            }
+            for item in pack.reaction_patterns[:6]
         ],
         "asset_summary": pack.asset_summary.model_dump(mode="json"),
         "asset_summaries": [
@@ -497,11 +777,31 @@ def build_benshi_master_prompt_payload(
                 "file_name": item.file_name,
                 "status": item.status,
                 "resolver": item.resolver,
+                "forward_degraded": item.status == "forward_degraded_asset",
                 "context_excerpt": preview_text(item.context_excerpt or "", 180),
                 "reason": preview_text(item.reason or "", 120),
             }
             for item in pack.missing_media_gaps[:max_missing_media_gaps]
         ],
+        "forward_degraded_asset_hints": [
+            {
+                "hint_id": item.hint_id,
+                "asset_type": item.asset_type,
+                "file_name": item.file_name,
+                "evidence_state": item.evidence_state,
+                "confidence_label": item.confidence_label,
+                "occurrence_count": item.occurrence_count,
+                "outer_message_count": item.outer_message_count,
+                "representative_context_excerpt": preview_text(
+                    item.representative_context_excerpt or "",
+                    160,
+                ) or None,
+                "preview_examples": [preview_text(example, 140) for example in item.preview_examples[:3]],
+                "notes": list(item.notes[:3]),
+            }
+            for item in pack.forward_degraded_asset_hints[:max_missing_media_gaps]
+        ],
+        "expired_inference_summary": resolved_expired_inference_summary,
         "preprocess_overlay_summary": (
             pack.preprocess_overlay_summary.model_dump(mode="json")
             if pack.preprocess_overlay_summary is not None
@@ -522,6 +822,7 @@ def build_benshi_master_user_prompt(
     max_forward_summaries: int = 8,
     max_recurrence_summaries: int = 8,
     max_missing_media_gaps: int = 8,
+    expired_inference_summary: dict[str, Any] | None = None,
     example_bank_context: dict[str, Any] | None = None,
     distribution_baseline_context: dict[str, Any] | None = None,
 ) -> str:
@@ -531,6 +832,7 @@ def build_benshi_master_user_prompt(
         max_forward_summaries=max_forward_summaries,
         max_recurrence_summaries=max_recurrence_summaries,
         max_missing_media_gaps=max_missing_media_gaps,
+        expired_inference_summary=expired_inference_summary,
         example_bank_context=example_bank_context,
         distribution_baseline_context=distribution_baseline_context,
     )
@@ -630,3 +932,110 @@ def _compact_recurrence_summary(item: Any) -> dict[str, Any]:
         "materialization_status_counts": item.materialization_status_counts,
         "exported_rel_paths": list(item.exported_rel_paths[:4]),
     }
+
+
+def _extract_expired_inference_annotations(extra: Any) -> list[dict[str, Any]]:
+    mapped = _as_mapping(extra)
+    values = [
+        mapped.get("annotations"),
+        mapped.get("preprocess_annotations"),
+        _as_mapping(mapped.get("preprocess")).get("annotations"),
+    ]
+    output: list[dict[str, Any]] = []
+    for value in values:
+        for item in _as_list(value):
+            item_map = _as_mapping(item)
+            if not item_map:
+                continue
+            label = str(item_map.get("label") or "")
+            tags = [str(tag) for tag in _as_list(item_map.get("tags")) if str(tag).strip()]
+            if label == "expired_asset_inference_preprocessor" or "expired_asset_inference" in tags:
+                output.append(item_map)
+    return output
+
+
+def _tag_value(tags: Any, prefix: str) -> str | None:
+    needle = f"{prefix}:"
+    for item in _as_list(tags):
+        text = str(item or "").strip()
+        if text.startswith(needle):
+            return text[len(needle) :].strip() or None
+    return None
+
+
+def _note_value(notes: Any, prefix: str) -> str | None:
+    needle = f"{prefix}:"
+    for item in _as_list(notes):
+        text = str(item or "").strip()
+        if text.startswith(needle):
+            return text[len(needle) :].strip() or None
+    return None
+
+
+def _note_bool(notes: Any, prefix: str) -> bool:
+    value = _note_value(notes, prefix)
+    return _bool_value(value)
+
+
+def _note_int(notes: Any, prefix: str) -> int | None:
+    value = _note_value(notes, prefix)
+    if value is None:
+        return None
+    parsed = _int_value(value)
+    return parsed if parsed > 0 else None
+
+
+def _expired_status_priority(value: Any) -> int:
+    status = str(value or "").strip().lower()
+    order = {
+        "resolved": 0,
+        "uncertain": 1,
+        "unrecoverable": 2,
+        "info": 3,
+        "unknown": 4,
+    }
+    return order.get(status, 5)
+
+
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return []
+
+
+def _first_non_empty_str(*values: Any) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _float_value(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)

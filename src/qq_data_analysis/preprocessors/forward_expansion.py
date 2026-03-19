@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Mapping
 
 from ..interfaces import AnalyzerContext, DeterministicAnalyzer
 from ..models import AnalysisEvidenceRef, DeterministicResult
+
+
+_TOKEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("video", re.compile(r"\[video:(?P<name>[^\]\r\n]+)\]")),
+    ("file", re.compile(r"\[(?:uploaded_file_name|file):(?P<name>[^\]\r\n]+)\]")),
+)
 
 
 class ForwardBundleExpander(DeterministicAnalyzer):
@@ -58,6 +65,16 @@ def _build_forward_expansion(*, message: Any, segment: Any) -> DeterministicResu
     inner_asset_refs = []
     for inner in inner_messages:
         inner_asset_refs.extend(inner["asset_refs"])
+    for line_index, line in enumerate(preview_lines):
+        inner_asset_refs = _merge_asset_refs(
+            inner_asset_refs,
+            _token_asset_refs_from_text(line, source_hint=f"preview_line:{line_index}"),
+        )
+    if detailed_text:
+        inner_asset_refs = _merge_asset_refs(
+            inner_asset_refs,
+            _token_asset_refs_from_text(detailed_text, source_hint="detailed_text"),
+        )
 
     evidence_refs = [
         AnalysisEvidenceRef(
@@ -142,6 +159,12 @@ def _compact_forward_message(item: Mapping[str, Any], *, index: int) -> dict[str
                 "path": _string_or_none(segment.get("path")),
             }
         )
+    text_value = _string_or_none(item.get("text_content")) or _string_or_none(item.get("content"))
+    if text_value:
+        asset_refs = _merge_asset_refs(
+            asset_refs,
+            _token_asset_refs_from_text(text_value, source_hint=f"forward_message:{index}"),
+        )
 
     return {
         "index": index,
@@ -214,6 +237,11 @@ def _forward_child_to_message(item: Mapping[str, Any], *, index: int) -> dict[st
         if not segment_types:
             for child in nested:
                 segment_types.extend(child.get("segment_types") or [])
+    if text_value:
+        asset_refs = _merge_asset_refs(
+            asset_refs,
+            _token_asset_refs_from_text(text_value, source_hint=f"forward_child:{index}"),
+        )
     return {
         "index": index,
         "sender_id": _string_or_none(item.get("sender_id")),
@@ -224,6 +252,60 @@ def _forward_child_to_message(item: Mapping[str, Any], *, index: int) -> dict[st
         "asset_refs": asset_refs,
         "segment_types": segment_types,
     }
+
+
+def _token_asset_refs_from_text(value: str, *, source_hint: str) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    if not value:
+        return output
+    for asset_type, pattern in _TOKEN_PATTERNS:
+        for match in pattern.finditer(value):
+            file_name = _string_or_none(match.group("name"))
+            if not file_name:
+                continue
+            output.append(
+                {
+                    "asset_type": asset_type,
+                    "file_name": file_name,
+                    "token": match.group(0),
+                    "summary": f"{asset_type}:{file_name}",
+                    "md5": None,
+                    "path": None,
+                    "resource_state": "missing",
+                    "resolver": "forward_token_only",
+                    "forward_degraded": True,
+                    "source_hint": source_hint,
+                }
+            )
+    return output
+
+
+def _merge_asset_refs(
+    existing: Iterable[Mapping[str, Any]],
+    extra: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = [dict(item) for item in existing if isinstance(item, Mapping)]
+    seen = {
+        (
+            _string_or_none(item.get("asset_type")) or "unknown",
+            _string_or_none(item.get("file_name")) or "",
+            _string_or_none(item.get("token")) or "",
+        )
+        for item in merged
+    }
+    for item in extra:
+        if not isinstance(item, Mapping):
+            continue
+        key = (
+            _string_or_none(item.get("asset_type")) or "unknown",
+            _string_or_none(item.get("file_name")) or "",
+            _string_or_none(item.get("token")) or "",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(dict(item))
+    return merged
 
 
 def _segment_id(segment: Any) -> str | None:

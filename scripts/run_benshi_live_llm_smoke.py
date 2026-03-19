@@ -5,6 +5,7 @@ from collections import defaultdict
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from qq_data_analysis import AnalysisJobConfig, AnalysisService, AnalysisTarget
@@ -138,13 +139,24 @@ def _build_review_text(*, payload: dict, output_json_path: Path) -> str:
     compact = payload["compact_payload"]
     evidence = compact.get("evidence_layer", {}) or {}
     shi_component = compact.get("shi_component_analysis_layer", {}) or {}
+    group_consumption = compact.get("group_consumption_layer", {}) or {}
     shi_description = compact.get("shi_description_layer", {}) or {}
+    joint_analysis = compact.get("joint_analysis_layer", {}) or {}
     cultural = compact.get("cultural_interpretation_layer", {}) or {}
     register = compact.get("register_layer", {}) or {}
     reply = compact.get("reply_probe_layer", {}) or {}
     meta = compact.get("llm_meta", {}) or {}
     image_clusters = compact.get("image_cluster_summaries", []) or []
     image_captions = compact.get("image_caption_samples", []) or []
+    reaction_summary = compact.get("reaction_summary", {}) or {}
+    reaction_patterns = compact.get("reaction_patterns", []) or []
+    expired_inference_summary = compact.get("expired_inference_summary", {}) or {}
+    expired_inference_items = compact.get("expired_inference_items", []) or []
+    missing_media_gaps = compact.get("missing_media_gaps", []) or []
+    forward_degraded_asset_hints = compact.get("forward_degraded_asset_hints", []) or []
+    preprocess_overlay_summary = compact.get("preprocess_overlay_summary", {}) or {}
+    selected_message_overview = compact.get("selected_message_overview", []) or []
+    asset_summary = compact.get("asset_summary", {}) or {}
     prompt_refs = compact.get("prompt_reference_context", {}) or {}
     example_bank_context = prompt_refs.get("example_bank_context") or {}
     distribution_context = prompt_refs.get("distribution_baseline_context") or {}
@@ -196,27 +208,60 @@ def _build_review_text(*, payload: dict, output_json_path: Path) -> str:
             if distribution_context
             else "<none>"
         ),
-        "",
-        "2.7 图像证据",
-        f"  2.7.1 ImageClusterCount: {len(image_clusters)}",
-        f"  2.7.2 ImageCaptionCount: {len(image_captions)}",
-        "",
-        "3. 证据层",
-        f"  3.1 ShiPresence: {(evidence.get('shi_presence') or {}).get('label')}",
-        "  3.2 ShiTypeCandidates:",
     ]
+    next_enhanced_index = 8
     if artifact_inputs.get("notes"):
-        lines.append("  2.6.8 ArtifactNotes:")
+        lines.append(f"  2.6.{next_enhanced_index} ArtifactNotes:")
         for item in artifact_inputs.get("notes") or []:
             lines.append(f"    - {item}")
+        next_enhanced_index += 1
     if example_bank_context.get("example_groups"):
-        lines.append("  2.6.9 ExampleBankExamples:")
+        lines.append(f"  2.6.{next_enhanced_index} ExampleBankExamples:")
         for group in example_bank_context.get("example_groups") or []:
             lines.append(f"    - {group.get('group_name')}")
             for item in group.get("examples") or []:
                 lines.append(
                     f"      - {item.get('example_id')}: {item.get('expected_direction')}"
                 )
+    lines.extend(
+        [
+            "",
+        "2.7 图像证据",
+        f"  2.7.1 ImageClusterCount: {len(image_clusters)}",
+        f"  2.7.2 ImageCaptionCount: {len(image_captions)}",
+        f"  2.7.3 ReactionMessageCount: {reaction_summary.get('reaction_message_count') or 0}",
+        f"  2.7.4 ForwardDegradedHintCount: {len(forward_degraded_asset_hints)}",
+        f"  2.7.5 MissingMediaGapCount: {len(missing_media_gaps)}",
+        f"  2.7.6 ExpiredInferenceCount: {expired_inference_summary.get('annotation_count') or expired_inference_summary.get('inference_count') or 0}",
+        ]
+    )
+    lines.extend(
+        _build_joint_analysis_overview_lines(
+            evidence=evidence,
+            shi_component=shi_component,
+            group_consumption=group_consumption,
+            shi_description=shi_description,
+            joint_analysis=joint_analysis,
+            cultural=cultural,
+            reaction_summary=reaction_summary,
+            reaction_patterns=reaction_patterns,
+            image_clusters=image_clusters,
+            image_captions=image_captions,
+            expired_inference_summary=expired_inference_summary,
+            expired_inference_items=expired_inference_items,
+            missing_media_gaps=missing_media_gaps,
+            preprocess_overlay_summary=preprocess_overlay_summary,
+            selected_message_overview=selected_message_overview,
+        )
+    )
+    lines.extend(
+        [
+            "",
+            "3. 证据层",
+            f"  3.1 ShiPresence: {(evidence.get('shi_presence') or {}).get('label')}",
+            "  3.2 ShiTypeCandidates:",
+        ]
+    )
     for idx, item in enumerate(evidence.get("shi_type_candidates", []), start=1):
         lines.append(f"    {idx}. {item.get('label')} ({item.get('confidence') or item.get('score')})")
         reasons = item.get("reasons") or [item.get("why")] if item.get("why") else []
@@ -245,8 +290,31 @@ def _build_review_text(*, payload: dict, output_json_path: Path) -> str:
         lines.append("  3.5 Unknowns:")
         for item in unknowns:
             lines.append(f"    - {item}")
+    if reaction_summary:
+        lines.append("  3.6 GroupReactionSummary:")
+        lines.append(
+            "    - "
+            f"reaction_messages={reaction_summary.get('reaction_message_count') or 0} "
+            f"reactors={reaction_summary.get('reactor_count') or 0} "
+            f"reply_participation={reaction_summary.get('reply_participation_count') or 0}"
+        )
+        lines.append(
+            "    - dominant_modes="
+            + (" / ".join(reaction_summary.get("dominant_modes") or []) or "<none>")
+        )
+        for note in reaction_summary.get("notes") or []:
+            lines.append(f"    - note: {note}")
+        if reaction_patterns:
+            lines.append("    - reaction_patterns:")
+            for index, item in enumerate(reaction_patterns[:5], start=1):
+                lines.append(
+                    f"      {index}. {item.get('pattern_label')} "
+                    f"(messages={item.get('message_count')} reactors={item.get('reactor_count')})"
+                )
+                for excerpt in item.get("representative_excerpts") or []:
+                    lines.append(f"        - excerpt: {excerpt}")
     if image_captions:
-        lines.append("  3.6 ImageCaptionEvidence:")
+        lines.append("  3.7 ImageCaptionEvidence:")
         for index, item in enumerate(image_captions, start=1):
             label = item.get("cluster_id") or item.get("file_name") or item.get("message_uid")
             lines.append(f"    {index}. {label}")
@@ -255,7 +323,7 @@ def _build_review_text(*, payload: dict, output_json_path: Path) -> str:
             lines.append(f"      - ctx: {item.get('context_excerpt') or '<none>'}")
             lines.append(f"      - caption: {item.get('caption')}")
     if image_clusters:
-        lines.append("  3.7 ImageClusterSummaries:")
+        lines.append("  3.8 ImageClusterSummaries:")
         for index, item in enumerate(image_clusters, start=1):
             lines.append(
                 f"    {index}. {item.get('cluster_id')} / {item.get('cluster_kind')}"
@@ -278,6 +346,123 @@ def _build_review_text(*, payload: dict, output_json_path: Path) -> str:
                 lines.append(f"      - examples: {', '.join(examples)}")
             for note in item.get("notes") or []:
                 lines.append(f"      - note: {note}")
+    if forward_degraded_asset_hints:
+        lines.append("  3.9 ForwardDegradedAssetHints:")
+        for index, item in enumerate(forward_degraded_asset_hints[:6], start=1):
+            lines.append(
+                f"    {index}. {item.get('asset_type')} / {item.get('file_name') or '<none>'}"
+            )
+            lines.append(
+                "      - "
+                f"occurrences={item.get('occurrence_count')} "
+                f"outer_messages={item.get('outer_message_count')} "
+                f"confidence={item.get('confidence_label')}"
+            )
+            if item.get("representative_context_excerpt"):
+                lines.append(f"      - ctx: {item.get('representative_context_excerpt')}")
+            for example in item.get("preview_examples") or []:
+                lines.append(f"      - preview: {example}")
+    if missing_media_gaps or preprocess_overlay_summary or expired_inference_summary:
+        lines.append("  3.10 MissingMediaAndExpiredInference:")
+        if expired_inference_summary:
+            status_counts = expired_inference_summary.get("status_counts") or expired_inference_summary.get("final_status_counts") or {}
+            asset_type_counts = expired_inference_summary.get("asset_type_counts") or {}
+            lines.append(
+                "    - expired_statuses: "
+                + _format_counter(status_counts)
+            )
+            lines.append(
+                "    - expired_asset_types: "
+                + _format_counter(asset_type_counts)
+            )
+            if expired_inference_summary.get("notes"):
+                lines.append("    - expired_notes:")
+                for item in expired_inference_summary.get("notes") or []:
+                    lines.append(f"      - {item}")
+            if expired_inference_items:
+                lines.append("    - expired_examples:")
+                for index, item in enumerate(expired_inference_items[:4], start=1):
+                    label = item.get("file_name") or item.get("asset_type") or item.get("message_uid")
+                    lines.append(
+                        f"      {index}. {label} / status={item.get('status') or item.get('final_status')} / confidence={item.get('confidence')}"
+                    )
+                    if item.get("hypothesis_text"):
+                        lines.append(f"        - hypothesis={item.get('hypothesis_text')}")
+                    if item.get("decision_summary"):
+                        lines.append(f"        - decision={item.get('decision_summary')}")
+        if missing_media_gaps:
+            lines.append(
+                "    - gap_by_type: "
+                + _format_counter(_counter_from_items(missing_media_gaps, "asset_type"))
+            )
+            lines.append(
+                "    - gap_by_status: "
+                + _format_counter(_counter_from_items(missing_media_gaps, "status"))
+            )
+            lines.append(
+                "    - gap_by_resolver: "
+                + _format_counter(_counter_from_items(missing_media_gaps, "resolver"))
+            )
+            if asset_summary:
+                lines.append(
+                    "    - asset_summary_missing: "
+                    + _format_counter(asset_summary.get("asset_type_missing_counts") or {})
+                )
+            lines.append("    - gap_examples:")
+            for index, item in enumerate(missing_media_gaps[:6], start=1):
+                lines.append(
+                    f"      {index}. {item.get('asset_type')} / {item.get('file_name') or '<no-file-name>'}"
+                )
+                if item.get("status") or item.get("resolver"):
+                    lines.append(
+                        f"        - status={item.get('status') or '<none>'} resolver={item.get('resolver') or '<none>'}"
+                    )
+                if item.get("reason"):
+                    lines.append(f"        - reason={item.get('reason')}")
+                if item.get("context_excerpt"):
+                    lines.append(
+                        f"        - ctx={item.get('context_excerpt')}"
+                    )
+        overlay_items = _collect_expired_or_missing_overlay_items(
+            preprocess_overlay_summary=preprocess_overlay_summary,
+            selected_message_overview=selected_message_overview,
+        )
+        if preprocess_overlay_summary:
+            lines.append(
+                "    - overlay_top_labels: "
+                + _format_counter(preprocess_overlay_summary.get("top_labels") or {})
+            )
+            if preprocess_overlay_summary.get("delivery_profile"):
+                lines.append(
+                    f"    - overlay_delivery_profile: {preprocess_overlay_summary.get('delivery_profile')}"
+                )
+            if preprocess_overlay_summary.get("notes"):
+                lines.append("    - overlay_notes:")
+                for item in preprocess_overlay_summary.get("notes") or []:
+                    lines.append(f"      - {item}")
+        if overlay_items:
+            lines.append("    - overlay_representative_items:")
+            for index, item in enumerate(overlay_items[:6], start=1):
+                labels = item.get("labels") or item.get("preprocess_labels") or []
+                lines.append(
+                    f"      {index}. {item.get('message_uid') or '<unknown-message>'} / labels={', '.join(labels) if labels else '<none>'}"
+                )
+                if item.get("missing_media_count"):
+                    lines.append(
+                        f"        - missing_media_count={item.get('missing_media_count')}"
+                    )
+                if item.get("decision_summary"):
+                    lines.append(
+                        f"        - decision_summary={item.get('decision_summary')}"
+                    )
+                elif item.get("processed_text"):
+                    lines.append(
+                        f"        - processed_text={item.get('processed_text')}"
+                    )
+        if image_clusters or image_captions:
+            lines.append(
+                "    - joint_note: 图像簇/图像 caption 提供的是可见图像证据；群友反应说明这坨史是怎么被吃的；forward 退化媒体和 expired/missing 位点则只能靠上下文与 overlay 保守解释。四者必须联合读，但不能混成同一置信层。"
+            )
     transport = evidence.get("transport_pattern") or {}
     if transport:
         lines.extend(
@@ -534,6 +719,7 @@ def main() -> int:
         "warnings": output.warnings,
         "artifact_inputs": artifact_inputs,
     }
+    payload["compact_payload"].update(_serialize_pack_context(prepared))
     suffix_parts: list[str] = []
     if "reply_probe" in args.prompt_version:
         suffix_parts.append("reply_probe")
@@ -975,6 +1161,13 @@ def _build_shi_review_text(*, payload: dict, output_json_path: Path) -> str:
     shi_component = compact.get("shi_component_analysis_layer", {}) or {}
     shi_description = compact.get("shi_description_layer", {}) or {}
     evidence = compact.get("evidence_layer", {}) or {}
+    missing_media_gaps = compact.get("missing_media_gaps", []) or []
+    expired_inference_summary = compact.get("expired_inference_summary", {}) or {}
+    expired_inference_items = compact.get("expired_inference_items", []) or []
+    preprocess_overlay_summary = compact.get("preprocess_overlay_summary", {}) or {}
+    selected_message_overview = compact.get("selected_message_overview", []) or []
+    image_clusters = compact.get("image_cluster_summaries", []) or []
+    image_captions = compact.get("image_caption_samples", []) or []
     prompt_refs = compact.get("prompt_reference_context", {}) or {}
     example_bank_context = prompt_refs.get("example_bank_context") or {}
     distribution_context = prompt_refs.get("distribution_baseline_context") or {}
@@ -1049,6 +1242,55 @@ def _build_shi_review_text(*, payload: dict, output_json_path: Path) -> str:
         lines.append("  4.5 成分解释:")
         for item in shi_component.get("component_rationale") or []:
             lines.append(f"    - {item}")
+    overlay_items = _collect_expired_or_missing_overlay_items(
+        preprocess_overlay_summary=preprocess_overlay_summary,
+        selected_message_overview=selected_message_overview,
+    )
+    if missing_media_gaps or overlay_items:
+        lines.append("  4.6 缺口/失活线索:")
+        if expired_inference_summary:
+            lines.append(
+                "    - 失活逆推状态: "
+                + _format_counter(
+                    expired_inference_summary.get("status_counts")
+                    or expired_inference_summary.get("final_status_counts")
+                    or {}
+                )
+            )
+            lines.append(
+                "    - 失活逆推类型: "
+                + _format_counter(expired_inference_summary.get("asset_type_counts") or {})
+            )
+            for index, item in enumerate(expired_inference_items[:4], start=1):
+                label = item.get("file_name") or item.get("asset_type") or item.get("message_uid")
+                lines.append(
+                    f"    {index}. {label} / {item.get('status') or item.get('final_status')}"
+                )
+                if item.get("hypothesis_text"):
+                    lines.append(f"      - hypothesis: {item.get('hypothesis_text')}")
+                if item.get("decision_summary"):
+                    lines.append(f"      - decision: {item.get('decision_summary')}")
+        if missing_media_gaps:
+            lines.append(
+                "    - 缺口类型: "
+                + _format_counter(_counter_from_items(missing_media_gaps, "asset_type"))
+            )
+            lines.append(
+                "    - 缺口状态: "
+                + _format_counter(_counter_from_items(missing_media_gaps, "status"))
+            )
+        if preprocess_overlay_summary.get("top_labels"):
+            lines.append(
+                "    - overlay 标签: "
+                + _format_counter(preprocess_overlay_summary.get("top_labels") or {})
+            )
+        for index, item in enumerate(overlay_items[:4], start=1):
+            labels = item.get("labels") or item.get("preprocess_labels") or []
+            lines.append(
+                f"    {index}. {item.get('message_uid') or '<unknown>'} / {', '.join(labels) if labels else '<none>'}"
+            )
+            if item.get("decision_summary"):
+                lines.append(f"      - {item.get('decision_summary')}")
     lines.extend(["", "5. 应该怎么描述这些史"])
     if shi_description.get("one_line_definition"):
         lines.append(
@@ -1083,7 +1325,398 @@ def _build_shi_review_text(*, payload: dict, output_json_path: Path) -> str:
         lines.append("  5.7 未知边界:")
         for item in shi_description.get("unknown_boundaries") or []:
             lines.append(f"    - {item}")
+    if image_clusters or image_captions or missing_media_gaps:
+        lines.append("  5.8 联合媒体描述约束:")
+        if image_clusters:
+            lines.append(
+                f"    - 当前已有 {len(image_clusters)} 个图像簇摘要，可用于描述图串返场、截图壳子、单图复现。"
+            )
+        if image_captions:
+            lines.append(
+                f"    - 当前已有 {len(image_captions)} 条直接 caption，可描述少量代表图的可见事实。"
+            )
+        if missing_media_gaps:
+            lines.append(
+                f"    - 当前仍有 {len(missing_media_gaps)} 个失活/缺失媒体位点；描述时只能说标题、壳子、上下文，不得把缺失视频/文件脑补成完整本体。"
+            )
     return "\n".join(lines) + "\n"
+
+
+def _serialize_pack_context(pack) -> dict[str, Any]:
+    overlay_summary = (
+        pack.preprocess_overlay_summary.model_dump(mode="json")
+        if getattr(pack, "preprocess_overlay_summary", None) is not None
+        else None
+    )
+    selected_message_overview: list[dict[str, Any]] = []
+    for item in getattr(pack, "selected_messages", []) or []:
+        if not (
+            item.missing_media_count
+            or item.preprocess_labels
+            or item.decision_summary
+            or item.processed_text
+        ):
+            continue
+        selected_message_overview.append(
+            {
+                "message_uid": item.message_uid,
+                "timestamp_iso": item.timestamp_iso,
+                "missing_media_count": item.missing_media_count,
+                "preprocess_labels": list(item.preprocess_labels),
+                "decision_summary": item.decision_summary,
+                "processed_text": item.processed_text,
+            }
+        )
+    return {
+        "reaction_summary": (
+            pack.reaction_summary.model_dump(mode="json")
+            if getattr(pack, "reaction_summary", None) is not None
+            else None
+        ),
+        "reaction_patterns": [
+            item.model_dump(mode="json")
+            for item in getattr(pack, "reaction_patterns", []) or []
+        ],
+        "expired_inference_summary": (
+            pack.expired_inference_summary.model_dump(mode="json")
+            if getattr(pack, "expired_inference_summary", None) is not None
+            else None
+        ),
+        "expired_inference_items": [
+            item.model_dump(mode="json")
+            for item in getattr(pack, "expired_inference_items", []) or []
+        ],
+        "missing_media_gaps": [
+            item.model_dump(mode="json")
+            for item in getattr(pack, "missing_media_gaps", []) or []
+        ],
+        "preprocess_overlay_summary": overlay_summary,
+        "selected_message_overview": selected_message_overview,
+        "asset_summary": (
+            pack.asset_summary.model_dump(mode="json")
+            if getattr(pack, "asset_summary", None) is not None
+            else None
+        ),
+    }
+
+
+def _build_joint_analysis_overview_lines(
+    *,
+    evidence: dict[str, Any],
+    shi_component: dict[str, Any],
+    group_consumption: dict[str, Any],
+    shi_description: dict[str, Any],
+    joint_analysis: dict[str, Any],
+    cultural: dict[str, Any],
+    reaction_summary: dict[str, Any],
+    reaction_patterns: list[dict[str, Any]],
+    image_clusters: list[dict[str, Any]],
+    image_captions: list[dict[str, Any]],
+    expired_inference_summary: dict[str, Any],
+    expired_inference_items: list[dict[str, Any]],
+    missing_media_gaps: list[dict[str, Any]],
+    preprocess_overlay_summary: dict[str, Any],
+    selected_message_overview: list[dict[str, Any]],
+) -> list[str]:
+    lines = [
+        "",
+        "2.8 联合分析总览",
+        "  2.8.1 Shi本体:",
+    ]
+    for item in _summarize_shi_body(
+        evidence=evidence,
+        shi_component=shi_component,
+        shi_description=shi_description,
+        joint_analysis=joint_analysis,
+    ):
+        lines.append(f"    - {item}")
+    lines.append("  2.8.2 群友反应:")
+    for item in _summarize_group_reaction(
+        evidence=evidence,
+        cultural=cultural,
+        group_consumption=group_consumption,
+        reaction_summary=reaction_summary,
+        reaction_patterns=reaction_patterns,
+    ):
+        lines.append(f"    - {item}")
+    lines.append("  2.8.3 图像模态:")
+    for item in _summarize_image_modality(
+        image_clusters=image_clusters,
+        image_captions=image_captions,
+    ):
+        lines.append(f"    - {item}")
+    lines.append("  2.8.4 深层forward/退化媒体:")
+    for item in _summarize_degraded_media(
+        evidence=evidence,
+        expired_inference_summary=expired_inference_summary,
+        expired_inference_items=expired_inference_items,
+        missing_media_gaps=missing_media_gaps,
+        preprocess_overlay_summary=preprocess_overlay_summary,
+        selected_message_overview=selected_message_overview,
+    ):
+        lines.append(f"    - {item}")
+    lines.append("  2.8.5 UnknownBoundary:")
+    for item in _summarize_unknown_boundaries(
+        evidence=evidence,
+        group_consumption=group_consumption,
+        joint_analysis=joint_analysis,
+        image_captions=image_captions,
+        missing_media_gaps=missing_media_gaps,
+    ):
+        lines.append(f"    - {item}")
+    return lines
+
+
+def _summarize_shi_body(
+    *,
+    evidence: dict[str, Any],
+    shi_component: dict[str, Any],
+    shi_description: dict[str, Any],
+    joint_analysis: dict[str, Any],
+) -> list[str]:
+    lines: list[str] = []
+    if joint_analysis.get("joint_verdict"):
+        lines.append(str(joint_analysis.get("joint_verdict")))
+    one_line = (
+        shi_description.get("one_line_definition")
+        or shi_description.get("what_is_shi_definition")
+        or shi_component.get("definition")
+    )
+    if one_line:
+        lines.append(one_line)
+    dominant_types = [
+        item.get("label")
+        for item in (evidence.get("shi_type_candidates") or [])
+        if item.get("label")
+    ][:4]
+    if dominant_types:
+        presence = (evidence.get("shi_presence") or {}).get("label")
+        suffix = f"；presence={presence}" if presence else ""
+        lines.append("主要史型: " + " / ".join(dominant_types) + suffix)
+    dominant_components = shi_component.get("dominant_components") or []
+    if dominant_components:
+        lines.append("主成分: " + " / ".join(dominant_components[:5]))
+    return lines or ["当前缺少足够的 shi 本体摘要，只能回看详细证据层。"]
+
+
+def _summarize_group_reaction(
+    *,
+    evidence: dict[str, Any],
+    cultural: dict[str, Any],
+    group_consumption: dict[str, Any],
+    reaction_summary: dict[str, Any],
+    reaction_patterns: list[dict[str, Any]],
+) -> list[str]:
+    lines: list[str] = []
+    if group_consumption.get("consumption_summary"):
+        lines.append(str(group_consumption.get("consumption_summary")))
+        for item in (group_consumption.get("how_group_ate_it") or [])[:2]:
+            lines.append(str(item))
+    if reaction_summary.get("reaction_message_count"):
+        lines.append(
+            "群友反应 "
+            f"{reaction_summary.get('reaction_message_count')} 条，"
+            f"主模式="
+            f"{' / '.join(reaction_summary.get('dominant_modes') or []) or 'unclear'}"
+        )
+        if reaction_summary.get("forward_internal_count"):
+            lines.append(
+                f"forward 内层也有 {reaction_summary.get('forward_internal_count')} 条围观/点评片段。"
+            )
+        for item in reaction_patterns[:2]:
+            excerpt = (item.get("representative_excerpts") or [None])[0]
+            lines.append(
+                f"{item.get('pattern_label') or item.get('pattern_id')}[{item.get('scope') or 'mixed'}]"
+                f" x{item.get('message_count')} / reactors={item.get('reactor_count')}"
+                + (f" / {excerpt}" if excerpt else "")
+            )
+        return lines[:4]
+
+    direct_observations = evidence.get("direct_observations") or []
+    recurrence_notes = (evidence.get("transport_pattern") or {}).get("recurrence_notes") or []
+    resonance_notes = cultural.get("resonance_notes") or []
+    dominant_sender_note = next(
+        (
+            item
+            for item in direct_observations
+            if "绝对主导者" in item or ("发送者" in item and "主导" in item)
+        ),
+        None,
+    )
+    if dominant_sender_note:
+        lines.append(dominant_sender_note)
+        lines.append("当前窗口更像单人主导倾倒，群友即时现聊反馈证据较弱。")
+    reaction_note = next(
+        (
+            item
+            for item in [*resonance_notes, *recurrence_notes, *direct_observations]
+            if any(token in item for token in ("回声", "复读", "围观", "返场", "补档", "reply"))
+        ),
+        None,
+    )
+    if reaction_note:
+        lines.append(reaction_note)
+    if not lines:
+        lines.append("当前材料更偏搬运结构与返场回放，群友反应证据不强。")
+    return lines[:3]
+
+
+def _summarize_image_modality(
+    *,
+    image_clusters: list[dict[str, Any]],
+    image_captions: list[dict[str, Any]],
+) -> list[str]:
+    lines: list[str] = [
+        f"图像侧当前有 {len(image_clusters)} 个图像簇、{len(image_captions)} 条直接 caption，可见证据主要来自重复图串、单图复现和少量代表图描述。"
+    ]
+    if image_clusters:
+        top_cluster = image_clusters[0]
+        lines.append(
+            f"最强图像簇是 {top_cluster.get('cluster_id')} / {top_cluster.get('cluster_kind')}，refs={top_cluster.get('reference_count')}，messages={top_cluster.get('distinct_message_count')}。"
+        )
+    if image_captions:
+        lines.append("代表图 caption: " + str(image_captions[0].get("caption") or "<none>"))
+    return lines[:3]
+
+
+def _summarize_degraded_media(
+    *,
+    evidence: dict[str, Any],
+    expired_inference_summary: dict[str, Any],
+    expired_inference_items: list[dict[str, Any]],
+    missing_media_gaps: list[dict[str, Any]],
+    preprocess_overlay_summary: dict[str, Any],
+    selected_message_overview: list[dict[str, Any]],
+) -> list[str]:
+    lines: list[str] = []
+    direct_observations = evidence.get("direct_observations") or []
+    nested_forward_note = next(
+        (
+            item
+            for item in direct_observations
+            if "套娃 forward" in item or "forward 摘要" in item or "forward_nested" in item
+        ),
+        None,
+    )
+    if nested_forward_note:
+        lines.append(nested_forward_note)
+    if missing_media_gaps:
+        lines.append(
+            "formal 缺口: "
+            + _format_counter(_counter_from_items(missing_media_gaps, "asset_type"))
+            + "；状态="
+            + _format_counter(_counter_from_items(missing_media_gaps, "status"))
+        )
+    else:
+        lines.append("formal missing_media_gaps 当前为空；退化边界主要来自深层 forward 摘要截断、未展开媒体和 caption 覆盖不足。")
+    if expired_inference_summary:
+        lines.append(
+            "expired inference: "
+            + _format_counter(
+                expired_inference_summary.get("status_counts")
+                or expired_inference_summary.get("final_status_counts")
+                or {}
+            )
+        )
+    elif expired_inference_items:
+        lines.append(f"expired inference items: {len(expired_inference_items)}")
+    top_labels = preprocess_overlay_summary.get("top_labels") or {}
+    overlay_items = _collect_expired_or_missing_overlay_items(
+        preprocess_overlay_summary=preprocess_overlay_summary,
+        selected_message_overview=selected_message_overview,
+    )
+    if top_labels:
+        lines.append("overlay: " + _format_counter(top_labels))
+    elif overlay_items:
+        lines.append("overlay: 已存在失活/缺失相关处理项，但当前 top_labels 为空。")
+    return lines[:4]
+
+
+def _summarize_unknown_boundaries(
+    *,
+    evidence: dict[str, Any],
+    group_consumption: dict[str, Any],
+    joint_analysis: dict[str, Any],
+    image_captions: list[dict[str, Any]],
+    missing_media_gaps: list[dict[str, Any]],
+) -> list[str]:
+    lines = list((evidence.get("unknowns") or [])[:3])
+    for item in (group_consumption.get("unknown_boundaries") or [])[:2]:
+        lines.append(str(item))
+    for item in (joint_analysis.get("unknown_boundaries") or [])[:2]:
+        lines.append(str(item))
+    if not lines and image_captions:
+        lines.append(
+            f"当前只对 {len(image_captions)} 条代表图做了直接 caption，其余图像不能自动视为已见。"
+        )
+    if not lines and missing_media_gaps:
+        lines.append("存在缺失媒体位点，未见本体时只能描述壳子、标题和上下文。")
+    if not lines:
+        lines.append("当前未知边界未显式输出，需回看详细证据层。")
+    return lines[:5]
+
+
+def _counter_from_items(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = str(item.get(key) or "<none>")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _format_counter(counter: dict[str, int]) -> str:
+    if not counter:
+        return "<none>"
+    return " / ".join(
+        f"{key}={value}"
+        for key, value in sorted(counter.items(), key=lambda pair: (-pair[1], pair[0]))
+    )
+
+
+def _collect_expired_or_missing_overlay_items(
+    *,
+    preprocess_overlay_summary: dict[str, Any],
+    selected_message_overview: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    representative_items = list(preprocess_overlay_summary.get("representative_items") or [])
+    interesting: list[dict[str, Any]] = []
+    for item in representative_items:
+        labels = [str(label).lower() for label in (item.get("labels") or [])]
+        payload = " ".join(
+            [
+                str(item.get("decision_summary") or ""),
+                str(item.get("processed_text") or ""),
+                " ".join(item.get("labels") or []),
+            ]
+        ).lower()
+        if _is_expired_or_missing_signal(labels, payload):
+            interesting.append(item)
+    for item in selected_message_overview:
+        labels = [str(label).lower() for label in (item.get("preprocess_labels") or [])]
+        payload = " ".join(
+            [
+                str(item.get("decision_summary") or ""),
+                str(item.get("processed_text") or ""),
+                " ".join(item.get("preprocess_labels") or []),
+            ]
+        ).lower()
+        if item.get("missing_media_count") or _is_expired_or_missing_signal(labels, payload):
+            if not any(existing.get("message_uid") == item.get("message_uid") for existing in interesting):
+                interesting.append(item)
+    return interesting
+
+
+def _is_expired_or_missing_signal(labels: list[str], payload: str) -> bool:
+    if any(
+        token in label
+        for label in labels
+        for token in ("expired", "missing", "placeholder", "degraded", "缺口", "失活")
+    ):
+        return True
+    return any(
+        token in payload
+        for token in ("expired", "missing", "placeholder", "degraded", "失活", "缺口", "资源过期")
+    )
 
 
 if __name__ == "__main__":
