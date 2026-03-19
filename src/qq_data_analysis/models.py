@@ -512,6 +512,62 @@ class BenshiShiDescriptionProfile(BaseModel):
     example_descriptors: list[str] = Field(default_factory=list)
 
 
+class BenshiOntologyDimension(BaseModel):
+    label: str
+    summary: str
+    cues: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class BenshiOntologyTaxonomyItem(BaseModel):
+    label: str
+    definition: str
+    positive_cues: list[str] = Field(default_factory=list)
+    caution: str | None = None
+
+
+class BenshiOntologyPopularForm(BaseModel):
+    label: str
+    summary: str
+    common_carriers: list[str] = Field(default_factory=list)
+    relation_to_origin: str | None = None
+    cautions: list[str] = Field(default_factory=list)
+
+
+class BenshiOntologyPack(BaseModel):
+    source_documents: list[str] = Field(default_factory=list)
+    origin_definition: str
+    propagation_paradox: str | None = None
+    formation_dimensions: list[BenshiOntologyDimension] = Field(default_factory=list)
+    taxonomy: list[BenshiOntologyTaxonomyItem] = Field(default_factory=list)
+    quality_rubric: list[BenshiOntologyDimension] = Field(default_factory=list)
+    transport_theory: list[BenshiOntologyDimension] = Field(default_factory=list)
+    popular_forms: list[BenshiOntologyPopularForm] = Field(default_factory=list)
+    hard_guidance: list[str] = Field(default_factory=list)
+    soft_guidance: list[str] = Field(default_factory=list)
+    anti_patterns: list[str] = Field(default_factory=list)
+
+
+class BenshiDistributionBaselineSummary(BaseModel):
+    dataset_id: str | None = None
+    artifact: str | None = None
+    baseline_path: str | None = None
+    canonical_messages: int = 0
+    all_occurrences: int = 0
+    repeated_dump_windows: list[str] = Field(default_factory=list)
+    dominant_components: list[str] = Field(default_factory=list)
+    component_family_score_totals: dict[str, float] = Field(default_factory=dict)
+    delivery_mode_counts: dict[str, int] = Field(default_factory=dict)
+    modality_counts: dict[str, int] = Field(default_factory=dict)
+    relay_shape: str | None = None
+    recurrence_notes: list[str] = Field(default_factory=list)
+    cluster_count: int = 0
+    caption_count: int = 0
+    recurrent_cluster_count: int = 0
+    cluster_kind_counts: dict[str, int] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
 class BenshiAnalysisPack(BaseModel):
     run_id: str
     target: ResolvedAnalysisTarget
@@ -532,6 +588,8 @@ class BenshiAnalysisPack(BaseModel):
     asset_summaries: list[BenshiAssetSummary] = Field(default_factory=list)
     shi_component_summaries: list[BenshiShiComponentSummary] = Field(default_factory=list)
     shi_description_profile: BenshiShiDescriptionProfile | None = None
+    ontology_pack: BenshiOntologyPack | None = None
+    distribution_baseline_summary: BenshiDistributionBaselineSummary | None = None
     image_cluster_summaries: list[BenshiImageClusterSummary] = Field(default_factory=list)
     missing_media_gaps: list[BenshiMissingMediaGap] = Field(default_factory=list)
     image_caption_samples: list[ImageCaptionSample] = Field(default_factory=list)

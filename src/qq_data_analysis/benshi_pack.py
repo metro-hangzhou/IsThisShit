@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from qq_data_process.utils import preview_text, stable_digest
 
+from .benshi_seed_artifacts import load_distribution_baseline_summary
 from .models import (
     AnalysisMaterials,
     AnalysisMessageRecord,
     BenshiAnalysisPack,
     BenshiAssetAggregateSummary,
     BenshiAssetSummary,
+    BenshiDistributionBaselineSummary,
     BenshiForwardAggregateSummary,
     BenshiForwardSummary,
     BenshiMissingMediaGap,
+    BenshiOntologyDimension,
+    BenshiOntologyPack,
+    BenshiOntologyPopularForm,
+    BenshiOntologyTaxonomyItem,
     BenshiParticipantRoleCandidate,
     BenshiPreprocessOverlayItem,
     BenshiPreprocessOverlaySummary,
@@ -44,11 +51,17 @@ class BenshiAnalysisPackBuilder:
         max_recurrence_summaries: int = 24,
         max_missing_media_gaps: int = 32,
         max_overlay_items: int = 24,
+        distribution_baseline_path: str | Path | None = None,
     ) -> None:
         self.max_forward_summaries = max_forward_summaries
         self.max_recurrence_summaries = max_recurrence_summaries
         self.max_missing_media_gaps = max_missing_media_gaps
         self.max_overlay_items = max_overlay_items
+        self.distribution_baseline_path = (
+            Path(distribution_baseline_path)
+            if distribution_baseline_path is not None
+            else None
+        )
 
     def build(self, materials: AnalysisMaterials) -> BenshiAnalysisPack:
         return build_benshi_analysis_pack(
@@ -57,6 +70,7 @@ class BenshiAnalysisPackBuilder:
             max_recurrence_summaries=self.max_recurrence_summaries,
             max_missing_media_gaps=self.max_missing_media_gaps,
             max_overlay_items=self.max_overlay_items,
+            distribution_baseline_path=self.distribution_baseline_path,
         )
 
 
@@ -67,6 +81,7 @@ def build_benshi_analysis_pack(
     max_recurrence_summaries: int = 24,
     max_missing_media_gaps: int = 32,
     max_overlay_items: int = 24,
+    distribution_baseline_path: str | Path | None = None,
 ) -> BenshiAnalysisPack:
     selected_messages = _build_selected_messages(materials.messages)
     overlay_summary = _build_preprocess_overlay_summary(
@@ -107,6 +122,11 @@ def build_benshi_analysis_pack(
         component_summaries=shi_component_summaries,
         missing_media_gaps=missing_media_gaps,
     )
+    ontology_pack = _build_benshi_ontology_pack()
+    distribution_baseline_summary, distribution_warnings = _load_distribution_baseline_summary(
+        distribution_baseline_path
+    )
+    warnings = list(materials.warnings) + distribution_warnings
 
     return BenshiAnalysisPack(
         run_id=materials.run_id,
@@ -130,10 +150,24 @@ def build_benshi_analysis_pack(
         asset_summaries=asset_summaries,
         shi_component_summaries=shi_component_summaries,
         shi_description_profile=shi_description_profile,
+        ontology_pack=ontology_pack,
+        distribution_baseline_summary=distribution_baseline_summary,
         missing_media_gaps=missing_media_gaps,
         preprocess_overlay_summary=overlay_summary,
-        warnings=list(materials.warnings),
+        warnings=warnings,
     )
+
+
+def _load_distribution_baseline_summary(
+    distribution_baseline_path: str | Path | None,
+) -> tuple[BenshiDistributionBaselineSummary | None, list[str]]:
+    if distribution_baseline_path is None:
+        return None, []
+    baseline_path = Path(distribution_baseline_path)
+    if not baseline_path.exists():
+        return None, [f"distribution_baseline_missing:{baseline_path}"]
+    summary = load_distribution_baseline_summary(baseline_path)
+    return summary, []
 
 
 def _build_selected_messages(
@@ -782,6 +816,159 @@ def _build_shi_description_profile(
             "单人主导的高密度外源搬运拼盘",
             "套娃 forward 和图串返场味儿很重的二手史",
             "不是单条爆点，而是中转站式库存清仓",
+        ],
+    )
+
+
+def _build_benshi_ontology_pack() -> BenshiOntologyPack:
+    return BenshiOntologyPack(
+        source_documents=[
+            "dev/documents/Q群群友史.docx",
+            "dev/documents/benshi_calibration_rubric.md",
+            "dev/documents/benshi_report_review_20260312.md",
+        ],
+        origin_definition=(
+            "‘史’不是普通垃圾内容的同义词，而是当内容抽象性、认知错位感和传播外壳包浆共同成立后，"
+            "在群聊里被迅速识别成值得围观、值得搬运、值得复读的一类赛博审美对象。"
+        ),
+        propagation_paradox=(
+            "史的传播动力并不来自认可，而常常来自厌恶、围观、吐槽、复读和再搬运。"
+            "也就是说，嫌弃感本身往往会转化成传播燃料。"
+        ),
+        formation_dimensions=[
+            BenshiOntologyDimension(
+                label="内容抽象性",
+                summary="表达或行为明显脱离常识与社会规范，形成荒诞奇点。",
+                cues=["逻辑崩坏", "表达离谱", "行为失衡"],
+            ),
+            BenshiOntologyDimension(
+                label="认知错位感",
+                summary="当事人往往自洽甚至自我感动，而旁观者体验到强烈的尴尬、震惊或滑稽。",
+                cues=["当事人无自觉", "围观者 cringe", "双方认知不在一个平面"],
+            ),
+            BenshiOntologyDimension(
+                label="视觉符号化/赛博包浆",
+                summary="长截图、高糊录屏、多层水印、套娃 forward、截图壳与返场回放等外壳，会增强其被识别和搬运的身份。",
+                cues=["截图壳", "套娃 forward", "水印/画质劣化", "图串返场"],
+            ),
+        ],
+        taxonomy=[
+            BenshiOntologyTaxonomyItem(
+                label="原生史",
+                definition="在即时通讯环境中自然生成的原始史料，重点在突发性、原始感和无修饰的荒诞张力。",
+                positive_cues=["现场聊天自然生长", "原始记录", "不用额外包装就有冲击力"],
+                caution="不要把所有群内原生争吵都抬成原生史，必须仍有明显荒诞张力。",
+            ),
+            BenshiOntologyTaxonomyItem(
+                label="工业史",
+                definition="机械化、大规模、低门槛重复搬运的平庸内容，常常更像电子噪声而不是高质量史料。",
+                positive_cues=["低信息密度", "机械复读", "过时旧梗", "工业流水线感"],
+                caution="工业史可以成立，但成色通常偏低，不要和典中典或高价值原生史混为一谈。",
+            ),
+            BenshiOntologyTaxonomyItem(
+                label="典中典史",
+                definition="经时间和跨群传播检验后沉淀成共同模因记忆的经典史料。",
+                positive_cues=["跨语境成立", "时间沉淀", "群友无需解释就能接"],
+                caution="不要因为窗口里有人反应整齐，就过早封成典中典。",
+            ),
+            BenshiOntologyTaxonomyItem(
+                label="外源史",
+                definition="源自外部平台，经截图或转运移植进 QQ 群的史料。",
+                positive_cues=["外部平台 UI", "外部新闻/帖文/短视频截图", "群外材料搬入"],
+                caution="外源史强调来源路径，不等于自动高质量。",
+            ),
+            BenshiOntologyTaxonomyItem(
+                label="二手史",
+                definition="经多轮跨群转发、被群友评论和套娃结构包裹后的二手史料。",
+                positive_cues=["多层 forward", "群友点评包裹", "套娃感", "二手转运"],
+                caution="二手史的重点可能转移到群体反应，而不是原事件本体。",
+            ),
+            BenshiOntologyTaxonomyItem(
+                label="二阶史",
+                definition="多种类型叠加形成的复合史，例如外源史和二手史叠加，或原生史沿传播链演化成典中典。",
+                positive_cues=["复合类型", "原义与 popular 形态混合", "沿传播链演化"],
+                caution="二阶史是混合解释，不应成为偷懒兜底标签。",
+            ),
+        ],
+        quality_rubric=[
+            BenshiOntologyDimension(
+                label="认知落差",
+                summary="是否存在明显超出常规认知的戏剧张力。",
+                cues=["荒诞奇点", "这也行？", "强烈反转/错位"],
+            ),
+            BenshiOntologyDimension(
+                label="语境跨度/脱水性",
+                summary="脱离原始语境后，别人是否仍能迅速看懂槽点。",
+                cues=["跨群可理解", "无需大量背景说明", "公共槽点"],
+            ),
+            BenshiOntologyDimension(
+                label="视觉包浆/真实性",
+                summary="合理的截图壳、UI 锚点、水印和套娃结构会增强证言感，但过度摆拍会削弱原生震撼力。",
+                cues=["截图壳", "平台 UI", "多层水印", "赛博包浆"],
+            ),
+            BenshiOntologyDimension(
+                label="反馈整齐度",
+                summary="能否稳定激起问号、复读、尖锐点评或机械情绪共振。",
+                cues=["整齐反馈", "复读", "回声", "群体共振"],
+            ),
+        ],
+        transport_theory=[
+            BenshiOntologyDimension(
+                label="运史官不是机械转发器",
+                summary="搬运者是筛选器、过滤器和审美裁判者，不是任何垃圾都无脑转。",
+                cues=["会筛", "看后不转", "投放到特定受众群"],
+            ),
+            BenshiOntologyDimension(
+                label="搬运行为本身是一种再生产",
+                summary="史不是简单复制，而是在新群里被重新包装、赋予新立场和新反馈结构。",
+                cues=["再投放", "二次包装", "社交筹码"],
+            ),
+        ],
+        popular_forms=[
+            BenshiOntologyPopularForm(
+                label="外源截图史",
+                summary="来自外部平台的截图被直接当作可围观史料搬入群里。",
+                common_carriers=["平台 UI 截图", "新闻截图", "社媒评论区截图"],
+                relation_to_origin="通常更接近外源史，而不是纯原生史。",
+            ),
+            BenshiOntologyPopularForm(
+                label="套娃 forward 史",
+                summary="靠多层 forward 和群友包裹评论来增加包浆和二手感。",
+                common_carriers=["合并转发", "群聊切片", "套娃截图"],
+                relation_to_origin="popular 形态上常常是二手史或二阶史。",
+            ),
+            BenshiOntologyPopularForm(
+                label="图串返场史",
+                summary="同一批图片/图串在窗口前后重复回放，形成库存清仓或补档返场感。",
+                common_carriers=["图串 bundle", "重复引用", "补档回放"],
+                relation_to_origin="popular 形态上常和补档返场史、包浆史耦合。",
+            ),
+            BenshiOntologyPopularForm(
+                label="拼盘混装史",
+                summary="不同题材的抽象料被集中倾倒，形成库存货架全倒出来的乱炖感。",
+                common_carriers=["单人高密度投喂", "题材异质混装", "多图多 forward 混合"],
+                relation_to_origin="popular 形态上不一定最纯，但非常符合集中式搬史窗口。",
+                cautions=["popular 不等于高质量，拼盘感强不自动代表成色高。"],
+            ),
+        ],
+        hard_guidance=[
+            "史不等于普通低俗内容。",
+            "史不等于单纯截图壳，也不等于任何复读。",
+            "判断史时必须同时考虑内容抽象性、认知错位和传播外壳/包浆。",
+            "必须区分史的原义、popular 形态、搬运机制和成色高低。",
+            "缺失媒体不能被脑补成直接证据。",
+        ],
+        soft_guidance=[
+            "当前 popular shi 常常比原义更偏外源、二手、套娃、图串返场和拼盘混装。",
+            "单人高密度倾倒常会增强中转站感和库存清仓感。",
+            "低俗猎奇会抬高冲击性，但不自动抬高史价值。",
+        ],
+        anti_patterns=[
+            "看到低俗内容就自动判成史。",
+            "看到截图就自动判成史。",
+            "看到多人复读就自动判成高价值史。",
+            "把当前 popular shi 的常见载体误当成史的本义。",
+            "把缺失视频/图片脑补成完整剧情。",
         ],
     )
 

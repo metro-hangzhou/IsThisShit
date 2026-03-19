@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .benshi_pack import build_benshi_analysis_pack
@@ -35,11 +36,25 @@ class BenshiMasterAgent:
     agent_name = "benshi_master"
     agent_version = "v0"
 
+    def __init__(
+        self,
+        *,
+        distribution_baseline_path: Path | str | None = None,
+    ) -> None:
+        self.distribution_baseline_path = (
+            Path(distribution_baseline_path)
+            if distribution_baseline_path is not None
+            else None
+        )
+
     def serialize_result(self, output: AnalysisAgentOutput) -> dict[str, Any]:
         return output.compact_payload
 
     def prepare(self, materials: AnalysisMaterials) -> BenshiAnalysisPack:
-        return build_benshi_analysis_pack(materials)
+        return build_benshi_analysis_pack(
+            materials,
+            distribution_baseline_path=self.distribution_baseline_path,
+        )
 
     def analyze(
         self, materials: AnalysisMaterials, prepared: BenshiPreparedPack | Any
@@ -67,6 +82,8 @@ class BenshiMasterAgent:
         )
         register_layer = self._build_register_layer(pack, shi_presence, shi_types, quality_band)
         reply_probe = self._build_reply_probe_placeholder(pack, shi_presence, shi_types)
+        ontology_summary = self._build_ontology_summary(pack)
+        distribution_baseline_summary = self._build_distribution_baseline_summary(pack)
 
         report_lines = [
             "## Benshi Master",
@@ -79,6 +96,31 @@ class BenshiMasterAgent:
             + (" / ".join(f"{item['label']}({item['score']:.2f})" for item in shi_types) or "未定型"),
             f"- 史质量带: {quality_band['label']}",
         ]
+        if ontology_summary is not None:
+            report_lines.append("- 本地史学本体:")
+            report_lines.append(f"  - 原义: {ontology_summary['origin_definition']}")
+            report_lines.append(
+                "  - 类型学: " + " / ".join(ontology_summary["taxonomy_labels"])
+            )
+            report_lines.append(
+                "  - popular 形态: "
+                + " / ".join(ontology_summary["popular_form_labels"])
+            )
+        if distribution_baseline_summary is not None:
+            report_lines.append("- 集中式分布基线:")
+            report_lines.append(
+                "  - "
+                f"dataset={distribution_baseline_summary['dataset_id']} "
+                f"canonical={distribution_baseline_summary['canonical_messages']} "
+                f"occurrences={distribution_baseline_summary['all_occurrences']}"
+            )
+            dominant = distribution_baseline_summary.get("dominant_components") or []
+            if dominant:
+                report_lines.append("  - 主成分背景: " + " / ".join(dominant[:5]))
+            if distribution_baseline_summary.get("relay_shape"):
+                report_lines.append(
+                    f"  - relay_shape: {distribution_baseline_summary['relay_shape']}"
+                )
         report_lines.extend(build_input_semantics_lines(materials))
         if structured_evidence["direct_observations"]:
             report_lines.append("- 直接观察:")
@@ -146,11 +188,40 @@ class BenshiMasterAgent:
                         for label, count in pack.top_tags
                     ],
                     "transport_signals": pack.transport_signals,
+                    "ontology_summary": ontology_summary,
+                    "distribution_baseline_summary": distribution_baseline_summary,
                 },
             },
             evidence=list(pack.evidence),
             warnings=[],
         )
+
+    def _build_ontology_summary(self, pack: BenshiPreparedPack) -> dict[str, Any] | None:
+        ontology = getattr(pack.pack, "ontology_pack", None) if pack.pack is not None else None
+        if ontology is None:
+            return None
+        return {
+            "origin_definition": ontology.origin_definition,
+            "taxonomy_labels": [item.label for item in ontology.taxonomy],
+            "popular_form_labels": [item.label for item in ontology.popular_forms],
+            "hard_guidance_count": len(ontology.hard_guidance),
+            "soft_guidance_count": len(ontology.soft_guidance),
+            "anti_pattern_count": len(ontology.anti_patterns),
+            "source_documents": list(ontology.source_documents),
+        }
+
+    def _build_distribution_baseline_summary(
+        self,
+        pack: BenshiPreparedPack,
+    ) -> dict[str, Any] | None:
+        distribution = (
+            getattr(pack.pack, "distribution_baseline_summary", None)
+            if pack.pack is not None
+            else None
+        )
+        if distribution is None:
+            return None
+        return distribution.model_dump(mode="json")
 
     def _coerce_pack(
         self, materials: AnalysisMaterials, prepared: BenshiPreparedPack | Any
@@ -515,6 +586,7 @@ class BenshiMasterAgent:
         quality_band: dict[str, Any],
     ) -> dict[str, Any]:
         pack_model = pack.pack
+        ontology = pack_model.ontology_pack if pack_model is not None else None
         component_candidates = []
         if pack_model is not None:
             component_candidates.extend(
@@ -594,7 +666,9 @@ class BenshiMasterAgent:
             component_rationale.append("窗口里有缺失媒体位点，所以成分层允许保留‘视频壳缺本体’这类未知项。")
         return {
             "definition": (
-                "史不是单条离谱内容本身，而是内容、搬运、包装、群体回声和包浆一起作用后，"
+                ontology.origin_definition
+                if ontology is not None
+                else "史不是单条离谱内容本身，而是内容、搬运、包装、群体回声和包浆一起作用后，"
                 "在群聊里被快速识别成‘值得围观/值得搬运’的东西。"
             ),
             "component_candidates": ordered,
@@ -625,6 +699,7 @@ class BenshiMasterAgent:
     ) -> dict[str, Any]:
         pack_model = pack.pack
         profile = pack_model.shi_description_profile if pack_model is not None else None
+        ontology = pack_model.ontology_pack if pack_model is not None else None
         dominant_components = list(shi_component_analysis.get("dominant_components") or [])
         top_type = shi_types[0]["label"] if shi_types else "未定型"
         one_line_definition = (
@@ -654,7 +729,11 @@ class BenshiMasterAgent:
             "先说这是一批什么路数的史，再说它靠什么搬运结构成立，最后补一句包浆/返场/截图壳或未知边界。"
         )
         return {
-            "what_is_shi_definition": profile.base_definition if profile else None,
+            "what_is_shi_definition": (
+                profile.base_definition
+                if profile and profile.base_definition
+                else (ontology.origin_definition if ontology is not None else None)
+            ),
             "one_line_definition": one_line_definition,
             "component_breakdown": component_breakdown,
             "descriptive_tags": descriptive_tags,

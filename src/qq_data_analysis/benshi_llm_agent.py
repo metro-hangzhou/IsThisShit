@@ -9,6 +9,11 @@ from .benshi_prompting import (
     build_benshi_master_user_prompt,
     resolve_benshi_prompt_scaffold,
 )
+from .benshi_seed_artifacts import (
+    build_distribution_baseline_prompt_context_from_summary,
+    build_example_bank_prompt_context,
+    load_distribution_baseline_prompt_context,
+)
 from .llm_agent import OpenAICompatibleAnalysisClient, _extract_json_object
 from .llm_window import _model_name_from_client, _provider_name_from_client, load_text_analysis_client
 from .models import AnalysisAgentOutput, AnalysisMaterials, BenshiAnalysisPack
@@ -27,6 +32,13 @@ class BenshiMasterLlmAgent:
         max_output_tokens: int = 2200,
         max_selected_messages: int = 32,
         stream_callback: Callable[[str, str], None] | None = None,
+        example_bank_manifest_path: Path | str | None = None,
+        distribution_baseline_path: Path | str | None = None,
+        max_examples_per_group: int = 1,
+        max_negative_templates: int = 2,
+        max_good_judgment_examples: int | None = None,
+        max_good_description_examples: int | None = None,
+        max_good_reply_probe_examples: int | None = None,
     ) -> None:
         self.config_path = Path(config_path)
         self.model = model
@@ -34,25 +46,125 @@ class BenshiMasterLlmAgent:
         self.max_output_tokens = max_output_tokens
         self.max_selected_messages = max_selected_messages
         self.stream_callback = stream_callback
+        self.example_bank_manifest_path = (
+            Path(example_bank_manifest_path)
+            if example_bank_manifest_path is not None
+            else None
+        )
+        self.distribution_baseline_path = (
+            Path(distribution_baseline_path)
+            if distribution_baseline_path is not None
+            else None
+        )
+        self.max_examples_per_group = max_examples_per_group
+        self.max_negative_templates = max_negative_templates
+        self.max_good_judgment_examples = max_good_judgment_examples
+        self.max_good_description_examples = max_good_description_examples
+        self.max_good_reply_probe_examples = max_good_reply_probe_examples
 
     def prepare(self, materials: AnalysisMaterials) -> BenshiAnalysisPack:
-        return build_benshi_analysis_pack(materials)
+        return build_benshi_analysis_pack(
+            materials,
+            distribution_baseline_path=self.distribution_baseline_path,
+        )
+
+    def _load_prompt_reference_context(
+        self,
+        *,
+        reply_probe_enabled: bool,
+        load_distribution_baseline: bool = True,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, list[str]]:
+        example_bank_context = None
+        distribution_baseline_context = None
+        warnings: list[str] = []
+        include_groups = [
+            "good_judgment_examples",
+            "good_description_examples",
+        ]
+        max_examples_by_group = {
+            "good_judgment_examples": (
+                self.max_good_judgment_examples
+                if self.max_good_judgment_examples is not None
+                else self.max_examples_per_group
+            ),
+            "good_description_examples": (
+                self.max_good_description_examples
+                if self.max_good_description_examples is not None
+                else self.max_examples_per_group
+            ),
+        }
+        if reply_probe_enabled:
+            include_groups.append("good_reply_probe_examples")
+            max_examples_by_group["good_reply_probe_examples"] = (
+                self.max_good_reply_probe_examples
+                if self.max_good_reply_probe_examples is not None
+                else self.max_examples_per_group
+            )
+
+        if self.example_bank_manifest_path is not None:
+            if self.example_bank_manifest_path.exists():
+                try:
+                    example_bank_context = build_example_bank_prompt_context(
+                        self.example_bank_manifest_path,
+                        max_examples_per_group=self.max_examples_per_group,
+                        max_negative_templates=self.max_negative_templates,
+                        include_groups=include_groups,
+                        max_examples_by_group=max_examples_by_group,
+                    )
+                except Exception:
+                    warnings.append("example_bank_context_load_failed")
+            else:
+                warnings.append("example_bank_manifest_missing")
+        if load_distribution_baseline and self.distribution_baseline_path is not None:
+            if self.distribution_baseline_path.exists():
+                try:
+                    distribution_baseline_context = load_distribution_baseline_prompt_context(
+                        self.distribution_baseline_path
+                    )
+                except Exception:
+                    warnings.append("distribution_baseline_context_load_failed")
+            else:
+                warnings.append("distribution_baseline_path_missing")
+        return example_bank_context, distribution_baseline_context, warnings
 
     def analyze(
         self,
         materials: AnalysisMaterials,
         prepared: BenshiAnalysisPack | Any,
     ) -> AnalysisAgentOutput:
-        pack = prepared if isinstance(prepared, BenshiAnalysisPack) else build_benshi_analysis_pack(materials)
+        pack = (
+            prepared
+            if isinstance(prepared, BenshiAnalysisPack)
+            else build_benshi_analysis_pack(
+                materials,
+                distribution_baseline_path=self.distribution_baseline_path,
+            )
+        )
         scaffold = resolve_benshi_prompt_scaffold(self.prompt_version)
         if scaffold is None:
             raise RuntimeError(f"Unsupported benshi prompt version: {self.prompt_version}")
 
+        pack_distribution_context = None
+        if pack.distribution_baseline_summary is not None:
+            pack_distribution_context = build_distribution_baseline_prompt_context_from_summary(
+                pack.distribution_baseline_summary
+            )
+        example_bank_context, distribution_baseline_context, reference_context_warnings = (
+            self._load_prompt_reference_context(
+                reply_probe_enabled=scaffold.reply_probe_enabled,
+                load_distribution_baseline=pack_distribution_context is None,
+            )
+        )
+        if pack_distribution_context is not None:
+            distribution_baseline_context = pack_distribution_context
+        warnings: list[str] = list(reference_context_warnings)
         system_prompt = build_benshi_master_system_prompt(scaffold)
         user_prompt = build_benshi_master_user_prompt(
             pack,
             scaffold=scaffold,
             max_selected_messages=self.max_selected_messages,
+            example_bank_context=example_bank_context,
+            distribution_baseline_context=distribution_baseline_context,
         )
         client = load_text_analysis_client(
             self.config_path,
@@ -77,7 +189,6 @@ class BenshiMasterLlmAgent:
         register_layer = parsed.get("register_rendering") or parsed.get("register_layer") or {}
         reply_probe_layer = parsed.get("reply_probe") or parsed.get("reply_probe_layer") or {}
 
-        warnings: list[str] = []
         if not isinstance(evidence_layer, dict):
             evidence_layer = {}
             warnings.append("invalid_evidence_layer_shape")
@@ -109,6 +220,22 @@ class BenshiMasterLlmAgent:
             f"- CompletionTokens: {bundle.usage.completion_tokens}",
             f"- TotalTokens: {bundle.usage.total_tokens}",
         ]
+        if example_bank_context is not None:
+            report_lines.append(
+                "- ExampleBankContext: "
+                + ", ".join(
+                    f"{key}={value}"
+                    for key, value in sorted(
+                        (example_bank_context.get("selected_counts") or {}).items()
+                    )
+                )
+            )
+        if distribution_baseline_context is not None:
+            report_lines.append(
+                "- DistributionBaseline: "
+                f"dataset={distribution_baseline_context.get('dataset_id')} "
+                f"dominant={', '.join((distribution_baseline_context.get('current_window_distribution') or {}).get('dominant_components') or [])}"
+            )
         rendered_commentary = register_layer.get("rendered_commentary")
         if isinstance(rendered_commentary, str) and rendered_commentary.strip():
             report_lines.append("- 口吻层输出:")
@@ -170,6 +297,17 @@ class BenshiMasterLlmAgent:
                     "reasoning_tokens": bundle.usage.reasoning_tokens,
                     "cached_tokens": bundle.usage.cached_tokens,
                 },
+            },
+            "pack_summary": {
+                "distribution_baseline_summary": (
+                    pack.distribution_baseline_summary.model_dump(mode="json")
+                    if pack.distribution_baseline_summary is not None
+                    else None
+                ),
+            },
+            "prompt_reference_context": {
+                "example_bank_context": example_bank_context,
+                "distribution_baseline_context": distribution_baseline_context,
             },
             "raw_payload": parsed,
             "raw_text": bundle.raw_text,

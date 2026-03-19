@@ -7,6 +7,11 @@ Longer reference materials, exported reports, and review notes live here.
 - [benshi_report_review_20260312.md](benshi_report_review_20260312.md)
 - [benshi_calibration_rubric.md](benshi_calibration_rubric.md)
 - [benshi_review_checklist.md](benshi_review_checklist.md)
+- [benshi_local_ontology.md](benshi_local_ontology.md)
+
+## Route / orchestration
+
+- [technical-roadmap.md](technical-roadmap.md)
 
 ## Repository maintenance
 

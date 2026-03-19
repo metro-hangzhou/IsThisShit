@@ -14,6 +14,9 @@ from qq_data_process import (
 
 _FIXTURE_PATH = Path("tests/fixtures/analysis_seed.jsonl")
 _TARGET_ID = "20001"
+_DISTRIBUTION_BASELINE_PATH = Path(
+    "dev/testdata/local/shi_group_751365230/benshi_distribution_baseline.json"
+)
 
 
 def _new_tmp_path(prefix: str) -> Path:
@@ -96,12 +99,35 @@ def test_benshi_analysis_pack_builder_is_alias_safe_and_structured() -> None:
     assert pack.asset_summary is not None
     assert pack.missing_media_gaps is not None
     assert pack.preprocess_overlay_summary is not None
+    assert pack.ontology_pack is not None
+    assert "史" in pack.ontology_pack.origin_definition
+    assert pack.ontology_pack.taxonomy
     for item in pack.selected_messages[:20]:
         sender_id = getattr(item, "sender_id", None)
         if sender_id:
             assert not str(sender_id).isdigit(), (
                 f"Raw sender id leaked into Benshi pack: {sender_id}"
             )
+
+
+def test_benshi_analysis_pack_builder_can_attach_distribution_baseline_summary() -> None:
+    from qq_data_analysis.benshi_pack import BenshiAnalysisPackBuilder
+
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_pack_distribution_baseline",
+    )
+    pack = BenshiAnalysisPackBuilder(
+        distribution_baseline_path=_DISTRIBUTION_BASELINE_PATH,
+    ).build(materials)
+
+    assert pack.distribution_baseline_summary is not None
+    assert pack.distribution_baseline_summary.dataset_id == "shi_group_751365230"
+    assert pack.distribution_baseline_summary.canonical_messages == 49
+    assert pack.distribution_baseline_summary.all_occurrences == 147
+    assert pack.distribution_baseline_summary.dominant_components
+    assert pack.distribution_baseline_summary.cluster_count >= 1
 
 
 def test_benshi_analysis_pack_builder_carries_forward_and_recurrence_signals() -> None:
@@ -142,6 +168,7 @@ def test_benshi_master_agent_emits_layered_output_without_llm() -> None:
     assert "cultural_interpretation_layer" in output.compact_payload
     assert "register_layer" in output.compact_payload
     assert "reply_probe_layer" in output.compact_payload
+    assert output.compact_payload["pack_summary"]["ontology_summary"] is not None
 
     evidence_layer = output.compact_payload["evidence_layer"]
     assert "shi_presence" in evidence_layer
@@ -160,6 +187,10 @@ def test_benshi_master_agent_emits_layered_output_without_llm() -> None:
     assert "descriptive_tags" in description_layer
     assert "how_to_describe_this_shi" in description_layer
     assert "unknown_boundaries" in description_layer
+    ontology_summary = output.compact_payload["pack_summary"]["ontology_summary"]
+    assert "origin_definition" in ontology_summary
+    assert ontology_summary["taxonomy_labels"]
+    assert ontology_summary["popular_form_labels"]
 
 
 def test_benshi_master_agent_keeps_alias_safe_defaults() -> None:
@@ -188,6 +219,28 @@ def test_benshi_master_agent_keeps_alias_safe_defaults() -> None:
         output.compact_payload["shi_description_layer"]
     )
     assert "20001" not in serialized
+
+
+def test_benshi_master_agent_surfaces_distribution_baseline_summary_when_provided() -> None:
+    from qq_data_analysis.benshi_agent import BenshiMasterAgent
+
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_distribution_summary_output",
+    )
+    agent = BenshiMasterAgent(
+        distribution_baseline_path=_DISTRIBUTION_BASELINE_PATH,
+    )
+    output = agent.analyze(materials, agent.prepare(materials))
+
+    distribution_summary = output.compact_payload["pack_summary"][
+        "distribution_baseline_summary"
+    ]
+    assert distribution_summary is not None
+    assert distribution_summary["dataset_id"] == "shi_group_751365230"
+    assert distribution_summary["dominant_components"]
+    assert distribution_summary["relay_shape"] == "forward_heavy"
 
 
 def test_benshi_master_agent_reply_probe_placeholder_is_explicit() -> None:
@@ -338,6 +391,76 @@ def test_benshi_prompt_payload_exposes_component_and_description_inputs() -> Non
     assert payload["shi_component_summaries"][0]["component_label"]
     assert payload["shi_description_profile"] is not None
     assert payload["shi_description_profile"]["base_definition"]
+    assert payload["ontology_pack"] is not None
+    assert payload["ontology_pack"]["origin_definition"]
+    assert payload["ontology_pack"]["taxonomy"]
+    assert payload["ontology_pack"]["popular_forms"]
+
+
+def test_benshi_prompt_payload_uses_compact_distribution_baseline_context() -> None:
+    from qq_data_analysis.benshi_pack import BenshiAnalysisPackBuilder
+    from qq_data_analysis.benshi_prompting import build_benshi_master_prompt_payload
+
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_prompt_distribution_context",
+    )
+    pack = BenshiAnalysisPackBuilder(
+        distribution_baseline_path=_DISTRIBUTION_BASELINE_PATH,
+    ).build(materials)
+    payload = build_benshi_master_prompt_payload(pack, max_selected_messages=6)
+
+    context = payload["distribution_baseline_context"]
+    assert context is not None
+    assert context["dataset_id"] == "shi_group_751365230"
+    assert context["canonical_sample_overview"]["canonical_messages"] == 49
+    assert context["current_window_distribution"]["dominant_components"]
+    assert context["current_window_distribution"]["transport_pattern"]["relay_shape"] == "forward_heavy"
+    assert "shi_type_candidates" not in context["current_window_distribution"]
+
+
+def test_benshi_prompt_payload_keeps_ontology_when_example_bank_context_is_injected() -> None:
+    from qq_data_analysis.benshi_pack import BenshiAnalysisPackBuilder
+    from qq_data_analysis.benshi_prompting import build_benshi_master_prompt_payload
+    from qq_data_analysis.benshi_seed_artifacts import (
+        build_example_bank_prompt_context,
+        load_distribution_baseline_prompt_context,
+    )
+
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_prompt_payload_reference_context",
+    )
+    pack = BenshiAnalysisPackBuilder().build(materials)
+    example_bank_context = build_example_bank_prompt_context(
+        Path("dev/testdata/local/shi_group_751365230/benshi_example_bank_manifest.json"),
+        include_groups=[
+            "good_judgment_examples",
+            "good_description_examples",
+        ],
+        max_examples_per_group=1,
+        max_negative_templates=1,
+    )
+    distribution_context = load_distribution_baseline_prompt_context(
+        Path("dev/testdata/local/shi_group_751365230/benshi_distribution_baseline.json")
+    )
+
+    payload = build_benshi_master_prompt_payload(
+        pack,
+        max_selected_messages=6,
+        example_bank_context=example_bank_context,
+        distribution_baseline_context=distribution_context,
+    )
+
+    assert payload["ontology_pack"] is not None
+    assert payload["ontology_pack"]["origin_definition"]
+    assert payload["example_bank_context"] is not None
+    assert payload["example_bank_context"]["selected_counts"]["good_judgment_examples"] == 1
+    assert payload["example_bank_context"]["selected_counts"]["good_description_examples"] == 1
+    assert "good_reply_probe_examples" not in payload["example_bank_context"]["selected_counts"]
+    assert payload["distribution_baseline_context"] is not None
 
 
 def test_benshi_description_layer_keeps_unknowns_when_media_is_missing() -> None:
@@ -356,3 +479,73 @@ def test_benshi_description_layer_keeps_unknowns_when_media_is_missing() -> None
     assert isinstance(unknowns, list)
     assert unknowns
     assert any("未知" in item or "缺失" in item or "保守" in item for item in unknowns)
+
+
+def test_benshi_ontology_pack_distinguishes_origin_and_popular_forms() -> None:
+    from qq_data_analysis.benshi_pack import BenshiAnalysisPackBuilder
+
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_ontology_pack",
+    )
+    pack = BenshiAnalysisPackBuilder().build(materials)
+
+    ontology = pack.ontology_pack
+    assert ontology is not None
+    taxonomy_labels = {item.label for item in ontology.taxonomy}
+    popular_labels = {item.label for item in ontology.popular_forms}
+
+    assert {"原生史", "工业史", "典中典史", "外源史", "二手史", "二阶史"} <= taxonomy_labels
+    assert {"外源截图史", "套娃 forward 史", "图串返场史", "拼盘混装史"} <= popular_labels
+    assert any("popular" in (item.relation_to_origin or "") for item in ontology.popular_forms)
+
+
+def test_benshi_prompt_payload_roundtrips_reference_contexts() -> None:
+    from qq_data_analysis.benshi_pack import BenshiAnalysisPackBuilder
+    from qq_data_analysis.benshi_prompting import build_benshi_master_prompt_payload
+
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_prompt_payload_reference_contexts",
+    )
+    pack = BenshiAnalysisPackBuilder().build(materials)
+    payload = build_benshi_master_prompt_payload(
+        pack,
+        max_selected_messages=4,
+        example_bank_context={
+            "artifact": "benshi_example_bank_prompt_context",
+            "dataset_id": "shi_group_751365230",
+            "selected_counts": {"good_judgment_examples": 1, "negative_templates": 2},
+            "example_groups": [
+                {
+                    "group_name": "good_judgment_examples",
+                    "examples": [
+                        {
+                            "example_id": "benshi_example_0001",
+                            "expected_direction": "先按结构判断，不要空喊抽象。",
+                        }
+                    ],
+                }
+            ],
+        },
+        distribution_baseline_context={
+            "artifact": "benshi_distribution_prompt_context",
+            "dataset_id": "shi_group_751365230",
+            "current_window_distribution": {
+                "dominant_components": ["外源史", "二手史", "单人主导倾倒"],
+            },
+            "delivery_structure_distribution": {
+                "delivery_mode_counts": {"forward_bundle": 40},
+            },
+        },
+    )
+
+    assert payload["example_bank_context"] is not None
+    assert payload["example_bank_context"]["artifact"] == "benshi_example_bank_prompt_context"
+    assert payload["example_bank_context"]["selected_counts"]["good_judgment_examples"] == 1
+    assert payload["example_bank_context"]["example_groups"][0]["examples"][0]["example_id"] == "benshi_example_0001"
+    assert payload["distribution_baseline_context"] is not None
+    assert payload["distribution_baseline_context"]["artifact"] == "benshi_distribution_prompt_context"
+    assert payload["distribution_baseline_context"]["current_window_distribution"]["dominant_components"][0] == "外源史"

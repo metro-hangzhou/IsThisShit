@@ -81,6 +81,19 @@ Normal development workflow:
    - local validation against a cleaner runtime surface
    - behavior comparison against development state
 
+## Execution Workflow Rule
+
+Default execution workflow for ongoing development:
+
+1. First analyze the next-stage direction and identify the main non-conflicting work lanes.
+2. Then implement a parallel bundle of tasks that do not conflict in ownership or architecture.
+3. Only switch to fine-grained step-by-step confirmation when:
+   - the user explicitly asks for it
+   - a destructive action is under consideration
+   - or the available implementation paths conflict in a way that needs a decision first
+
+This keeps the project moving in larger coherent chunks instead of stalling on unnecessary micro-confirmation.
+
 ## Sync / Archive Rule
 
 When a change set is large, important, or meaningfully changes behavior:

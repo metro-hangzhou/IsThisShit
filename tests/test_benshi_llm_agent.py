@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 
 from qq_data_analysis.benshi_llm_agent import BenshiMasterLlmAgent
 from qq_data_analysis.llm_agent import LlmResponseBundle, LlmUsageSnapshot
 
 from tests.test_benshi_master_agent import _FIXTURE_PATH, _TARGET_ID, _build_materials
+
+
+def _new_workspace_tmp_dir(prefix: str) -> Path:
+    tmp_root = Path(".tmp")
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    path = tmp_root / f"{prefix}_{uuid4().hex[:8]}"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
 
 
 class _FakeBenshiTextClient:
@@ -224,3 +233,169 @@ def test_benshi_llm_agent_rejects_wrong_shape_for_new_layers_gracefully(
     assert output.compact_payload["shi_description_layer"] == {}
     assert "invalid_shi_component_analysis_shape" in output.warnings
     assert "invalid_shi_description_layer_shape" in output.warnings
+
+
+def test_benshi_llm_agent_includes_prompt_reference_context_when_configured(
+    monkeypatch,
+) -> None:
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_llm_agent_reference_context",
+    )
+    raw_text = """
+{
+  "contract_version": "benshi_master_v1",
+  "analysis_mode": "benshi_master",
+  "voice_profile": "cn_chonglang_benshi_v1",
+  "evidence_layer": {
+    "shi_presence": {"label": "clear", "confidence": "high", "reasons": []},
+    "shi_type_candidates": []
+  },
+  "shi_component_analysis": {},
+  "shi_description_layer": {},
+  "cultural_interpretation": {},
+  "register_rendering": {
+    "voice_profile": "cn_chonglang_benshi_v1",
+    "style_constraints_followed": [],
+    "rendered_commentary": "有例子库和分布基线兜着。"
+  },
+  "reply_probe": {
+    "enabled": false,
+    "candidate_followups": [],
+    "followup_rationale": [],
+    "followup_confidence": "n/a"
+  }
+}
+""".strip()
+    monkeypatch.setattr(
+        "qq_data_analysis.benshi_llm_agent.load_text_analysis_client",
+        lambda *args, **kwargs: _FakeBenshiTextClient(raw_text),
+    )
+
+    agent = BenshiMasterLlmAgent(
+        config_path=Path("state/config/llm.local.json"),
+        prompt_version="benshi_master_v1",
+        max_output_tokens=900,
+        max_selected_messages=12,
+        example_bank_manifest_path=Path(
+            "dev/testdata/local/shi_group_751365230/benshi_example_bank_manifest.json"
+        ),
+        distribution_baseline_path=Path(
+            "dev/testdata/local/shi_group_751365230/benshi_distribution_baseline.json"
+        ),
+    )
+    output = agent.analyze(materials, agent.prepare(materials))
+
+    prompt_refs = output.compact_payload["prompt_reference_context"]
+    assert prompt_refs["example_bank_context"] is not None
+    assert prompt_refs["distribution_baseline_context"] is not None
+    assert "good_reply_probe_examples" not in (
+        prompt_refs["example_bank_context"]["selected_counts"] or {}
+    )
+    assert "ExampleBankContext:" in output.human_report
+    assert "DistributionBaseline:" in output.human_report
+
+
+def test_benshi_llm_agent_includes_reply_probe_examples_only_when_enabled(
+    monkeypatch,
+) -> None:
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_llm_agent_reply_probe_examples",
+    )
+    raw_text = """
+{
+  "contract_version": "benshi_master_v1",
+  "analysis_mode": "benshi_master",
+  "voice_profile": "cn_chonglang_benshi_v1",
+  "evidence_layer": {},
+  "shi_component_analysis": {},
+  "shi_description_layer": {},
+  "cultural_interpretation": {},
+  "register_rendering": {},
+  "reply_probe": {
+    "enabled": true,
+    "candidate_followups": ["这批是库存回放还是补档返场"],
+    "followup_rationale": ["直接贴返场结构在接。"],
+    "followup_confidence": "medium"
+  }
+}
+""".strip()
+    monkeypatch.setattr(
+        "qq_data_analysis.benshi_llm_agent.load_text_analysis_client",
+        lambda *args, **kwargs: _FakeBenshiTextClient(raw_text),
+    )
+
+    agent = BenshiMasterLlmAgent(
+        config_path=Path("state/config/llm.local.json"),
+        prompt_version="benshi_master_v1_reply_probe",
+        max_output_tokens=900,
+        max_selected_messages=12,
+        example_bank_manifest_path=Path(
+            "dev/testdata/local/shi_group_751365230/benshi_example_bank_manifest.json"
+        ),
+        max_good_judgment_examples=1,
+        max_good_description_examples=1,
+        max_good_reply_probe_examples=1,
+    )
+    output = agent.analyze(materials, agent.prepare(materials))
+
+    prompt_refs = output.compact_payload["prompt_reference_context"]
+    counts = prompt_refs["example_bank_context"]["selected_counts"]
+    assert counts["good_judgment_examples"] == 1
+    assert counts["good_description_examples"] == 1
+    assert counts["good_reply_probe_examples"] == 1
+
+
+def test_benshi_llm_agent_degrades_gracefully_when_reference_context_is_broken(
+    monkeypatch,
+) -> None:
+    tmp_path = _new_workspace_tmp_dir("test_benshi_llm_agent_bad_reference_context")
+    materials = _build_materials(
+        fixture_path=_FIXTURE_PATH,
+        target_id=_TARGET_ID,
+        tmp_name="test_benshi_llm_agent_bad_reference_context",
+    )
+    raw_text = """
+{
+  "contract_version": "benshi_master_v1",
+  "analysis_mode": "benshi_master",
+  "voice_profile": "cn_chonglang_benshi_v1",
+  "evidence_layer": {},
+  "shi_component_analysis": {},
+  "shi_description_layer": {},
+  "cultural_interpretation": {},
+  "register_rendering": {},
+  "reply_probe": {
+    "enabled": false,
+    "candidate_followups": [],
+    "followup_rationale": [],
+    "followup_confidence": "n/a"
+  }
+}
+""".strip()
+    monkeypatch.setattr(
+        "qq_data_analysis.benshi_llm_agent.load_text_analysis_client",
+        lambda *args, **kwargs: _FakeBenshiTextClient(raw_text),
+    )
+
+    broken_manifest = tmp_path / "broken_manifest.json"
+    broken_manifest.write_text("{bad json", encoding="utf-8")
+
+    agent = BenshiMasterLlmAgent(
+        config_path=Path("state/config/llm.local.json"),
+        prompt_version="benshi_master_v1",
+        max_output_tokens=900,
+        max_selected_messages=12,
+        example_bank_manifest_path=broken_manifest,
+        distribution_baseline_path=tmp_path / "missing_distribution.json",
+    )
+    output = agent.analyze(materials, agent.prepare(materials))
+
+    prompt_refs = output.compact_payload["prompt_reference_context"]
+    assert prompt_refs["example_bank_context"] is None
+    assert prompt_refs["distribution_baseline_context"] is None
+    assert "example_bank_context_load_failed" in output.warnings
+    assert "distribution_baseline_path_missing" in output.warnings

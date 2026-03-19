@@ -5,6 +5,7 @@ from typing import Any
 
 from qq_data_process.utils import preview_text
 
+from .benshi_seed_artifacts import build_distribution_baseline_prompt_context_from_summary
 from .models import BenshiAnalysisPack
 
 from pydantic import BaseModel, Field
@@ -239,6 +240,7 @@ def build_benshi_master_system_prompt(scaffold: BenshiPromptScaffold) -> str:
     return (
         "你是 BenshiMasterAgent 的提示词骨架层，负责把 analysis pack 变成第一份可复核的“吃史判断”。\n"
         "你不是普通总结器，也不是文绉绉的报告员。你要先稳住证据层，再拆史成分，再给描述策略，再解释这坨东西为什么是史，最后才把语气渲染成更像群友会说的话。\n"
+        "analysis pack 里如果附带 `ontology_pack`，那就是本项目本地关于‘史’的原义、类型学、判准和 popular 形态约束。你必须优先服从这份 ontology，而不是临场自创定义。\n"
         "你必须分清五层：\n"
         "1. 直接证据：pack 里明确可见的文本、forward、reply、系统/分享、caption、媒体覆盖信息。\n"
         "2. 上下文推断：可以推，但要写明是 context-only，不准装成看过媒体本体。\n"
@@ -281,6 +283,9 @@ def build_benshi_master_user_tail(scaffold: BenshiPromptScaffold) -> list[str]:
         "不要给太万能、放哪都能说的空泛吐槽句；宁可少给几条，也要更贴当前这坨史的具体结构。",
         "如果存在 image_cluster_summaries，它们是程序先做过的一层图像簇摘要。你可以把它们当成“这一窗图片大致分成了哪些簇、哪些是图串、哪些是重复回放”的结构证据。",
         "如果存在 image_caption_samples，它们属于直接可见媒体证据的一部分；可以拿来解释图像簇的画面类型、截图/梗图/界面/聊天记录属性，但不要把 caption 外推成看见了所有图片。",
+        "如果存在 ontology_pack，你必须显式区分：`史的原义`、`当前 popular shi 形态`、`这一窗实际体现出来的成分`。这三者不能混成一坨。",
+        "如果存在 example_bank_context，把它当作本地校准示例库：学习它的判断结构、描述结构和负例边界，但不要机械复读原句。",
+        "如果存在 distribution_baseline_context，把它当作集中式样本的背景先验：它可以帮助你理解这类样本通常怎么搬、怎么返场、怎么包浆，但不能覆盖当前 evidence_layer 的直接观察。",
         "不要输出额外解释文字，直接输出 JSON。",
         "JSON contract skeleton:",
         contract_stub,
@@ -295,7 +300,19 @@ def build_benshi_master_prompt_payload(
     max_forward_summaries: int = 8,
     max_recurrence_summaries: int = 8,
     max_missing_media_gaps: int = 8,
+    example_bank_context: dict[str, Any] | None = None,
+    distribution_baseline_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    resolved_distribution_baseline_context = distribution_baseline_context
+    if (
+        resolved_distribution_baseline_context is None
+        and pack.distribution_baseline_summary is not None
+    ):
+        resolved_distribution_baseline_context = (
+            build_distribution_baseline_prompt_context_from_summary(
+                pack.distribution_baseline_summary
+            )
+        )
     selected_messages = [
         _compact_selected_message(item)
         for item in _pick_prompt_selected_messages(
@@ -368,6 +385,60 @@ def build_benshi_master_prompt_payload(
             }
             for item in pack.asset_summaries[:6]
         ],
+        "ontology_pack": (
+            {
+                "origin_definition": pack.ontology_pack.origin_definition,
+                "propagation_paradox": pack.ontology_pack.propagation_paradox,
+                "formation_dimensions": [
+                    {
+                        "label": item.label,
+                        "summary": item.summary,
+                        "cues": list(item.cues[:4]),
+                    }
+                    for item in pack.ontology_pack.formation_dimensions[:4]
+                ],
+                "taxonomy": [
+                    {
+                        "label": item.label,
+                        "definition": item.definition,
+                        "positive_cues": list(item.positive_cues[:4]),
+                        "caution": item.caution,
+                    }
+                    for item in pack.ontology_pack.taxonomy[:8]
+                ],
+                "quality_rubric": [
+                    {
+                        "label": item.label,
+                        "summary": item.summary,
+                        "cues": list(item.cues[:4]),
+                    }
+                    for item in pack.ontology_pack.quality_rubric[:6]
+                ],
+                "transport_theory": [
+                    {
+                        "label": item.label,
+                        "summary": item.summary,
+                        "cues": list(item.cues[:4]),
+                    }
+                    for item in pack.ontology_pack.transport_theory[:4]
+                ],
+                "popular_forms": [
+                    {
+                        "label": item.label,
+                        "summary": item.summary,
+                        "common_carriers": list(item.common_carriers[:4]),
+                        "relation_to_origin": item.relation_to_origin,
+                        "cautions": list(item.cautions[:3]),
+                    }
+                    for item in pack.ontology_pack.popular_forms[:6]
+                ],
+                "hard_guidance": list(pack.ontology_pack.hard_guidance[:8]),
+                "soft_guidance": list(pack.ontology_pack.soft_guidance[:6]),
+                "anti_patterns": list(pack.ontology_pack.anti_patterns[:6]),
+            }
+            if pack.ontology_pack is not None
+            else None
+        ),
         "shi_component_summaries": [
             {
                 "component_label": item.component_label,
@@ -437,6 +508,8 @@ def build_benshi_master_prompt_payload(
             else None
         ),
         "selected_messages": selected_messages,
+        "example_bank_context": example_bank_context,
+        "distribution_baseline_context": resolved_distribution_baseline_context,
         "warnings": list(pack.warnings),
     }
 
@@ -449,6 +522,8 @@ def build_benshi_master_user_prompt(
     max_forward_summaries: int = 8,
     max_recurrence_summaries: int = 8,
     max_missing_media_gaps: int = 8,
+    example_bank_context: dict[str, Any] | None = None,
+    distribution_baseline_context: dict[str, Any] | None = None,
 ) -> str:
     payload = build_benshi_master_prompt_payload(
         pack,
@@ -456,6 +531,8 @@ def build_benshi_master_user_prompt(
         max_forward_summaries=max_forward_summaries,
         max_recurrence_summaries=max_recurrence_summaries,
         max_missing_media_gaps=max_missing_media_gaps,
+        example_bank_context=example_bank_context,
+        distribution_baseline_context=distribution_baseline_context,
     )
     payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
     tail_lines = build_benshi_master_user_tail(scaffold)
