@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from qq_data_process.preprocess_models import PreprocessViewContext
 from qq_data_process.rag import RagService
 from qq_data_process.rag_models import RetrievalConfig
 from qq_data_process.utils import preview_text, stable_digest
@@ -40,6 +41,21 @@ class _Session:
     score: float
 
 
+@dataclass(slots=True)
+class _PreprocessWindowBiasContext:
+    input_kind: str
+    profile_id: str | None
+    view_id: str
+    relevance_policy: str | None
+    target_tokens: tuple[str, ...]
+    suppress_tokens: tuple[str, ...]
+    debug_tokens: tuple[str, ...]
+    noise_labels_by_key: dict[str, set[str]]
+    suppressed_keys: set[str]
+    forward_outer_message_ids: set[str]
+    expired_or_missing_message_ids: set[str]
+
+
 class AnalysisSubstrate:
     def __init__(self, *, sqlite_path: Path, qdrant_path: Path) -> None:
         self.sqlite_path = sqlite_path
@@ -51,7 +67,12 @@ class AnalysisSubstrate:
             self._rag_service.close()
             self._rag_service = None
 
-    def build_materials(self, config: AnalysisJobConfig) -> AnalysisMaterials:
+    def build_materials(
+        self,
+        config: AnalysisJobConfig,
+        *,
+        analysis_input: Any | None = None,
+    ) -> AnalysisMaterials:
         resolved_run_id = self._resolve_run_id(config.target.run_id)
         target = self._resolve_target(
             run_id=resolved_run_id,
@@ -71,8 +92,10 @@ class AnalysisSubstrate:
                 f"No messages were found for target {config.target.target_type}:{config.target.target_id}"
             )
 
-        chosen_time_window = self._resolve_time_window(
-            messages=all_messages, config=config
+        chosen_time_window, selection_debug = self._resolve_time_window(
+            messages=all_messages,
+            config=config,
+            analysis_input=analysis_input,
         )
         manifest_media_coverage = self._load_run_media_coverage(resolved_run_id)
         scoped_messages = [
@@ -112,6 +135,7 @@ class AnalysisSubstrate:
             participant_profiles=participant_profiles,
             theme_queries=theme_queries,
             warnings=[],
+            input_context={"time_window_selection": selection_debug},
         )
 
     def _load_run_media_coverage(self, run_id: str) -> MediaCoverageSummary | None:
@@ -266,59 +290,146 @@ class AnalysisSubstrate:
         *,
         messages: list[AnalysisMessageRecord],
         config: AnalysisJobConfig,
-    ) -> ResolvedTimeWindow:
+        analysis_input: Any | None = None,
+    ) -> tuple[ResolvedTimeWindow, dict[str, Any]]:
         if config.time_scope.mode == "manual":
             start = config.time_scope.start_timestamp_ms
             end = config.time_scope.end_timestamp_ms
             assert start is not None
             assert end is not None
             selected_count = sum(start <= item.timestamp_ms <= end for item in messages)
-            return ResolvedTimeWindow(
-                mode="manual",
-                start_timestamp_ms=start,
-                end_timestamp_ms=end,
-                start_timestamp_iso=_ms_to_iso(start),
-                end_timestamp_iso=_ms_to_iso(end),
-                rationale="explicit user-provided range",
-                selected_message_count=selected_count,
+            return (
+                ResolvedTimeWindow(
+                    mode="manual",
+                    start_timestamp_ms=start,
+                    end_timestamp_ms=end,
+                    start_timestamp_iso=_ms_to_iso(start),
+                    end_timestamp_iso=_ms_to_iso(end),
+                    rationale="explicit user-provided range",
+                    selected_message_count=selected_count,
+                ),
+                {
+                    "mode": "manual",
+                    "strategy": "explicit_range",
+                    "selected_message_count": selected_count,
+                    "bias_applied": False,
+                },
             )
 
         if len(messages) <= config.time_scope.min_messages_for_auto:
             start = messages[0].timestamp_ms
             end = messages[-1].timestamp_ms
-            return ResolvedTimeWindow(
-                mode="auto_adaptive",
-                start_timestamp_ms=start,
-                end_timestamp_ms=end,
-                start_timestamp_iso=messages[0].timestamp_iso,
-                end_timestamp_iso=messages[-1].timestamp_iso,
-                rationale=(
-                    "auto-adaptive fell back to the full available window because the "
-                    "target message count is below the auto-selection threshold"
+            return (
+                ResolvedTimeWindow(
+                    mode="auto_adaptive",
+                    start_timestamp_ms=start,
+                    end_timestamp_ms=end,
+                    start_timestamp_iso=messages[0].timestamp_iso,
+                    end_timestamp_iso=messages[-1].timestamp_iso,
+                    rationale=(
+                        "auto-adaptive fell back to the full available window because the "
+                        "target message count is below the auto-selection threshold"
+                    ),
+                    selected_message_count=len(messages),
                 ),
-                selected_message_count=len(messages),
+                {
+                    "mode": "auto_adaptive",
+                    "strategy": "full_window_fallback",
+                    "selected_message_count": len(messages),
+                    "bias_applied": False,
+                },
             )
 
         sessions = self._sessionize(messages, config.time_scope.session_gap_ms)
-        chosen_session = max(
+        ordered_sessions = sorted(
             sessions,
             key=lambda item: (item.score, len(item.messages)),
+            reverse=True,
         )
-        chosen = chosen_session.messages
-        best_score = chosen_session.score
-        _, best_notes = self._window_signal_score(chosen)
-        return ResolvedTimeWindow(
-            mode="auto_adaptive",
-            start_timestamp_ms=chosen[0].timestamp_ms,
-            end_timestamp_ms=chosen[-1].timestamp_ms,
-            start_timestamp_iso=chosen[0].timestamp_iso,
-            end_timestamp_iso=chosen[-1].timestamp_iso,
-            rationale=(
+        bias_context = self._build_preprocess_window_bias_context(analysis_input)
+        candidate_limit = min(max(config.max_candidate_events, 3), len(ordered_sessions))
+        candidate_sessions = ordered_sessions[:candidate_limit]
+        scored_candidates: list[dict[str, Any]] = []
+        for raw_rank, session in enumerate(candidate_sessions, start=1):
+            raw_score, raw_notes = self._window_signal_score(session.messages)
+            bias_score = 0.0
+            bias_notes: list[str] = []
+            if bias_context is not None:
+                bias_score, bias_notes = self._candidate_window_bias_score(
+                    session.messages,
+                    bias_context=bias_context,
+                )
+            final_score = raw_score + bias_score
+            scored_candidates.append(
+                {
+                    "raw_rank": raw_rank,
+                    "start_timestamp_ms": session.messages[0].timestamp_ms,
+                    "end_timestamp_ms": session.messages[-1].timestamp_ms,
+                    "start_timestamp_iso": session.messages[0].timestamp_iso,
+                    "end_timestamp_iso": session.messages[-1].timestamp_iso,
+                    "message_count": len(session.messages),
+                    "raw_signal_score": round(raw_score, 4),
+                    "directive_bias_score": round(bias_score, 4),
+                    "final_selection_score": round(final_score, 4),
+                    "raw_notes": raw_notes,
+                    "bias_notes": bias_notes,
+                    "dominant_tags": list(session.tags.keys())[:6],
+                }
+            )
+
+        chosen_candidate = max(
+            scored_candidates,
+            key=lambda item: (
+                item["final_selection_score"],
+                item["raw_signal_score"],
+                item["message_count"],
+            ),
+        )
+        chosen = next(
+            session.messages
+            for session, candidate in zip(candidate_sessions, scored_candidates)
+            if candidate["raw_rank"] == chosen_candidate["raw_rank"]
+        )
+        if bias_context is None:
+            rationale = (
                 "auto-adaptive selected the highest-signal bounded session window "
                 f"using a {config.time_scope.session_gap_ms // (60 * 1000)}m session gap "
-                f"(signal_score={best_score:.2f}; {', '.join(best_notes)})"
+                f"(signal_score={chosen_candidate['raw_signal_score']:.2f}; "
+                f"{', '.join(chosen_candidate['raw_notes'])})"
+            )
+        else:
+            rationale = (
+                "auto-adaptive reranked raw candidate windows with "
+                f"{bias_context.profile_id or bias_context.relevance_policy or 'directive'} bias "
+                f"and selected raw candidate #{chosen_candidate['raw_rank']} "
+                f"(raw_signal_score={chosen_candidate['raw_signal_score']:.2f}; "
+                f"directive_bias_score={chosen_candidate['directive_bias_score']:.2f}; "
+                f"final_selection_score={chosen_candidate['final_selection_score']:.2f}; "
+                f"raw_notes={'; '.join(chosen_candidate['raw_notes'])}; "
+                f"bias_notes={'; '.join(chosen_candidate['bias_notes']) if chosen_candidate['bias_notes'] else 'none'})"
+            )
+        return (
+            ResolvedTimeWindow(
+                mode="auto_adaptive",
+                start_timestamp_ms=chosen[0].timestamp_ms,
+                end_timestamp_ms=chosen[-1].timestamp_ms,
+                start_timestamp_iso=chosen[0].timestamp_iso,
+                end_timestamp_iso=chosen[-1].timestamp_iso,
+                rationale=rationale,
+                selected_message_count=len(chosen),
             ),
-            selected_message_count=len(chosen),
+            {
+                "mode": "auto_adaptive",
+                "strategy": "raw_top_n_rerank" if bias_context is not None else "raw_high_signal",
+                "bias_applied": bias_context is not None,
+                "profile_id": getattr(bias_context, "profile_id", None),
+                "relevance_policy": getattr(bias_context, "relevance_policy", None),
+                "candidate_count": len(scored_candidates),
+                "selected_raw_rank": chosen_candidate["raw_rank"],
+                "selected_final_score": chosen_candidate["final_selection_score"],
+                "selected_bias_score": chosen_candidate["directive_bias_score"],
+                "candidates": scored_candidates,
+            },
         )
 
     def _build_stats(
@@ -720,6 +831,215 @@ class AnalysisSubstrate:
 
         return score, notes
 
+    def _build_preprocess_window_bias_context(
+        self, analysis_input: Any | None
+    ) -> _PreprocessWindowBiasContext | None:
+        if not isinstance(analysis_input, PreprocessViewContext):
+            return None
+        manifest = analysis_input.manifest
+        directive = manifest.directive or analysis_input.directive
+        metadata = manifest.metadata or {}
+        profile_id = _first_non_empty_str(
+            metadata.get("profile_id"),
+            manifest.view_id,
+            directive.directive_id if directive is not None else None,
+        )
+        relevance_policy = directive.relevance_policy if directive is not None else None
+        if (
+            profile_id not in {"shi_focus", "meme_focus"}
+            and relevance_policy not in {"strict_focus", "meme_focus"}
+        ):
+            return None
+
+        noise_labels_by_key: dict[str, set[str]] = defaultdict(set)
+        suppressed_keys: set[str] = set()
+        for view in analysis_input.message_views:
+            keys = {
+                *(
+                    str(item)
+                    for item in [view.message_id, *view.source_message_ids]
+                    if item is not None and str(item)
+                )
+            }
+            if not keys:
+                continue
+            labels = {str(item) for item in view.labels if str(item)}
+            suppressed = bool(view.suppressed or _has_noise_label(labels))
+            for key in keys:
+                noise_labels_by_key[key].update(labels)
+                if suppressed:
+                    suppressed_keys.add(key)
+
+        forward_outer_message_ids: set[str] = set()
+        for view in analysis_input.thread_views:
+            for annotation in view.annotations:
+                details = _as_dict(annotation.metadata.get("details"))
+                outer_id = _first_non_empty_str(
+                    details.get("outer_message_id"),
+                    details.get("message_id"),
+                )
+                if outer_id:
+                    forward_outer_message_ids.add(outer_id)
+
+        expired_or_missing_message_ids: set[str] = set()
+        for view in analysis_input.asset_views:
+            if view.resource_state not in {"expired", "missing", "placeholder"}:
+                continue
+            for key in view.source_message_ids:
+                if key:
+                    expired_or_missing_message_ids.add(str(key))
+            for annotation in view.annotations:
+                for key in annotation.source_message_ids:
+                    if key:
+                        expired_or_missing_message_ids.add(str(key))
+
+        return _PreprocessWindowBiasContext(
+            input_kind="preprocess_view",
+            profile_id=profile_id,
+            view_id=manifest.view_id,
+            relevance_policy=relevance_policy,
+            target_tokens=tuple(
+                _normalize_tokens(directive.target_topics if directive is not None else [])
+            ),
+            suppress_tokens=tuple(
+                _normalize_tokens(directive.suppress_message_patterns if directive is not None else [])
+            ),
+            debug_tokens=tuple(
+                _normalize_tokens(
+                    (
+                        *(
+                            directive.suppress_message_patterns
+                            if directive is not None
+                            else []
+                        ),
+                        *(directive.suppress_topics if directive is not None else []),
+                        "napcat",
+                        "onebot",
+                        "watch",
+                        "export",
+                        "debug",
+                        "log",
+                        "traceback",
+                        "proxy",
+                        "二维码",
+                    )
+                )
+            ),
+            noise_labels_by_key=dict(noise_labels_by_key),
+            suppressed_keys=suppressed_keys,
+            forward_outer_message_ids=forward_outer_message_ids,
+            expired_or_missing_message_ids=expired_or_missing_message_ids,
+        )
+
+    def _candidate_window_bias_score(
+        self,
+        messages: list[AnalysisMessageRecord],
+        *,
+        bias_context: _PreprocessWindowBiasContext,
+    ) -> tuple[float, list[str]]:
+        total = len(messages)
+        if total == 0:
+            return 0.0, []
+
+        message_keys: set[str] = set()
+        debug_token_hits = 0
+        debug_attachment_hits = 0
+        target_topic_hits = 0
+        forward_like_messages = 0
+        nested_forward_messages = 0
+        multimodal_messages = 0
+        missing_media_messages = 0
+        for message in messages:
+            message_keys.add(message.message_uid)
+            if message.message_id is not None:
+                message_keys.add(str(message.message_id))
+            text = f"{message.content}\n{message.text_content}".lower()
+            if any(token in text for token in bias_context.debug_tokens):
+                debug_token_hits += 1
+            if any(token in text for token in bias_context.target_tokens):
+                target_topic_hits += 1
+            if message.features.has_forward:
+                forward_like_messages += 1
+            if message.features.forward_depth >= 2:
+                nested_forward_messages += 1
+            if message.features.missing_media_count > 0:
+                missing_media_messages += 1
+            asset_types = {str(item.get("asset_type", "")).lower() for item in message.assets}
+            rich_types = {"image", "video", "file", "record", "speech"} & asset_types
+            if len(rich_types) >= 2 or ("image" in rich_types and message.features.has_forward):
+                multimodal_messages += 1
+            if any(
+                token in " ".join(
+                    str(item.get("file_name", "")).lower() for item in message.assets
+                )
+                for token in ("log", "trace", "summary", "manifest", "startup", "export")
+            ):
+                debug_attachment_hits += 1
+
+        suppressed_count = sum(1 for key in message_keys if key in bias_context.suppressed_keys)
+        noise_label_hits = sum(
+            1
+            for key in message_keys
+            if _has_noise_label(bias_context.noise_labels_by_key.get(key, set()))
+        )
+        expanded_forward_hits = sum(
+            1
+            for message in messages
+            if message.message_id is not None
+            and str(message.message_id) in bias_context.forward_outer_message_ids
+        )
+        expired_context_hits = sum(
+            1
+            for message in messages
+            if (
+                message.message_id is not None
+                and str(message.message_id) in bias_context.expired_or_missing_message_ids
+            )
+            or message.features.missing_media_count > 0
+        )
+
+        score = 0.0
+        notes: list[str] = []
+
+        if forward_like_messages / total >= 0.15:
+            score += 2.0
+            notes.append(f"forward_density_boost=+2.0({forward_like_messages}/{total})")
+        if nested_forward_messages >= 2:
+            score += 2.0
+            notes.append(f"nested_forward_boost=+2.0({nested_forward_messages})")
+        if expanded_forward_hits >= 2:
+            score += 1.5
+            notes.append(f"forward_expansion_boost=+1.5({expanded_forward_hits})")
+        if target_topic_hits / total >= 0.12:
+            score += 1.5
+            notes.append(f"target_topic_boost=+1.5({target_topic_hits}/{total})")
+        if multimodal_messages / total >= 0.08:
+            score += 1.0
+            notes.append(f"multimodal_boost=+1.0({multimodal_messages}/{total})")
+        if expired_context_hits > 0:
+            score += 1.0
+            notes.append(f"expired_context_boost=+1.0({expired_context_hits})")
+
+        if suppressed_count / total >= 0.20:
+            score -= 2.0
+            notes.append(f"suppressed_noise_penalty=-2.0({suppressed_count}/{total})")
+        if noise_label_hits / total >= 0.18:
+            score -= 1.5
+            notes.append(f"noise_label_penalty=-1.5({noise_label_hits}/{total})")
+        if debug_token_hits / total >= 0.18:
+            score -= 1.5
+            notes.append(f"debug_keyword_penalty=-1.5({debug_token_hits}/{total})")
+        if debug_attachment_hits / total >= 0.08:
+            score -= 1.0
+            notes.append(f"debug_attachment_penalty=-1.0({debug_attachment_hits}/{total})")
+
+        clamped = max(min(score, 12.0), -12.0)
+        if clamped != score:
+            notes.append(f"bias_clamped={score:.2f}->{clamped:.2f}")
+        if not notes:
+            notes.append("neutral_bias")
+        return clamped, notes
+
     def _derive_aggregate_tags(
         self, messages: list[AnalysisMessageRecord]
     ) -> list[str]:
@@ -1068,6 +1388,47 @@ def _contains_keyword_marker(value: Any, keywords: tuple[str, ...]) -> bool:
         text = value.lower()
         return any(word in text for word in lowered)
     return False
+
+
+def _normalize_tokens(values: Iterable[str]) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        lowered = str(value).strip().lower()
+        if lowered:
+            tokens.append(lowered)
+    return tokens
+
+
+def _first_non_empty_str(*values: Any) -> str | None:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _has_noise_label(labels: set[str]) -> bool:
+    return any(
+        label in labels
+        for label in {
+            "strict_focus_non_target",
+            "low_signal_chatter",
+            "runtime_debug",
+            "cli_workflow",
+            "dev_ops",
+            "analysis_dev",
+            "suppressed_pattern",
+            "suppressed_topic",
+            "suppressed_example",
+            "debug_attachment",
+        }
+    )
 
 
 def _forward_depth(value: Any, depth: int = 0) -> int:

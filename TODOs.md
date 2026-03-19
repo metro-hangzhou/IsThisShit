@@ -2,6 +2,10 @@
 
 Detailed specialized TODOs now live under [dev/todos/INDEX.md](/d:/Coding_Project/IsThisShit/dev/todos/INDEX.md).
 
+See also: [TODOs.analysis-platform-roadmap.md](/d:/Coding_Project/IsThisShit/dev/todos/TODOs.analysis-platform-roadmap.md) for the corpus, preprocess, analysis-substrate, and pluggable-agent development roadmap.
+See also: [TODOs.analysis-implementation-plan.md](/d:/Coding_Project/IsThisShit/dev/todos/TODOs.analysis-implementation-plan.md) for the execution plan from preprocess/runtime wiring through GPT-5.4 text+multimodal manual testing.
+See also: [TODOs.code-review-risk-register.md](/d:/Coding_Project/IsThisShit/dev/todos/TODOs.code-review-risk-register.md) for the strict reviewer-style risk register covering export/runtime/CLI failure modes.
+See also: [TODOs.export-optimization.md](/d:/Coding_Project/IsThisShit/dev/todos/TODOs.export-optimization.md) for the export-era optimization notes and targeted recovery follow-ups.
 See also: [TODOs.export-performance.md](/d:/Coding_Project/IsThisShit/dev/todos/TODOs.export-performance.md) for the dedicated export-speed investigation and fix plan.
 See also: [TODOs.export-fidelity.md](/d:/Coding_Project/IsThisShit/dev/todos/TODOs.export-fidelity.md) for export UX coverage and media/content fidelity follow-ups.
 See also: [TODOs.export-forensics.md](/d:/Coding_Project/IsThisShit/dev/todos/TODOs.export-forensics.md) for fail-fast missing policy, forensic debug bundles, and investigative-failure handling.

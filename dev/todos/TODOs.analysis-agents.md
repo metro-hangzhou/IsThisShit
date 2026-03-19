@@ -168,6 +168,7 @@ Related phase note:
 ## Deferred
 
 - [ ] `BenshiAgent`
+  - now tracked in `TODOs.benshi-master-agent.md`
 - [ ] richer people-image semantics
 - [ ] OCR/caption-backed image analysis
 - [ ] reranker-backed evidence refinement

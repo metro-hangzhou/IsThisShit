@@ -9,6 +9,9 @@ tmp*/
 dist/
 exports/
 state/
+state/config/llm.local.json
+state/config/*.local.json
+state/config/*.secret.json
 NapCatQQ/
 NapCat/config.json
 NapCat/napcat/cache/

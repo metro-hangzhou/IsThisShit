@@ -1265,6 +1265,303 @@ def test_write_bundle_reuses_resolution_for_duplicate_assets() -> None:
         assert bundle.reused_asset_count == 1
 
 
+def test_write_bundle_reuses_same_content_across_distinct_source_files() -> None:
+    with _repo_temp_dir("media_bundle_same_content_dedupe") as tmp_path:
+        service = ChatExportService()
+        source_root = tmp_path / "source"
+        left = source_root / "left" / "same-a.png"
+        right = source_root / "right" / "same-b.jpg"
+        payload = b"\x89PNG\r\n\x1a\nsame-content"
+        for path in (left, right):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+
+        message_a = NormalizedMessage(
+            chat_type="group",
+            chat_id="1",
+            group_id="1",
+            sender_id="100",
+            sender_name="A",
+            message_id="1",
+            message_seq="1",
+            timestamp_ms=1770000000000,
+            timestamp_iso="2026-02-02T02:02:02+08:00",
+            content="[image:same-a.png]",
+            text_content="",
+            segments=[
+                NormalizedSegment(
+                    type="image",
+                    token="[image:same-a.png]",
+                    file_name="same-a.png",
+                    path=str(left),
+                    md5=None,
+                    extra={},
+                )
+            ],
+        )
+        message_b = message_a.model_copy(
+            update={
+                "message_id": "2",
+                "message_seq": "2",
+                "timestamp_ms": 1770000001000,
+                "timestamp_iso": "2026-02-02T02:02:03+08:00",
+                "content": "[image:same-b.jpg]",
+                "segments": [
+                    NormalizedSegment(
+                        type="image",
+                        token="[image:same-b.jpg]",
+                        file_name="same-b.jpg",
+                        path=str(right),
+                        md5=None,
+                        extra={},
+                    )
+                ],
+            }
+        )
+
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="1",
+            chat_name="demo",
+            messages=[message_a, message_b],
+            metadata={},
+        )
+
+        out_path = tmp_path / "exports" / "group_1_same_content.jsonl"
+        bundle = service.write_bundle(snapshot, out_path, fmt="jsonl")
+
+        image_files = sorted((bundle.assets_dir / "images").iterdir())
+        assert bundle.copied_asset_count == 1
+        assert bundle.reused_asset_count == 1
+        assert len(image_files) == 1
+        assert bundle.assets[0].exported_rel_path == bundle.assets[1].exported_rel_path
+
+
+def test_write_bundle_keeps_distinct_content_variants_with_same_export_name() -> None:
+    with _repo_temp_dir("media_bundle_distinct_content_variants") as tmp_path:
+        service = ChatExportService()
+        source_root = tmp_path / "source"
+        left = source_root / "left" / "same-name-a.jpg"
+        right = source_root / "right" / "same-name-b.jpg"
+        left.parent.mkdir(parents=True, exist_ok=True)
+        right.parent.mkdir(parents=True, exist_ok=True)
+        left.write_bytes(b"\xff\xd8\xff\xdbfirst-version")
+        right.write_bytes(b"\xff\xd8\xff\xdbsecond-version-with-diff")
+
+        message_a = NormalizedMessage(
+            chat_type="group",
+            chat_id="1",
+            group_id="1",
+            sender_id="100",
+            sender_name="A",
+            message_id="1",
+            message_seq="1",
+            timestamp_ms=1770000000000,
+            timestamp_iso="2026-02-02T02:02:02+08:00",
+            content="[image:same-name.jpg]",
+            text_content="",
+            segments=[
+                NormalizedSegment(
+                    type="image",
+                    token="[image:same-name.jpg]",
+                    file_name="same-name.jpg",
+                    path=str(left),
+                    md5=None,
+                    extra={},
+                )
+            ],
+        )
+        message_b = message_a.model_copy(
+            update={
+                "message_id": "2",
+                "message_seq": "2",
+                "timestamp_ms": 1770000001000,
+                "timestamp_iso": "2026-02-02T02:02:03+08:00",
+                "segments": [
+                    NormalizedSegment(
+                        type="image",
+                        token="[image:same-name.jpg]",
+                        file_name="same-name.jpg",
+                        path=str(right),
+                        md5=None,
+                        extra={},
+                    )
+                ],
+            }
+        )
+
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="1",
+            chat_name="demo",
+            messages=[message_a, message_b],
+            metadata={},
+        )
+
+        out_path = tmp_path / "exports" / "group_1_distinct_variants.jsonl"
+        bundle = service.write_bundle(snapshot, out_path, fmt="jsonl")
+
+        image_files = sorted((bundle.assets_dir / "images").iterdir())
+        assert bundle.copied_asset_count == 2
+        assert bundle.reused_asset_count == 0
+        assert len(image_files) == 2
+        assert bundle.assets[0].exported_rel_path != bundle.assets[1].exported_rel_path
+
+
+def test_write_bundle_keeps_same_size_distinct_content_variants_separate() -> None:
+    with _repo_temp_dir("media_bundle_same_size_distinct_variants") as tmp_path:
+        service = ChatExportService()
+        source_root = tmp_path / "source"
+        left = source_root / "left" / "same-name-a.jpg"
+        right = source_root / "right" / "same-name-b.jpg"
+        left.parent.mkdir(parents=True, exist_ok=True)
+        right.parent.mkdir(parents=True, exist_ok=True)
+        left.write_bytes(b"\xff\xd8\xff\xdbsame-size-payload-A")
+        right.write_bytes(b"\xff\xd8\xff\xdbsame-size-payload-B")
+        assert left.stat().st_size == right.stat().st_size
+
+        message_a = NormalizedMessage(
+            chat_type="group",
+            chat_id="1",
+            group_id="1",
+            sender_id="100",
+            sender_name="A",
+            message_id="1",
+            message_seq="1",
+            timestamp_ms=1770000000000,
+            timestamp_iso="2026-02-02T02:02:02+08:00",
+            content="[image:same-name.jpg]",
+            text_content="",
+            segments=[
+                NormalizedSegment(
+                    type="image",
+                    token="[image:same-name.jpg]",
+                    file_name="same-name.jpg",
+                    path=str(left),
+                    md5=None,
+                    extra={},
+                )
+            ],
+        )
+        message_b = message_a.model_copy(
+            update={
+                "message_id": "2",
+                "message_seq": "2",
+                "timestamp_ms": 1770000001000,
+                "timestamp_iso": "2026-02-02T02:02:03+08:00",
+                "segments": [
+                    NormalizedSegment(
+                        type="image",
+                        token="[image:same-name.jpg]",
+                        file_name="same-name.jpg",
+                        path=str(right),
+                        md5=None,
+                        extra={},
+                    )
+                ],
+            }
+        )
+
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="1",
+            chat_name="demo",
+            messages=[message_a, message_b],
+            metadata={},
+        )
+
+        out_path = tmp_path / "exports" / "group_1_same_size_distinct_variants.jsonl"
+        bundle = service.write_bundle(snapshot, out_path, fmt="jsonl")
+
+        image_files = sorted((bundle.assets_dir / "images").iterdir())
+        assert bundle.copied_asset_count == 2
+        assert bundle.reused_asset_count == 0
+        assert len(image_files) == 2
+        assert bundle.assets[0].exported_rel_path != bundle.assets[1].exported_rel_path
+
+
+def test_write_bundle_keeps_large_sample_collision_variants_separate() -> None:
+    with _repo_temp_dir("media_bundle_large_sample_collision_variants") as tmp_path:
+        service = ChatExportService()
+        source_root = tmp_path / "source"
+        left = source_root / "left" / "same-name-a.jpg"
+        right = source_root / "right" / "same-name-b.jpg"
+        left.parent.mkdir(parents=True, exist_ok=True)
+        right.parent.mkdir(parents=True, exist_ok=True)
+
+        size = 400 * 1024
+        shared_a = bytearray(b"\x00" * size)
+        shared_b = bytearray(b"\x00" * size)
+        shared_a[:4] = b"\xff\xd8\xff\xdb"
+        shared_b[:4] = b"\xff\xd8\xff\xdb"
+        # Keep head/middle/tail windows identical so the fast sampled signature
+        # collides; only the exact content check should separate them.
+        shared_a[80 * 1024] = ord("A")
+        shared_b[80 * 1024] = ord("B")
+        left.write_bytes(bytes(shared_a))
+        right.write_bytes(bytes(shared_b))
+        assert left.stat().st_size == right.stat().st_size
+
+        message_a = NormalizedMessage(
+            chat_type="group",
+            chat_id="1",
+            group_id="1",
+            sender_id="100",
+            sender_name="A",
+            message_id="1",
+            message_seq="1",
+            timestamp_ms=1770000000000,
+            timestamp_iso="2026-02-02T02:02:02+08:00",
+            content="[image:same-name.jpg]",
+            text_content="",
+            segments=[
+                NormalizedSegment(
+                    type="image",
+                    token="[image:same-name.jpg]",
+                    file_name="same-name.jpg",
+                    path=str(left),
+                    md5=None,
+                    extra={},
+                )
+            ],
+        )
+        message_b = message_a.model_copy(
+            update={
+                "message_id": "2",
+                "message_seq": "2",
+                "timestamp_ms": 1770000001000,
+                "timestamp_iso": "2026-02-02T02:02:03+08:00",
+                "segments": [
+                    NormalizedSegment(
+                        type="image",
+                        token="[image:same-name.jpg]",
+                        file_name="same-name.jpg",
+                        path=str(right),
+                        md5=None,
+                        extra={},
+                    )
+                ],
+            }
+        )
+
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="1",
+            chat_name="demo",
+            messages=[message_a, message_b],
+            metadata={},
+        )
+
+        out_path = tmp_path / "exports" / "group_1_large_sample_collision_variants.jsonl"
+        bundle = service.write_bundle(snapshot, out_path, fmt="jsonl")
+
+        image_files = sorted((bundle.assets_dir / "images").iterdir())
+        assert bundle.copied_asset_count == 2
+        assert bundle.reused_asset_count == 0
+        assert len(image_files) == 2
+        assert bundle.assets[0].exported_rel_path != bundle.assets[1].exported_rel_path
+
+
 def test_write_bundle_skips_legacy_search_context_for_napcat_only(monkeypatch) -> None:
     service = ChatExportService()
     snapshot = NormalizedSnapshot(

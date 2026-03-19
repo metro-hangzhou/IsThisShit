@@ -5,20 +5,40 @@ import base64
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from qq_data_process.utils import preview_text
+try:
+    from qq_data_process.utils import preview_text
+except ImportError:  # pragma: no cover - smoke harness fallback path
+    def preview_text(value: str | None, limit: int = 100) -> str:
+        text = (value or "").strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[: max(0, limit - 1)].rstrip()}…"
 
-from .agents import BaseAnalysisAgent
-from .models import (
-    AnalysisAgentOutput,
-    AnalysisEvidenceItem,
-    AnalysisMaterials,
-    AnalysisMessageRecord,
-)
+
+_GROUNDING_IMPORT_ERROR: Exception | None = None
+try:
+    from .agents import BaseAnalysisAgent
+    from .models import (
+        AnalysisAgentOutput,
+        AnalysisEvidenceItem,
+        AnalysisMaterials,
+        AnalysisMessageRecord,
+    )
+except ImportError as exc:  # pragma: no cover - smoke harness fallback path
+    _GROUNDING_IMPORT_ERROR = exc
+
+    class BaseAnalysisAgent:  # type: ignore[no-redef]
+        pass
+
+    AnalysisAgentOutput = Any  # type: ignore[assignment]
+    AnalysisEvidenceItem = Any  # type: ignore[assignment]
+    AnalysisMaterials = Any  # type: ignore[assignment]
+    AnalysisMessageRecord = Any  # type: ignore[assignment]
 
 
 class DeepSeekRuntimeConfig(BaseModel):
@@ -28,6 +48,7 @@ class DeepSeekRuntimeConfig(BaseModel):
     proxy_url: str | None = None
     temperature: float = 0.2
     timeout_s: float = 180.0
+    idle_timeout_s: float = 60.0
 
 
 class OpenAICompatibleRuntimeConfig(BaseModel):
@@ -36,7 +57,56 @@ class OpenAICompatibleRuntimeConfig(BaseModel):
     model: str = "gpt-5.4"
     proxy_url: str | None = None
     temperature: float | None = None
+    reasoning_effort: str | None = None
     timeout_s: float = 180.0
+    idle_timeout_s: float = 60.0
+
+
+def _httpx_timeout_for_runtime(config: Any) -> httpx.Timeout:
+    base_timeout = max(float(getattr(config, "timeout_s", 180.0) or 180.0), 1.0)
+    idle_timeout = max(
+        float(getattr(config, "idle_timeout_s", base_timeout) or base_timeout),
+        1.0,
+    )
+    return httpx.Timeout(
+        connect=base_timeout,
+        read=idle_timeout,
+        write=base_timeout,
+        pool=base_timeout,
+    )
+
+
+def apply_openai_prompt_family_defaults(
+    config: OpenAICompatibleRuntimeConfig,
+    *,
+    prompt_family: str | None = None,
+) -> OpenAICompatibleRuntimeConfig:
+    normalized = (prompt_family or "").strip().lower()
+    if not normalized.startswith("benshi_master"):
+        return config
+    updates: dict[str, Any] = {}
+    if config.reasoning_effort is None:
+        updates["reasoning_effort"] = "medium"
+    if config.temperature is None:
+        updates["temperature"] = 0.0
+    if not updates:
+        return config
+    return config.model_copy(update=updates)
+
+
+class MultimodalInputImage(BaseModel):
+    path: Path
+    mime_type: str | None = None
+    label: str | None = None
+
+
+class MultimodalSmokePack(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    system_prompt: str = ""
+    user_prompt: str
+    images: list[MultimodalInputImage] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -86,6 +156,20 @@ class LlmClient(Protocol):
     ) -> LlmResponseBundle: ...
 
 
+class MultimodalLlmClient(Protocol):
+    provider_name: str
+
+    def analyze_multimodal(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        images: Iterable[MultimodalInputImage],
+        max_output_tokens: int,
+        stream_callback: Callable[[str, str], None] | None = None,
+    ) -> LlmResponseBundle: ...
+
+
 def load_deepseek_runtime_config(path: Path) -> DeepSeekRuntimeConfig:
     if not path.exists():
         raise RuntimeError(
@@ -114,6 +198,70 @@ def load_openai_compatible_runtime_config(path: Path) -> OpenAICompatibleRuntime
             f"OpenAI-compatible api_key is still a placeholder in {path}. Fill it before running LLM analysis."
         )
     return config
+
+
+def load_multimodal_runtime_config(
+    path: Path,
+    *,
+    provider: str = "openai_compatible",
+) -> OpenAICompatibleRuntimeConfig | DeepSeekRuntimeConfig:
+    resolved = provider.strip().lower()
+    if resolved == "openai_compatible":
+        return load_openai_compatible_runtime_config(path)
+    if resolved == "deepseek":
+        return load_deepseek_runtime_config(path)
+    raise ValueError(f"Unsupported multimodal provider: {provider}")
+
+
+def load_multimodal_client(
+    path: Path,
+    *,
+    provider: str = "openai_compatible",
+    model: str | None = None,
+) -> MultimodalLlmClient:
+    resolved = provider.strip().lower()
+    if resolved == "openai_compatible":
+        config = load_openai_compatible_runtime_config(path)
+        if model:
+            config = config.model_copy(update={"model": model})
+        return OpenAICompatibleAnalysisClient(config)
+    if resolved == "deepseek":
+        raise RuntimeError(
+            "Provider 'deepseek' is currently text-only in this smoke harness. "
+            "Use provider='openai_compatible' for GPT-5.4 relay multimodal tests."
+        )
+    raise ValueError(f"Unsupported multimodal provider: {provider}")
+
+
+def load_multimodal_smoke_pack(path: Path) -> MultimodalSmokePack:
+    if not path.exists():
+        raise FileNotFoundError(f"Multimodal smoke pack does not exist: {path}")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    normalized = dict(raw)
+    normalized_images: list[dict[str, Any]] = []
+    for item in raw.get("images", []) or []:
+        if isinstance(item, str):
+            normalized_images.append({"path": item})
+            continue
+        if isinstance(item, dict):
+            normalized_images.append(item)
+            continue
+        raise TypeError(
+            "Multimodal smoke pack images must be strings or objects with a 'path' field."
+        )
+    normalized["images"] = normalized_images
+    pack = MultimodalSmokePack.model_validate(normalized)
+    resolved_images = [
+        image.model_copy(
+            update={
+                "path": (path.parent / image.path).resolve()
+                if not image.path.is_absolute()
+                else image.path.resolve()
+            }
+        )
+        for image in pack.images
+    ]
+    return pack.model_copy(update={"images": resolved_images})
 
 
 class DeepSeekAnalysisClient:
@@ -172,7 +320,7 @@ class DeepSeekAnalysisClient:
         payload["stream"] = True
         payload["stream_options"] = {"include_usage": True}
         client_kwargs: dict[str, Any] = {
-            "timeout": self.config.timeout_s,
+            "timeout": _httpx_timeout_for_runtime(self.config),
             "trust_env": False,
         }
         if self.config.proxy_url:
@@ -248,7 +396,7 @@ class DeepSeekAnalysisClient:
         if self.config.model != "deepseek-reasoner":
             payload["temperature"] = self.config.temperature
         client_kwargs: dict[str, Any] = {
-            "timeout": self.config.timeout_s,
+            "timeout": _httpx_timeout_for_runtime(self.config),
             "trust_env": False,
         }
         if self.config.proxy_url:
@@ -311,6 +459,15 @@ class OpenAICompatibleAnalysisClient:
         max_output_tokens: int,
         stream_callback: Callable[[str, str], None] | None = None,
     ) -> LlmResponseBundle:
+        fallback_payload = _build_openai_chat_text_payload(
+            model=self.config.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+            temperature=self.config.temperature,
+            reasoning_effort=self.config.reasoning_effort,
+            stream=stream_callback is not None,
+        )
         if stream_callback is not None:
             payload: dict[str, Any] = {
                 "model": self.config.model,
@@ -318,11 +475,12 @@ class OpenAICompatibleAnalysisClient:
                 "input": user_prompt,
                 "max_output_tokens": max_output_tokens,
             }
-            if self.config.temperature is not None:
-                payload["temperature"] = self.config.temperature
+            self._apply_openai_optional_controls(payload, responses_api=True)
             payload["stream"] = True
             return self._execute_streaming_payload(
-                payload, stream_callback=stream_callback
+                payload,
+                stream_callback=stream_callback,
+                fallback_payload=fallback_payload,
             )
         return self._execute_request(
             system_prompt=system_prompt,
@@ -330,12 +488,65 @@ class OpenAICompatibleAnalysisClient:
             max_output_tokens=max_output_tokens,
         )
 
+    def analyze_multimodal(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        images: Iterable[MultimodalInputImage],
+        max_output_tokens: int,
+        stream_callback: Callable[[str, str], None] | None = None,
+    ) -> LlmResponseBundle:
+        image_list = list(images)
+        content: list[dict[str, Any]] = []
+        if user_prompt.strip():
+            content.append({"type": "input_text", "text": user_prompt.strip()})
+        for index, image in enumerate(image_list, start=1):
+            if image.label:
+                content.append(
+                    {
+                        "type": "input_text",
+                        "text": f"[image {index} label] {image.label.strip()}",
+                    }
+                )
+            content.append(_build_openai_input_image(image))
+
+        if not content:
+            raise ValueError("analyze_multimodal requires at least one text or image input")
+
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "instructions": system_prompt,
+            "input": [{"role": "user", "content": content}],
+            "max_output_tokens": max_output_tokens,
+        }
+        fallback_payload = _build_openai_chat_multimodal_payload(
+            model=self.config.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            images=image_list,
+            max_output_tokens=max_output_tokens,
+            temperature=self.config.temperature,
+            reasoning_effort=self.config.reasoning_effort,
+            stream=stream_callback is not None,
+        )
+        self._apply_openai_optional_controls(payload, responses_api=True)
+        if stream_callback is not None:
+            payload["stream"] = True
+            return self._execute_streaming_payload(
+                payload,
+                stream_callback=stream_callback,
+                fallback_payload=fallback_payload,
+            )
+        return self._execute_payload(payload, fallback_payload=fallback_payload)
+
     def caption_image(
         self,
         *,
         image_path: Path,
         prompt: str,
         max_output_tokens: int = 220,
+        stream_callback: Callable[[str, str], None] | None = None,
     ) -> LlmResponseBundle:
         mime_type, _ = mimetypes.guess_type(str(image_path))
         if not mime_type:
@@ -357,9 +568,25 @@ class OpenAICompatibleAnalysisClient:
             ],
             "max_output_tokens": max_output_tokens,
         }
-        if self.config.temperature is not None:
-            payload["temperature"] = self.config.temperature
-        return self._execute_payload(payload)
+        fallback_payload = _build_openai_chat_multimodal_payload(
+            model=self.config.model,
+            system_prompt="",
+            user_prompt=prompt,
+            images=[MultimodalInputImage(path=image_path, mime_type=mime_type)],
+            max_output_tokens=max_output_tokens,
+            temperature=self.config.temperature,
+            reasoning_effort=self.config.reasoning_effort,
+            stream=stream_callback is not None,
+        )
+        self._apply_openai_optional_controls(payload, responses_api=True)
+        if stream_callback is not None:
+            payload["stream"] = True
+            return self._execute_streaming_payload(
+                payload,
+                stream_callback=stream_callback,
+                fallback_payload=fallback_payload,
+            )
+        return self._execute_payload(payload, fallback_payload=fallback_payload)
 
     def _execute_request(
         self,
@@ -374,30 +601,48 @@ class OpenAICompatibleAnalysisClient:
             "input": user_prompt,
             "max_output_tokens": max_output_tokens,
         }
-        if self.config.temperature is not None:
-            payload["temperature"] = self.config.temperature
+        fallback_payload = _build_openai_chat_text_payload(
+            model=self.config.model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_output_tokens=max_output_tokens,
+            temperature=self.config.temperature,
+            reasoning_effort=self.config.reasoning_effort,
+        )
+        self._apply_openai_optional_controls(payload, responses_api=True)
+        return self._execute_payload(payload, fallback_payload=fallback_payload)
 
-        return self._execute_payload(payload)
-
-    def _execute_payload(self, payload: dict[str, Any]) -> LlmResponseBundle:
+    def _execute_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        fallback_payload: dict[str, Any] | None = None,
+    ) -> LlmResponseBundle:
         client_kwargs: dict[str, Any] = {
-            "timeout": self.config.timeout_s,
+            "timeout": _httpx_timeout_for_runtime(self.config),
             "trust_env": False,
         }
         if self.config.proxy_url:
             client_kwargs["proxy"] = self.config.proxy_url
 
         with httpx.Client(**client_kwargs) as client:
-            response = client.post(
-                f"{self.config.base_url.rstrip('/')}/responses",
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            body = response.json()
+            try:
+                response = client.post(
+                    f"{self.config.base_url.rstrip('/')}/responses",
+                    headers={
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                response.raise_for_status()
+                body = response.json()
+            except httpx.HTTPStatusError as exc:
+                if not _should_fallback_to_chat_completions(exc):
+                    raise
+                if fallback_payload is None:
+                    raise
+                return self._execute_chat_payload(client, fallback_payload)
 
         return LlmResponseBundle(
             parsed_payload={},
@@ -413,9 +658,10 @@ class OpenAICompatibleAnalysisClient:
         payload: dict[str, Any],
         *,
         stream_callback: Callable[[str, str], None],
+        fallback_payload: dict[str, Any] | None = None,
     ) -> LlmResponseBundle:
         client_kwargs: dict[str, Any] = {
-            "timeout": self.config.timeout_s,
+            "timeout": _httpx_timeout_for_runtime(self.config),
             "trust_env": False,
         }
         if self.config.proxy_url:
@@ -432,35 +678,46 @@ class OpenAICompatibleAnalysisClient:
         last_body: dict[str, Any] = {}
 
         with httpx.Client(**client_kwargs) as client:
-            with client.stream(
-                "POST",
-                f"{self.config.base_url.rstrip('/')}/responses",
-                headers={
-                    "Authorization": f"Bearer {self.config.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    raw = line[5:].strip()
-                    if not raw:
-                        continue
-                    body = json.loads(raw)
-                    last_body = body
-                    event_type = str(body.get("type") or "")
-                    if event_type == "response.output_text.delta":
-                        piece = str(body.get("delta") or "")
-                        if piece:
-                            content_parts.append(piece)
-                            stream_callback("content", piece)
-                    elif event_type == "response.completed":
-                        response_body = body.get("response", {})
-                        if response_body:
-                            last_body = response_body
-                            usage = _extract_openai_usage(response_body)
+            try:
+                with client.stream(
+                    "POST",
+                    f"{self.config.base_url.rstrip('/')}/responses",
+                    headers={
+                        "Authorization": f"Bearer {self.config.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                ) as response:
+                    response.raise_for_status()
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        raw = line[5:].strip()
+                        if not raw:
+                            continue
+                        body = json.loads(raw)
+                        last_body = body
+                        event_type = str(body.get("type") or "")
+                        if event_type == "response.output_text.delta":
+                            piece = str(body.get("delta") or "")
+                            if piece:
+                                content_parts.append(piece)
+                                stream_callback("content", piece)
+                        elif event_type == "response.completed":
+                            response_body = body.get("response", {})
+                            if response_body:
+                                last_body = response_body
+                                usage = _extract_openai_usage(response_body)
+            except httpx.HTTPStatusError as exc:
+                if not _should_fallback_to_chat_completions(exc):
+                    raise
+                if fallback_payload is None:
+                    raise
+                return self._execute_chat_streaming_payload(
+                    client,
+                    fallback_payload,
+                    stream_callback=stream_callback,
+                )
 
         return LlmResponseBundle(
             parsed_payload={},
@@ -470,6 +727,105 @@ class OpenAICompatibleAnalysisClient:
             usage=usage,
             raw_response=last_body,
         )
+
+    def _execute_chat_payload(
+        self,
+        client: httpx.Client,
+        payload: dict[str, Any],
+    ) -> LlmResponseBundle:
+        response = client.post(
+            f"{self.config.base_url.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        )
+        response.raise_for_status()
+        body = response.json()
+        choice = body.get("choices", [{}])[0]
+        message = choice.get("message", {}) or {}
+        return LlmResponseBundle(
+            parsed_payload={},
+            raw_text=_extract_chat_completion_text(message),
+            reasoning_text=_extract_chat_completion_reasoning(message),
+            finish_reason=str(choice.get("finish_reason", "") or "").strip(),
+            usage=_extract_usage(body),
+            raw_response=body,
+        )
+
+    def _execute_chat_streaming_payload(
+        self,
+        client: httpx.Client,
+        payload: dict[str, Any],
+        *,
+        stream_callback: Callable[[str, str], None],
+    ) -> LlmResponseBundle:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        finish_reason = ""
+        usage = LlmUsageSnapshot(
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            reasoning_tokens=0,
+            cached_tokens=0,
+        )
+        last_body: dict[str, Any] = {}
+        with client.stream(
+            "POST",
+            f"{self.config.base_url.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw or raw == "[DONE]":
+                    continue
+                body = json.loads(raw)
+                last_body = body
+                choice = body.get("choices", [{}])[0]
+                delta = choice.get("delta", {}) or {}
+                content_piece = _extract_chat_completion_text(delta)
+                reasoning_piece = _extract_chat_completion_reasoning(delta)
+                if reasoning_piece:
+                    reasoning_parts.append(reasoning_piece)
+                    stream_callback("reasoning", reasoning_piece)
+                if content_piece:
+                    content_parts.append(content_piece)
+                    stream_callback("content", content_piece)
+                if choice.get("finish_reason"):
+                    finish_reason = str(choice.get("finish_reason") or "")
+                if body.get("usage"):
+                    usage = _extract_usage(body)
+        return LlmResponseBundle(
+            parsed_payload={},
+            raw_text="".join(content_parts).strip(),
+            reasoning_text="".join(reasoning_parts).strip(),
+            finish_reason=finish_reason,
+            usage=usage,
+            raw_response=last_body,
+        )
+
+    def _apply_openai_optional_controls(
+        self,
+        payload: dict[str, Any],
+        *,
+        responses_api: bool,
+    ) -> None:
+        if self.config.temperature is not None:
+            payload["temperature"] = self.config.temperature
+        if self.config.reasoning_effort:
+            if responses_api:
+                payload["reasoning"] = {"effort": self.config.reasoning_effort}
+            else:
+                payload["reasoning_effort"] = self.config.reasoning_effort
 
 
 class GroundedLlmAgent(BaseAnalysisAgent):
@@ -486,6 +842,7 @@ class GroundedLlmAgent(BaseAnalysisAgent):
         max_output_tokens: int = 1_200,
         event_index: int = 0,
     ) -> None:
+        _ensure_grounding_runtime_available()
         self.client = client
         self.max_messages = max_messages
         self.max_rendered_messages = max_rendered_messages
@@ -804,6 +1161,135 @@ def _extract_usage(body: dict[str, Any]) -> LlmUsageSnapshot:
         ),
         cached_tokens=int(prompt_details.get("cached_tokens", 0) or 0),
     )
+
+
+def _ensure_grounding_runtime_available() -> None:
+    if _GROUNDING_IMPORT_ERROR is None:
+        return
+    raise RuntimeError(
+        "Grounded LLM analysis runtime is unavailable because dependent analysis modules "
+        f"failed to import: {_GROUNDING_IMPORT_ERROR}"
+    ) from _GROUNDING_IMPORT_ERROR
+
+
+def _build_openai_input_image(image: MultimodalInputImage) -> dict[str, Any]:
+    resolved_path = image.path.expanduser().resolve()
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Multimodal image does not exist: {resolved_path}")
+    mime_type = image.mime_type
+    if not mime_type:
+        guessed, _ = mimetypes.guess_type(str(resolved_path))
+        mime_type = guessed or "image/jpeg"
+    encoded = base64.b64encode(resolved_path.read_bytes()).decode("ascii")
+    return {
+        "type": "input_image",
+        "image_url": f"data:{mime_type};base64,{encoded}",
+    }
+
+
+def _build_openai_chat_text_payload(
+    *,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_output_tokens: int,
+    temperature: float | None,
+    reasoning_effort: str | None,
+    stream: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": max_output_tokens,
+    }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def _build_openai_chat_multimodal_payload(
+    *,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    images: Iterable[MultimodalInputImage],
+    max_output_tokens: int,
+    temperature: float | None,
+    reasoning_effort: str | None,
+    stream: bool = False,
+) -> dict[str, Any]:
+    content: list[dict[str, Any]] = []
+    if user_prompt.strip():
+        content.append({"type": "text", "text": user_prompt.strip()})
+    for index, image in enumerate(images, start=1):
+        if image.label:
+            content.append({"type": "text", "text": f"[image {index} label] {image.label.strip()}"})
+        response_item = _build_openai_input_image(image)
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": response_item["image_url"]},
+            }
+        )
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": max_output_tokens,
+    }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    if stream:
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def _should_fallback_to_chat_completions(exc: httpx.HTTPStatusError) -> bool:
+    response = exc.response
+    request = exc.request
+    return (
+        response is not None
+        and request is not None
+        and response.status_code in {404, 405}
+        and str(request.url).rstrip("/").endswith("/responses")
+    )
+
+
+def _extract_chat_completion_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n".join(parts).strip()
+    return ""
+
+
+def _extract_chat_completion_reasoning(message: dict[str, Any]) -> str:
+    for key in ("reasoning_content", "reasoning", "reasoning_text"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
 
 
 def _extract_openai_output_text(body: dict[str, Any]) -> str:

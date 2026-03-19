@@ -1,0 +1,121 @@
+Analysis Window Selection Review
+
+1. 当前系统在做什么
+  1.1 先按 raw 消息切 session
+    - 入口: `AnalysisSubstrate._resolve_time_window(...)`
+    - 切分: `AnalysisSubstrate._sessionize(...)`
+    - 打分: `AnalysisSubstrate._window_signal_score(...)`
+  1.2 当前 auto 选择主要看 raw 高信号
+    - message 数
+    - sender 数
+    - reply
+    - forward
+    - nested forward
+    - share/system marker
+    - 低信息惩罚
+    - 重复噪音惩罚
+  1.3 当前 `shi_focus` 的作用
+    - 只在窗口已经选中之后，作为 overlay/解释层进入分析材料
+    - 它能补:
+      - processed_text
+      - decision_summary
+      - annotations
+    - 它暂时不能决定:
+      - 应该优先分析哪一段时间窗
+
+2. 当前这件事为什么还不够
+  2.1 对通用分析来说，raw 高信号选择没有问题
+  2.2 对 `史数据统计群` 这种混合群来说，还差半步
+    - 群里同时有:
+      - 集中搬 shi / forward dump
+      - debugging / export / watch / onebot / napcat 对接
+    - 两种内容都可能形成 "高信号窗口"
+  2.3 现在的风险
+    - 系统可能选中一个很热闹的 debug 窗口
+    - 然后才在窗口内部做 `shi_focus` 压缩
+    - 这样方向还是可能被带偏
+
+3. 下一步准备怎么做
+  3.1 不推翻现有 raw selector
+    - 保留 `_window_signal_score(...)`
+    - 保留 raw top-N 候选窗口
+  3.2 只在第二阶段做 rerank
+    - 先选 raw top-N 候选
+    - 再结合 `shi_focus` / preprocess overlay 对这些候选重排
+  3.3 最终输出三组分数
+    - `raw_signal_score`
+    - `directive_bias_score`
+    - `final_selection_score`
+
+4. `shi_focus` 偏置会看什么
+  4.1 加分项
+    - forward 密度高
+    - nested forward 多
+    - recurrence / 重复传播密度高
+    - retained target ratio 高
+    - multimodal asset mix 丰富
+    - expired/missing 但上下文仍存在
+  4.2 减分项
+    - `strict_focus_non_target` 比例高
+    - `runtime_debug` / `cli_workflow` / `dev_ops` 比例高
+    - debug 关键词密度高
+    - debug attachment 密度高
+    - 低价值短闲聊很多
+
+5. 这一步不会做什么
+  5.1 不会让 preprocess 变成新的 truth source
+  5.2 不会直接删除候选窗口
+  5.3 不会改 manual range 的行为
+  5.4 不会把 `shi_focus` 规则全局强塞给所有分析任务
+
+6. 这一步真正带来的好处
+  6.1 对搬 shi分析更聚焦
+    - 更容易优先挑中 forward 爆发段
+    - 更容易绕开 debug 主导段
+  6.2 对后续 analysis pack 更省上下文预算
+  6.3 对人工审阅更友好
+    - 能明确看到:
+      - raw 为什么高分
+      - `shi_focus` 为什么加/减分
+  6.4 对后续接 LLM 更稳
+    - 少把预算烧在 dev/debug 噪音上
+
+7. 代码上准备落在哪
+  7.1 主文件
+    - `src/qq_data_analysis/substrate.py`
+  7.2 当前函数保留
+    - `_sessionize(...)`
+    - `_window_signal_score(...)`
+  7.3 新增函数
+    - `_candidate_window_bias_score(...)`
+    - `_collect_window_overlay_stats(...)`
+  7.4 相关辅助来源
+    - `src/qq_data_analysis/preprocessors/context_filter.py`
+    - `src/qq_data_process/preprocess_profiles.py`
+
+8. rationale 以后准备长什么样
+  8.1 当前只会写 raw signal notes
+  8.2 增强后会同时写
+    - raw notes
+    - bias notes
+  8.3 目标效果
+    - 人一眼能看出:
+      - 是 raw 选中的
+      - 还是被 `shi_focus` 明显抬上来的
+
+9. 本地验证计划
+  9.1 用 `group_751365230` 真数据
+    - 看集中搬 shi dump 是否仍然排在前面
+  9.2 用 debug-heavy 窗口对照
+    - 看它是否仍能进 raw top-N
+    - 但在 rerank 后排到后面
+  9.3 不带 preprocess 再跑一遍
+    - 行为应与当前 auto 完全一致
+  9.4 manual range 再跑一遍
+    - 不应触发 rerank
+
+10. 当前推荐的实际开发顺序
+  10.1 先实现 top-N raw candidate 收集
+  10.2 再实现 `_candidate_window_bias_score(...)`
+  10.3 再把 raw+bias rationale 写进 `ResolvedTimeWindow`
+  10.4 最后跑 `group_751365230` 本地 smoke 验证

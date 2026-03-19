@@ -4,7 +4,10 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from typing import Any
 
+from .benshi_agent import BenshiMasterAgent
+from .benshi_llm_agent import BenshiMasterLlmAgent
 from .models import AnalysisAgentOutput, AnalysisEvidenceItem, AnalysisMaterials
+from .summary import build_input_semantics_lines, build_material_input_semantics
 
 
 class BaseAnalysisAgent(ABC):
@@ -32,6 +35,7 @@ class BaseStatsAgent(BaseAnalysisAgent):
         self, materials: AnalysisMaterials, prepared: Any
     ) -> AnalysisAgentOutput:
         stats = materials.stats
+        input_semantics = build_material_input_semantics(materials)
         report = (
             "## Base Stats\n"
             f"- 分析对象: {materials.target.display_id}\n"
@@ -43,7 +47,8 @@ class BaseStatsAgent(BaseAnalysisAgent):
             f"- 转发占比: {stats.forward_ratio:.2%}\n"
             f"- 回复占比: {stats.reply_ratio:.2%}\n"
             f"- 表情占比: {stats.emoji_ratio:.2%}\n"
-            f"- 低信息占比: {stats.low_information_ratio:.2%}"
+            f"- 低信息占比: {stats.low_information_ratio:.2%}\n\n"
+            + "\n".join(build_input_semantics_lines(materials))
         )
         return AnalysisAgentOutput(
             agent_name=self.agent_name,
@@ -60,6 +65,20 @@ class BaseStatsAgent(BaseAnalysisAgent):
                 "low_r": round(stats.low_information_ratio, 4),
                 "hrs": stats.hourly_distribution,
                 "days": stats.daily_distribution,
+                "input_semantics": {
+                    "delivery_profile_guess": input_semantics.delivery_profile_guess,
+                    "raw_visible_messages": input_semantics.raw_visible_messages,
+                    "processed_overlay_messages": input_semantics.processed_overlay_messages,
+                    "processed_only_messages": input_semantics.processed_only_messages,
+                    "raw_plus_processed_messages": input_semantics.raw_plus_processed_messages,
+                    "source_linked_messages": input_semantics.source_linked_messages,
+                    "annotation_count": input_semantics.annotation_count,
+                    "top_labels": [
+                        {"label": label, "count": count}
+                        for label, count in input_semantics.top_labels
+                    ],
+                    "notes": input_semantics.notes,
+                },
             },
         )
 
@@ -74,12 +93,14 @@ class ContentCompositionAgent(BaseAnalysisAgent):
         top_tags = materials.tag_summaries[:5]
         top_events = materials.candidate_events[:3]
         top_people = materials.participant_profiles[:3]
+        input_semantics = build_material_input_semantics(materials)
         notes = self._build_notes(materials)
         evidence = self._collect_evidence(
             top_events, top_people, limit=max(3, len(top_events) * 2)
         )
 
         report_lines = ["## Content Composition"]
+        report_lines.extend(build_input_semantics_lines(materials))
         if top_tags:
             report_lines.append(
                 "- 主要成分标签: "
@@ -151,6 +172,14 @@ class ContentCompositionAgent(BaseAnalysisAgent):
                 ],
                 "notes": notes,
                 "themes": materials.theme_queries,
+                "input_semantics": {
+                    "delivery_profile_guess": input_semantics.delivery_profile_guess,
+                    "processed_overlay_messages": input_semantics.processed_overlay_messages,
+                    "processed_only_messages": input_semantics.processed_only_messages,
+                    "raw_plus_processed_messages": input_semantics.raw_plus_processed_messages,
+                    "source_linked_messages": input_semantics.source_linked_messages,
+                    "annotation_count": input_semantics.annotation_count,
+                },
             },
             evidence=evidence,
         )
@@ -172,6 +201,13 @@ class ContentCompositionAgent(BaseAnalysisAgent):
             notes.append("窗口内存在缺失媒体证据，需要保留不确定性")
         if "absurd_or_bizarre" in tag_map:
             notes.append("存在怪诞或摸不着头脑的内容结构")
+        input_semantics = build_material_input_semantics(materials)
+        if input_semantics.delivery_profile_guess == "raw_plus_processed":
+            notes.append("当前输入混合 raw 与 processed 视图，应把 derived summary 与原始消息分开理解")
+        if input_semantics.processed_only_messages:
+            notes.append("存在 processed-only 记录，引用时不得把派生摘要当成原始发言")
+        if input_semantics.annotation_count:
+            notes.append("预处理 annotation 已进入材料层，可作为辅助摘要而不是真相层")
         if not notes and materials.theme_queries:
             notes.append("当前窗口更偏向普通内容成分分布，异常标签并不密集")
         return notes
@@ -208,4 +244,6 @@ def build_default_agent_registry() -> dict[str, BaseAnalysisAgent]:
     return {
         "base_stats": BaseStatsAgent(),
         "content_composition": ContentCompositionAgent(),
+        "benshi_master": BenshiMasterAgent(),
+        "benshi_master_llm": BenshiMasterLlmAgent(),
     }

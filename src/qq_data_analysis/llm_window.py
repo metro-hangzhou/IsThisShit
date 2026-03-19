@@ -8,11 +8,17 @@ from typing import Any, Callable, Protocol
 
 from qq_data_process.utils import preview_text
 
+from .benshi_prompting import (
+    build_benshi_master_system_prompt,
+    build_benshi_master_user_tail,
+    resolve_benshi_prompt_scaffold,
+)
 from .llm_agent import (
     DeepSeekAnalysisClient,
     DeepSeekRuntimeConfig,
     OpenAICompatibleAnalysisClient,
     LlmResponseBundle,
+    apply_openai_prompt_family_defaults,
     load_deepseek_runtime_config,
     load_openai_compatible_runtime_config,
 )
@@ -30,6 +36,12 @@ from .models import (
     MediaEvidenceScaffoldItem,
     MediaInferenceScaffold,
     MediaCoverageSummary,
+)
+from .summary import (
+    build_llm_result_summary_payload,
+    build_material_input_semantics,
+    build_processed_overlay_references,
+    format_message_for_display,
 )
 
 STRUCTURED_TOKEN_RE = re.compile(r"\[[^\]]+\]")
@@ -179,6 +191,7 @@ class WholeWindowPackBuilder:
         self.config = config
 
     def build(self, materials: AnalysisMaterials) -> AnalysisPack:
+        input_semantics = build_material_input_semantics(materials)
         representative_messages = self._representative_messages(materials)
         reference_pool = self._reference_pool(materials, representative_messages)
         retrieval_snippets = self._retrieval_snippets(materials)
@@ -189,14 +202,20 @@ class WholeWindowPackBuilder:
             materials.messages,
             media_coverage,
         )
-        special_content_types = self._special_content_types(materials.messages)
+        special_content_types = self._special_content_types(materials, input_semantics)
         special_content_types["text_gap_inferred_items"] = len(
             media_inference_scaffold.inferred
         )
         special_content_types["text_gap_unknown_items"] = len(
             media_inference_scaffold.unknown
         )
+        special_content_types["processed_overlay_reference_count"] = sum(
+            1 for item in reference_pool if item.reason == "processed_overlay"
+        )
         warnings = list(materials.warnings)
+        warnings.extend(
+            f"Input semantics note: {note}" for note in input_semantics.notes
+        )
 
         if self.config.include_retrieval_snippets and not retrieval_snippets:
             warnings.append(
@@ -253,14 +272,18 @@ class WholeWindowPackBuilder:
         def add_message(message: AnalysisMessageRecord) -> None:
             if message.message_uid in seen or len(selected) >= limit:
                 return
+            display_content, display_tags = format_message_for_display(
+                message,
+                max_chars=220,
+            )
             selected.append(
                 AnalysisPackMessageSample(
                     message_uid=message.message_uid,
                     timestamp_iso=message.timestamp_iso,
                     sender_id=message.sender_id,
                     sender_name=message.sender_name,
-                    content=preview_text(message.content.replace("\n", " / "), 220),
-                    tags=message.features.message_tags[:4],
+                    content=display_content,
+                    tags=display_tags[:4],
                 )
             )
             seen.add(message.message_uid)
@@ -331,11 +354,21 @@ class WholeWindowPackBuilder:
             )
             seen.add(sample.message_uid)
 
+        if len(selected) < self.config.max_reference_messages:
+            for item in build_processed_overlay_references(
+                materials,
+                limit=self.config.max_reference_messages - len(selected),
+            ):
+                add(item)
+
         return selected
 
     def _special_content_types(
-        self, messages: list[AnalysisMessageRecord]
+        self,
+        materials: AnalysisMaterials,
+        input_semantics: Any,
     ) -> dict[str, int]:
+        messages = materials.messages
         counts = {
             "image_messages": sum(
                 1 for item in messages if item.features.image_count > 0
@@ -381,6 +414,22 @@ class WholeWindowPackBuilder:
                 ("system", "graytip", "tip"),
             )
         )
+        counts["raw_visible_messages"] = input_semantics.raw_visible_messages
+        counts["processed_overlay_messages"] = input_semantics.processed_overlay_messages
+        counts["processed_only_messages"] = input_semantics.processed_only_messages
+        counts["raw_plus_processed_messages"] = input_semantics.raw_plus_processed_messages
+        counts["source_linked_messages"] = input_semantics.source_linked_messages
+        counts["annotation_messages"] = input_semantics.annotation_messages
+        counts["annotation_count"] = input_semantics.annotation_count
+        profile_map = {
+            "raw_only": 1,
+            "processed_only": 2,
+            "raw_plus_processed": 3,
+        }
+        counts["delivery_profile_guess"] = profile_map.get(
+            input_semantics.delivery_profile_guess,
+            0,
+        )
         return counts
 
     def _retrieval_snippets(self, materials: AnalysisMaterials) -> list[str]:
@@ -395,6 +444,7 @@ class WholeWindowPackBuilder:
         return snippets[: self.config.max_retrieval_snippets]
 
     def _pack_summary(self, materials: AnalysisMaterials) -> str:
+        input_semantics = build_material_input_semantics(materials)
         top_tags = (
             ", ".join(
                 f"{item.tag}:{item.count}" for item in materials.tag_summaries[:5]
@@ -415,7 +465,10 @@ class WholeWindowPackBuilder:
             f"Messages={materials.stats.message_count}; "
             f"Senders={materials.stats.sender_count}; "
             f"TopTags={top_tags}; "
-            f"TopPeople={top_people}"
+            f"TopPeople={top_people}; "
+            f"DeliveryProfile={input_semantics.delivery_profile_guess}; "
+            f"ProcessedOverlay={input_semantics.processed_overlay_messages}; "
+            f"ProcessedOnly={input_semantics.processed_only_messages}"
         )
 
     def _media_coverage(
@@ -946,6 +999,9 @@ class WholeWindowLlmAnalyzer:
         )
 
     def _system_prompt(self) -> str:
+        benshi_scaffold = resolve_benshi_prompt_scaffold(self.config.prompt_version)
+        if benshi_scaffold is not None:
+            return build_benshi_master_system_prompt(benshi_scaffold)
         if self.config.prompt_version == "benshi_window_v2":
             return (
                 "你是QQ群/好友聊天记录的文本优先分析员，正在为 Benshi 工作流生成第二轮报告。\n"
@@ -996,12 +1052,34 @@ class WholeWindowLlmAnalyzer:
         )
 
     def _user_prompt(self, pack: AnalysisPack) -> str:
+        benshi_scaffold = resolve_benshi_prompt_scaffold(self.config.prompt_version)
+        delivery_profile_lookup = {
+            1: "raw_only",
+            2: "processed_only",
+            3: "raw_plus_processed",
+        }
+        delivery_profile_guess = delivery_profile_lookup.get(
+            pack.special_content_types.get("delivery_profile_guess", 0),
+            "raw_only",
+        )
         lines = [
             "# Analysis Pack",
             f"- Target: {pack.target.display_name or pack.target.display_id}",
             f"- TimeWindow: {pack.chosen_time_window.start_timestamp_iso} -> {pack.chosen_time_window.end_timestamp_iso}",
             f"- Rationale: {pack.chosen_time_window.rationale}",
             f"- PackSummary: {pack.pack_summary}",
+            "",
+            "## Input Semantics",
+            f"- DeliveryProfileGuess: {delivery_profile_guess}",
+            f"- RawVisibleMessages: {pack.special_content_types.get('raw_visible_messages', 0)}",
+            f"- ProcessedOverlayMessages: {pack.special_content_types.get('processed_overlay_messages', 0)}",
+            f"- ProcessedOnlyMessages: {pack.special_content_types.get('processed_only_messages', 0)}",
+            f"- RawPlusProcessedMessages: {pack.special_content_types.get('raw_plus_processed_messages', 0)}",
+            f"- SourceLinkedMessages: {pack.special_content_types.get('source_linked_messages', 0)}",
+            f"- AnnotationMessages: {pack.special_content_types.get('annotation_messages', 0)}",
+            f"- AnnotationCount: {pack.special_content_types.get('annotation_count', 0)}",
+            "- Rule: processed summaries / compaction outputs are derived views, not original chat quotes.",
+            "- Rule: when raw and processed material coexist, prefer raw text as the factual baseline and treat processed overlays as helper context.",
             "",
             "## Basic Stats",
             f"- Messages: {pack.stats.message_count}",
@@ -1075,6 +1153,22 @@ class WholeWindowLlmAnalyzer:
                     f"contradictions={','.join(item.contradiction_signals) or 'none'}"
                 )
 
+        processed_overlay_refs = [
+            item for item in pack.message_reference_pool if item.reason == "processed_overlay"
+        ]
+        lines.extend(["", "## Processed Overlay Hints"])
+        if processed_overlay_refs:
+            lines.append(
+                "- Rule: entries below are processed/derived hints linked back to source message ids; use them as auxiliary summaries only."
+            )
+            for item in processed_overlay_refs[:12]:
+                lines.append(
+                    f"- {item.timestamp_iso} | {item.sender_id} | "
+                    f"tags={','.join(item.tags) or 'none'} | {item.content}"
+                )
+        else:
+            lines.append("- none")
+
         lines.extend(["", "## Image Caption Evidence"])
         if pack.image_caption_samples:
             lines.append(
@@ -1139,12 +1233,16 @@ class WholeWindowLlmAnalyzer:
 
         lines.extend(["", "## Message Reference Pool"])
         for item in pack.message_reference_pool:
+            if item.reason == "processed_overlay":
+                continue
             lines.append(
                 f"- {item.timestamp_iso} | {item.sender_id} | {item.reason} | {item.content}"
             )
 
         lines.append("")
-        if self.config.prompt_version == "benshi_window_v2":
+        if benshi_scaffold is not None:
+            lines.extend(build_benshi_master_user_tail(benshi_scaffold))
+        elif self.config.prompt_version == "benshi_window_v2":
             lines.extend(
                 [
                     "请基于以上 analysis pack 输出一份 Benshi v2 长报告。",
@@ -1196,6 +1294,9 @@ def save_llm_analysis_result(
     report_path = out_dir / f"{prefix}.report.md"
     usage_path = out_dir / f"{prefix}.usage.json"
     prompt_path = out_dir / f"{prefix}.prompt.txt"
+    summary_path = out_dir / f"{prefix}.summary.json"
+    summary_report_path = out_dir / f"{prefix}.summary.md"
+    summary_payload = build_llm_result_summary_payload(result=result, plan=plan)
 
     analysis_pack_path.write_text(
         json.dumps(result.pack.model_dump(mode="json"), ensure_ascii=False, indent=2),
@@ -1214,6 +1315,15 @@ def save_llm_analysis_result(
                 "chosen_time_window": result.pack.chosen_time_window.model_dump(
                     mode="json"
                 ),
+                "artifacts_summary": {
+                    "analysis_pack_path": str(analysis_pack_path),
+                    "report_path": str(report_path),
+                    "usage_path": str(usage_path),
+                    "prompt_path": str(prompt_path),
+                    "summary_path": str(summary_path),
+                    "summary_report_path": str(summary_report_path),
+                },
+                "result_summary": summary_payload,
             },
             ensure_ascii=False,
             indent=2,
@@ -1227,6 +1337,33 @@ def save_llm_analysis_result(
     )
     prompt_path.write_text(
         "\n\n--- USER PROMPT ---\n\n".join([plan.system_prompt, plan.user_prompt]),
+        encoding="utf-8",
+    )
+    summary_path.write_text(
+        json.dumps(summary_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    summary_report_path.write_text(
+        "\n".join(
+            [
+                "# LLM Analysis Summary",
+                f"- provider: {result.provider_name}",
+                f"- model: {result.model_name}",
+                f"- prompt_version: {result.prompt_version}",
+                f"- target: {result.pack.target.display_name or result.pack.target.display_id}",
+                f"- time_window: {result.pack.chosen_time_window.start_timestamp_iso} -> {result.pack.chosen_time_window.end_timestamp_iso}",
+                f"- pack_summary: {result.pack.pack_summary}",
+                f"- message_count: {result.pack.stats.message_count}",
+                f"- sender_count: {result.pack.stats.sender_count}",
+                f"- estimated_input_tokens: {plan.estimated_input_tokens}",
+                f"- completion_tokens: {result.usage.completion_tokens}",
+                f"- total_tokens: {result.usage.total_tokens}",
+                f"- delivery_profile_guess: {summary_payload['input_semantics']['delivery_profile_guess']}",
+                f"- processed_overlay_messages: {summary_payload['input_semantics']['processed_overlay_messages']}",
+                f"- processed_only_messages: {summary_payload['input_semantics']['processed_only_messages']}",
+                f"- warnings: {len(result.warnings)}",
+            ]
+        ),
         encoding="utf-8",
     )
 
@@ -1248,6 +1385,7 @@ def load_text_analysis_client(
     config_path: Path,
     *,
     model: str | None = None,
+    prompt_family: str | None = None,
 ) -> WindowReportClient:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     provider = str(raw.get("provider", "")).strip().lower()
@@ -1257,6 +1395,10 @@ def load_text_analysis_client(
         runtime = load_openai_compatible_runtime_config(config_path)
         if model:
             runtime.model = model
+        runtime = apply_openai_prompt_family_defaults(
+            runtime,
+            prompt_family=prompt_family,
+        )
         return OpenAICompatibleAnalysisClient(runtime)
     runtime = load_deepseek_runtime_config(config_path)
     if model:
@@ -1300,6 +1442,8 @@ def _provider_name_from_client(client: Any) -> str:
 
 def _model_name_from_client(client: Any) -> str:
     if isinstance(client, DeepSeekAnalysisClient):
+        return client.config.model
+    if isinstance(client, OpenAICompatibleAnalysisClient):
         return client.config.model
     return getattr(client, "model_name", "unknown")
 

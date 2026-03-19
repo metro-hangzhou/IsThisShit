@@ -211,6 +211,10 @@ def materialize_snapshot_media(
                     }
                 )
     copied_map: dict[str, str] = {}
+    copied_content_map: dict[tuple[str, int, str], list[tuple[str, str]]] = {}
+    export_path_payloads: dict[str, tuple[Any, ...]] = {}
+    content_key_cache: dict[str, tuple[str, int, str] | None] = {}
+    content_match_cache: dict[tuple[str, str], bool] = {}
     resolution_cache: dict[tuple[Any, ...], tuple[Path | None, str]] = {}
     assets: list[MaterializedAsset] = []
     second_pass_candidates: list[tuple[MaterializedAsset, _AssetCandidate]] = []
@@ -395,12 +399,74 @@ def materialize_snapshot_media(
             )
             continue
 
+        content_key = _content_dedupe_key(
+            candidate,
+            resolved_path,
+            cache=content_key_cache,
+        )
+        # Content-level dedupe intentionally reuses the first successful export
+        # path for a payload, even if later references come from different local
+        # files or nominal names.
+        matched_rel_path = _matching_export_rel_path_for_content_key(
+            content_key=content_key,
+            resolved_path=resolved_path,
+            copied_content_map=copied_content_map,
+            compare_cache=content_match_cache,
+        )
+        if matched_rel_path is not None:
+            asset.status = "reused"
+            asset.exported_rel_path = matched_rel_path
+            copied_map[dedupe_key] = asset.exported_rel_path
+            assets.append(asset)
+            reused_count += 1
+            step_elapsed_s = round(monotonic() - step_started, 4)
+            _emit_materialization_step_trace(
+                progress_callback,
+                stage="done",
+                current=len(assets),
+                total=total_candidates,
+                candidate=candidate,
+                status=asset.status,
+                resolver=asset.resolver,
+                resolved_source_path=asset.resolved_source_path,
+                step_elapsed_s=step_elapsed_s,
+            )
+            _emit_materialization_progress(
+                progress_callback,
+                current=len(assets),
+                total=total_candidates,
+                candidate=candidate,
+                copied=copied_count,
+                reused=reused_count,
+                missing=missing_count,
+                error=error_count,
+                status=asset.status,
+                resolver=asset.resolver,
+                step_elapsed_s=step_elapsed_s,
+            )
+            continue
+
         rel_path = _build_export_rel_path(candidate, resolved_path)
+        reuse_content_marker = content_key is not None and matched_rel_path is None and content_key not in copied_content_map
+        payload_marker = _payload_marker(
+            content_key=content_key if reuse_content_marker else None,
+            resolved_path_key=dedupe_key,
+        )
+        rel_path = _allocate_export_rel_path(
+            rel_path,
+            payload_marker=payload_marker,
+            used_payloads=export_path_payloads,
+        )
         target_path = assets_dir / rel_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(resolved_path, target_path)
         except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
+            _release_allocated_export_rel_path(
+                rel_path,
+                payload_marker=payload_marker,
+                used_payloads=export_path_payloads,
+            )
             asset.status = "error"
             asset.note = str(exc)
             assets.append(asset)
@@ -436,6 +502,10 @@ def materialize_snapshot_media(
         asset.status = "copied"
         asset.exported_rel_path = rel_path.as_posix()
         copied_map[dedupe_key] = asset.exported_rel_path
+        if content_key is not None:
+            copied_content_map.setdefault(content_key, []).append(
+                (str(resolved_path.resolve()).lower(), asset.exported_rel_path)
+            )
         assets.append(asset)
         copied_count += 1
         step_elapsed_s = round(monotonic() - step_started, 4)
@@ -501,12 +571,46 @@ def materialize_snapshot_media(
                     reused_count += 1
                     recovered_count += 1
                     continue
+                content_key = _content_dedupe_key(
+                    candidate,
+                    resolved_path,
+                    cache=content_key_cache,
+                )
+                matched_rel_path = _matching_export_rel_path_for_content_key(
+                    content_key=content_key,
+                    resolved_path=resolved_path,
+                    copied_content_map=copied_content_map,
+                    compare_cache=content_match_cache,
+                )
+                if matched_rel_path is not None:
+                    asset.status = "reused"
+                    asset.exported_rel_path = matched_rel_path
+                    copied_map[dedupe_key] = asset.exported_rel_path
+                    missing_count -= 1
+                    reused_count += 1
+                    recovered_count += 1
+                    continue
                 rel_path = _build_export_rel_path(candidate, resolved_path)
+                reuse_content_marker = content_key is not None and matched_rel_path is None and content_key not in copied_content_map
+                payload_marker = _payload_marker(
+                    content_key=content_key if reuse_content_marker else None,
+                    resolved_path_key=dedupe_key,
+                )
+                rel_path = _allocate_export_rel_path(
+                    rel_path,
+                    payload_marker=payload_marker,
+                    used_payloads=export_path_payloads,
+                )
                 target_path = assets_dir / rel_path
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     shutil.copy2(resolved_path, target_path)
                 except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
+                    _release_allocated_export_rel_path(
+                        rel_path,
+                        payload_marker=payload_marker,
+                        used_payloads=export_path_payloads,
+                    )
                     asset.status = "error"
                     asset.note = str(exc)
                     missing_count -= 1
@@ -515,6 +619,10 @@ def materialize_snapshot_media(
                 asset.status = "copied"
                 asset.exported_rel_path = rel_path.as_posix()
                 copied_map[dedupe_key] = asset.exported_rel_path
+                if content_key is not None:
+                    copied_content_map.setdefault(content_key, []).append(
+                        (str(resolved_path.resolve()).lower(), asset.exported_rel_path)
+                    )
                 missing_count -= 1
                 copied_count += 1
                 recovered_count += 1
@@ -1893,6 +2001,182 @@ def _looks_like_local_path(value: str) -> bool:
 
 def _short_hash(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
+
+
+def _content_dedupe_key(
+    candidate: _AssetCandidate,
+    resolved_path: Path,
+    *,
+    cache: dict[str, tuple[str, int, str] | None],
+) -> tuple[str, int, str] | None:
+    path_key = str(resolved_path.resolve()).lower()
+    if path_key in cache:
+        return cache[path_key]
+    try:
+        size = resolved_path.stat().st_size
+    except OSError:
+        cache[path_key] = None
+        return None
+
+    digest = _content_signature(resolved_path, size=size)
+    if not digest:
+        cache[path_key] = None
+        return None
+    key = (candidate.asset_type, size, digest)
+    cache[path_key] = key
+    return key
+
+
+def _content_signature(path: Path, *, size: int) -> str | None:
+    try:
+        with path.open("rb") as handle:
+            if size <= 256 * 1024:
+                digest = hashlib.blake2b(digest_size=16)
+                digest.update(handle.read())
+                return f"full:{digest.hexdigest()}"
+
+            sample_size = 64 * 1024
+            window = min(sample_size, size)
+            positions = [0]
+            middle = max(0, (size // 2) - (window // 2))
+            tail = max(0, size - window)
+            for position in (middle, tail):
+                if position not in positions:
+                    positions.append(position)
+
+            digest = hashlib.blake2b(digest_size=16)
+            digest.update(str(size).encode("ascii"))
+            for position in positions:
+                handle.seek(position)
+                chunk = handle.read(window)
+                digest.update(str(position).encode("ascii"))
+                digest.update(chunk)
+            return f"sample:{digest.hexdigest()}"
+    except OSError:
+        return None
+
+
+def _matching_export_rel_path_for_content_key(
+    *,
+    content_key: tuple[str, int, str] | None,
+    resolved_path: Path,
+    copied_content_map: dict[tuple[str, int, str], list[tuple[str, str]]],
+    compare_cache: dict[tuple[str, str], bool],
+) -> str | None:
+    if content_key is None:
+        return None
+    entries = copied_content_map.get(content_key)
+    if not entries:
+        return None
+    resolved_key = str(resolved_path.resolve()).lower()
+    for existing_source_key, exported_rel_path in entries:
+        if existing_source_key == resolved_key:
+            return exported_rel_path
+        if _file_contents_equal(
+            Path(existing_source_key),
+            resolved_path,
+            cache=compare_cache,
+        ):
+            return exported_rel_path
+    return None
+
+
+def _file_contents_equal(
+    left: Path,
+    right: Path,
+    *,
+    cache: dict[tuple[str, str], bool],
+) -> bool:
+    left_key = str(left.resolve()).lower()
+    right_key = str(right.resolve()).lower()
+    pair = tuple(sorted((left_key, right_key)))
+    if pair in cache:
+        return cache[pair]
+    try:
+        left_stat = left.stat()
+        right_stat = right.stat()
+    except OSError:
+        cache[pair] = False
+        return False
+    if left_stat.st_size != right_stat.st_size:
+        cache[pair] = False
+        return False
+    chunk_size = 1024 * 1024
+    try:
+        with left.open("rb") as left_handle, right.open("rb") as right_handle:
+            while True:
+                left_chunk = left_handle.read(chunk_size)
+                right_chunk = right_handle.read(chunk_size)
+                if left_chunk != right_chunk:
+                    cache[pair] = False
+                    return False
+                if not left_chunk:
+                    cache[pair] = True
+                    return True
+    except OSError:
+        cache[pair] = False
+        return False
+
+
+def _payload_marker(
+    *,
+    content_key: tuple[str, int, str] | None,
+    resolved_path_key: str,
+) -> tuple[Any, ...]:
+    if content_key is not None:
+        return ("content", *content_key)
+    return ("source_path", resolved_path_key)
+
+
+def _allocate_export_rel_path(
+    rel_path: Path,
+    *,
+    payload_marker: tuple[Any, ...],
+    used_payloads: dict[str, tuple[Any, ...]],
+) -> Path:
+    rel_key = rel_path.as_posix().lower()
+    existing = used_payloads.get(rel_key)
+    if existing is None or existing == payload_marker:
+        used_payloads[rel_key] = payload_marker
+        return rel_path
+
+    stem = rel_path.stem
+    suffix = rel_path.suffix
+    parent = rel_path.parent
+    marker_token = _payload_marker_token(payload_marker)
+    candidate = parent / f"{stem}_{marker_token}{suffix}"
+    candidate_key = candidate.as_posix().lower()
+    if candidate_key not in used_payloads or used_payloads[candidate_key] == payload_marker:
+        used_payloads[candidate_key] = payload_marker
+        return candidate
+
+    counter = 2
+    while True:
+        numbered = parent / f"{stem}_{marker_token}_{counter}{suffix}"
+        numbered_key = numbered.as_posix().lower()
+        if numbered_key not in used_payloads or used_payloads[numbered_key] == payload_marker:
+            used_payloads[numbered_key] = payload_marker
+            return numbered
+        counter += 1
+
+
+def _release_allocated_export_rel_path(
+    rel_path: Path,
+    *,
+    payload_marker: tuple[Any, ...],
+    used_payloads: dict[str, tuple[Any, ...]],
+) -> None:
+    rel_key = rel_path.as_posix().lower()
+    if used_payloads.get(rel_key) == payload_marker:
+        used_payloads.pop(rel_key, None)
+
+
+def _payload_marker_token(payload_marker: tuple[Any, ...]) -> str:
+    if payload_marker and payload_marker[0] == "content" and len(payload_marker) >= 4:
+        return str(payload_marker[-1])[:8]
+    if len(payload_marker) >= 2:
+        return _short_hash(str(payload_marker[1]))
+    return _short_hash(repr(payload_marker))
 
 
 def _summarize_assets(assets: list[MaterializedAsset]) -> dict[str, int]:

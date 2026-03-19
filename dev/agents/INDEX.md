@@ -23,3 +23,5 @@ Specialized AGENT handbooks now live here:
   - preprocessing/indexing contracts and privacy/process policy
 - [llm_AGENTs.md](llm_AGENTs.md)
   - report-first LLM analysis policy and handoff contract
+- [Benshi_AGENTs.md](Benshi_AGENTs.md)
+  - first deep-analysis agent for 搬史/吃史 understanding, cultural judgment, and optional 接茬 probing

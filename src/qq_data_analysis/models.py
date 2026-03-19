@@ -72,6 +72,15 @@ class AnalysisEvidenceItem(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
+class AnalysisEvidenceRef(BaseModel):
+    kind: Literal["message", "asset", "thread", "forward_bundle", "annotation"] = "message"
+    message_id: str | None = None
+    asset_id: str | None = None
+    thread_id: str | None = None
+    segment_id: str | None = None
+    note: str | None = None
+
+
 class AnalysisTagSummary(BaseModel):
     tag: str
     count: int
@@ -186,6 +195,7 @@ class AnalysisMaterials(BaseModel):
     participant_profiles: list[ParticipantProfile] = Field(default_factory=list)
     theme_queries: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    input_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class AnalysisAgentOutput(BaseModel):
@@ -197,6 +207,20 @@ class AnalysisAgentOutput(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class DeterministicResult(BaseModel):
+    plugin_id: str
+    plugin_version: str
+    status: Literal["resolved", "uncertain", "unrecoverable", "info"] = "resolved"
+    summary: str
+    confidence: float = 0.0
+    modality_targets: list[str] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: list[AnalysisEvidenceRef] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    verdict: str | None = None
+    notes: list[str] = Field(default_factory=list)
+
+
 class AnalysisRunResult(BaseModel):
     run_id: str
     target: ResolvedAnalysisTarget
@@ -205,6 +229,7 @@ class AnalysisRunResult(BaseModel):
     summary_report: str
     compact_machine_output: str
     warnings: list[str] = Field(default_factory=list)
+    input_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class AnalysisPackMessageSample(BaseModel):
@@ -264,6 +289,8 @@ class MediaInferenceScaffold(BaseModel):
 
 
 class ImageCaptionSample(BaseModel):
+    cluster_id: str | None = None
+    cluster_kind: str | None = None
     message_uid: str
     timestamp_iso: str
     sender_id: str
@@ -295,6 +322,220 @@ class AnalysisPack(BaseModel):
         default_factory=MediaInferenceScaffold
     )
     image_caption_samples: list[ImageCaptionSample] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BenshiSelectedMessage(BaseModel):
+    message_uid: str
+    timestamp_iso: str
+    sender_id: str
+    sender_name: str | None = None
+    message_id: str | None = None
+    message_seq: str | None = None
+    content: str
+    text_content: str
+    processed_text: str | None = None
+    decision_summary: str | None = None
+    delivery_profile: str = "raw_only"
+    preprocess_labels: list[str] = Field(default_factory=list)
+    source_message_ids: list[str] = Field(default_factory=list)
+    source_thread_ids: list[str] = Field(default_factory=list)
+    asset_count: int = 0
+    asset_types: list[str] = Field(default_factory=list)
+    has_forward: bool = False
+    forward_depth: int = 0
+    missing_media_count: int = 0
+    message_tags: list[str] = Field(default_factory=list)
+
+
+class BenshiForwardSummary(BaseModel):
+    summary_id: str
+    outer_message_uid: str | None = None
+    outer_message_id: str | None = None
+    outer_timestamp_iso: str | None = None
+    outer_sender_id: str | None = None
+    outer_sender_name: str | None = None
+    preview_text: str | None = None
+    detailed_text: str | None = None
+    preview_lines: list[str] = Field(default_factory=list)
+    segment_summary: str | None = None
+    inner_message_count: int = 0
+    inner_asset_count: int = 0
+    inner_asset_type_counts: dict[str, int] = Field(default_factory=dict)
+    forward_depth_hint: int | None = None
+    evidence_message_uids: list[str] = Field(default_factory=list)
+
+
+class BenshiRecurrenceSummary(BaseModel):
+    summary_id: str
+    recurrence_key: str
+    basis: str
+    asset_type: str
+    file_name: str | None = None
+    occurrence_count: int = 0
+    distinct_chat_ids: list[str] = Field(default_factory=list)
+    resource_state_counts: dict[str, int] = Field(default_factory=dict)
+    materialization_status_counts: dict[str, int] = Field(default_factory=dict)
+    exported_rel_paths: list[str] = Field(default_factory=list)
+    evidence_message_ids: list[str] = Field(default_factory=list)
+    source_asset_ids: list[str] = Field(default_factory=list)
+    confidence: float = 0.0
+
+
+class BenshiParticipantRoleCandidate(BaseModel):
+    sender_id: str
+    sender_name: str | None = None
+    message_count: int
+    forward_message_count: int = 0
+    asset_message_count: int = 0
+    reply_message_count: int = 0
+    missing_media_message_count: int = 0
+    candidate_roles: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    evidence_message_uids: list[str] = Field(default_factory=list)
+
+
+class BenshiAssetSummary(BaseModel):
+    asset_type: str
+    reference_count: int = 0
+    message_count: int = 0
+    materialized_count: int = 0
+    missing_count: int = 0
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    top_file_names: list[str] = Field(default_factory=list)
+    representative_asset_ids: list[str] = Field(default_factory=list)
+
+
+class BenshiImageClusterSummary(BaseModel):
+    cluster_id: str
+    cluster_kind: str
+    member_count: int = 0
+    reference_count: int = 0
+    distinct_message_count: int = 0
+    representative_message_uid: str | None = None
+    representative_timestamp_iso: str | None = None
+    representative_file_name: str | None = None
+    representative_context_excerpt: str | None = None
+    file_name_examples: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    evidence_message_uids: list[str] = Field(default_factory=list)
+
+
+class BenshiMissingMediaGap(BaseModel):
+    gap_id: str
+    message_uid: str
+    message_id: str | None = None
+    timestamp_iso: str
+    sender_id: str
+    sender_name: str | None = None
+    asset_id: str | None = None
+    asset_type: str
+    file_name: str | None = None
+    status: str | None = None
+    resolver: str | None = None
+    exported_rel_path: str | None = None
+    context_excerpt: str | None = None
+    reason: str | None = None
+
+
+class BenshiPreprocessOverlayItem(BaseModel):
+    message_uid: str
+    delivery_profile: str = "raw_only"
+    processed_text: str | None = None
+    decision_summary: str | None = None
+    labels: list[str] = Field(default_factory=list)
+    source_message_ids: list[str] = Field(default_factory=list)
+
+
+class BenshiPreprocessOverlaySummary(BaseModel):
+    view_id: str | None = None
+    delivery_profile: str | None = None
+    overlayed_message_count: int = 0
+    processed_message_view_count: int = 0
+    processed_thread_view_count: int = 0
+    processed_asset_view_count: int = 0
+    annotation_count: int = 0
+    source_linked_message_count: int = 0
+    directive_id: str | None = None
+    directive_title: str | None = None
+    relevance_policy: str | None = None
+    top_labels: dict[str, int] = Field(default_factory=dict)
+    representative_items: list[BenshiPreprocessOverlayItem] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class BenshiForwardAggregateSummary(BaseModel):
+    forward_message_count: int = 0
+    nested_forward_count: int = 0
+    expanded_bundle_count: int = 0
+    expanded_inner_message_count: int = 0
+    expanded_inner_asset_count: int = 0
+    top_asset_type_counts: dict[str, int] = Field(default_factory=dict)
+    representative_forward_ids: list[str] = Field(default_factory=list)
+
+
+class BenshiRecurrenceAggregateSummary(BaseModel):
+    repeated_transport_count: int = 0
+    repeated_asset_cluster_count: int = 0
+    top_basis_counts: dict[str, int] = Field(default_factory=dict)
+    top_asset_type_counts: dict[str, int] = Field(default_factory=dict)
+    high_recurrence_keys: list[str] = Field(default_factory=list)
+
+
+class BenshiAssetAggregateSummary(BaseModel):
+    total_asset_reference_count: int = 0
+    materialized_asset_count: int = 0
+    missing_asset_count: int = 0
+    asset_type_reference_counts: dict[str, int] = Field(default_factory=dict)
+    asset_type_missing_counts: dict[str, int] = Field(default_factory=dict)
+    asset_type_materialized_counts: dict[str, int] = Field(default_factory=dict)
+    top_file_names: list[str] = Field(default_factory=list)
+
+
+class BenshiShiComponentSummary(BaseModel):
+    component_label: str
+    component_family: str
+    score: float = 0.0
+    evidence_basis: list[str] = Field(default_factory=list)
+    evidence_message_uids: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class BenshiShiDescriptionProfile(BaseModel):
+    base_definition: str | None = None
+    description_strategy: str | None = None
+    description_axes: list[str] = Field(default_factory=list)
+    descriptive_tags: list[str] = Field(default_factory=list)
+    good_description_patterns: list[str] = Field(default_factory=list)
+    bad_description_patterns: list[str] = Field(default_factory=list)
+    taboo_or_risk_notes: list[str] = Field(default_factory=list)
+    example_descriptors: list[str] = Field(default_factory=list)
+
+
+class BenshiAnalysisPack(BaseModel):
+    run_id: str
+    target: ResolvedAnalysisTarget
+    chosen_time_window: ResolvedTimeWindow
+    pack_summary: str
+    stats: AnalysisStatsSnapshot
+    selected_messages: list[BenshiSelectedMessage] = Field(default_factory=list)
+    forward_summary: BenshiForwardAggregateSummary = Field(
+        default_factory=BenshiForwardAggregateSummary
+    )
+    forward_summaries: list[BenshiForwardSummary] = Field(default_factory=list)
+    recurrence_summary: BenshiRecurrenceAggregateSummary = Field(
+        default_factory=BenshiRecurrenceAggregateSummary
+    )
+    recurrence_summaries: list[BenshiRecurrenceSummary] = Field(default_factory=list)
+    participant_role_candidates: list[BenshiParticipantRoleCandidate] = Field(default_factory=list)
+    asset_summary: BenshiAssetAggregateSummary = Field(default_factory=BenshiAssetAggregateSummary)
+    asset_summaries: list[BenshiAssetSummary] = Field(default_factory=list)
+    shi_component_summaries: list[BenshiShiComponentSummary] = Field(default_factory=list)
+    shi_description_profile: BenshiShiDescriptionProfile | None = None
+    image_cluster_summaries: list[BenshiImageClusterSummary] = Field(default_factory=list)
+    missing_media_gaps: list[BenshiMissingMediaGap] = Field(default_factory=list)
+    image_caption_samples: list[ImageCaptionSample] = Field(default_factory=list)
+    preprocess_overlay_summary: BenshiPreprocessOverlaySummary | None = None
     warnings: list[str] = Field(default_factory=list)
 
 

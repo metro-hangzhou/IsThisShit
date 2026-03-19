@@ -14,6 +14,16 @@ Tracks the main exporter repository for development work:
 - helper scripts under `scripts/`
 - vendored NapCat runtime under `NapCat/`
 
+Default daily development must happen on `full-dev`.
+
+This branch is the normal working branch for:
+
+- new feature development
+- analysis / preprocess / LLM substrate work
+- refactors
+- experimental or iterative implementation
+- developer-facing planning and design notes
+
 It must not track generated or machine-local output such as:
 
 - `dist/`
@@ -38,6 +48,40 @@ It must not track developer-facing materials such as:
 - `dev/`
 - `tests/`
 - most helper scripts
+
+### `main`
+
+Acts as the primary release/archive branch for the generally usable project state.
+
+`main` should be used for:
+
+- release-shaped snapshots
+- operator-facing updates
+- shareable or testable runtime states
+- remote archival checkpoints
+
+It should not be treated as the default day-to-day development branch.
+
+## Branch Workflow Rule
+
+Normal development workflow:
+
+1. Work on `full-dev` by default.
+2. Treat `main` and `runtime` as release / validation / archival branches.
+3. Use `main` and `runtime` for:
+   - publishable checkpoints
+   - local validation against a cleaner runtime surface
+   - behavior comparison against development state
+
+## Sync / Archive Rule
+
+When a change set is large, important, or meaningfully changes behavior:
+
+- commit the relevant state on `full-dev`
+- prepare corresponding `main` and `runtime` snapshots as needed
+- push `main` and `runtime` to the remote repository for archival / rollback reference
+
+This keeps remote history useful as a deployment and validation record, while preserving `full-dev` as the main ongoing development lane.
 
 ## NapCatQQ Rule
 
