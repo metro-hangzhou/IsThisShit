@@ -88,6 +88,7 @@ class NapCatMediaDownloader:
         ] = {}
         self._known_bad_public_tokens: dict[tuple[str, str], str] = {}
         self._image_placeholder_missing_cache: dict[str, str | None] = {}
+        self._public_token_action_outcomes: dict[tuple[str, str], dict[str, Any] | None] = {}
         self._remote_base_url = (
             remote_base_url
             or getattr(client, "_base_url", None)
@@ -195,6 +196,7 @@ class NapCatMediaDownloader:
             self._prefetched_forward_media.clear()
             self._prefetched_forward_media_payloads.clear()
             self._shared_media_outcomes.clear()
+            self._public_token_action_outcomes.clear()
             self._remote_media_resolution_cache.clear()
             self._remote_media_resolution_futures.clear()
             self._public_token_prefetch_cache.clear()
@@ -216,135 +218,6 @@ class NapCatMediaDownloader:
                 "token_remote_ok": 0,
                 "token_remote_error": 0,
             }
-
-    @staticmethod
-    def _new_download_progress_state() -> dict[str, Any]:
-        return {
-            "candidate_total": 0,
-            "eager_remote_candidates": 0,
-            "public_token_candidates": 0,
-            "context_candidates": 0,
-            "queued": 0,
-            "active": 0,
-            "completed": 0,
-            "failed": 0,
-            "cached": 0,
-            "last_asset_type": None,
-            "last_file_name": None,
-            "last_status": None,
-        }
-
-    def _initialize_download_progress_for_requests(
-        self,
-        requests: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        self._prepare_remote_cache_dir()
-        summary = self._summarize_download_candidates(requests)
-        with self._download_progress_lock:
-            self._download_progress = {
-                **self._new_download_progress_state(),
-                **summary,
-            }
-            self._download_operation_states.clear()
-            return dict(self._download_progress)
-
-    def begin_export_download_tracking(
-        self,
-        requests: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        return self._initialize_download_progress_for_requests(requests)
-
-    def export_download_progress_snapshot(self) -> dict[str, Any]:
-        with self._download_progress_lock:
-            return dict(self._download_progress)
-
-    def settle_export_download_progress(self, *, timeout_s: float | None = None) -> dict[str, Any]:
-        futures: list[Future[Any]] = []
-        with self._prefetch_state_lock:
-            futures.extend(self._remote_media_resolution_futures.values())
-            futures.extend(self._public_token_prefetch_futures.values())
-        deadline = None if timeout_s is None else monotonic() + max(0.0, timeout_s)
-        for future in futures:
-            remaining = None
-            if deadline is not None:
-                remaining = max(0.05, deadline - monotonic())
-                if remaining <= 0:
-                    break
-            with suppress(Exception):
-                future.result(timeout=remaining)
-        return self.export_download_progress_snapshot()
-
-    def _update_download_progress(
-        self,
-        cache_key: tuple[str, str],
-        *,
-        asset_type: str,
-        file_name: str | None,
-        next_state: str,
-    ) -> None:
-        with self._download_progress_lock:
-            current_state = self._download_operation_states.get(cache_key)
-            if current_state == next_state:
-                return
-            progress = self._download_progress
-            if current_state == "queued":
-                progress["queued"] = max(0, int(progress["queued"]) - 1)
-            elif current_state == "active":
-                progress["active"] = max(0, int(progress["active"]) - 1)
-
-            if next_state == "queued":
-                progress["queued"] = int(progress["queued"]) + 1
-            elif next_state == "active":
-                progress["active"] = int(progress["active"]) + 1
-            elif next_state == "completed":
-                progress["completed"] = int(progress["completed"]) + 1
-            elif next_state == "failed":
-                progress["failed"] = int(progress["failed"]) + 1
-            elif next_state == "cached":
-                progress["cached"] = int(progress["cached"]) + 1
-
-            progress["last_asset_type"] = asset_type or None
-            progress["last_file_name"] = file_name or None
-            progress["last_status"] = next_state
-            self._download_operation_states[cache_key] = next_state
-
-    def _summarize_download_candidates(
-        self,
-        requests: list[dict[str, Any]],
-    ) -> dict[str, int]:
-        candidate_total = 0
-        eager_remote_candidates = 0
-        public_token_candidates = 0
-        context_candidates = 0
-        for request in requests:
-            asset_type = str(request.get("asset_type") or "").strip()
-            hint = self._request_hint(request)
-            if self._resolve_from_hint_local_path(hint) != (None, None):
-                continue
-            if asset_type not in self.REMOTE_PREFETCHABLE_ASSET_TYPES:
-                continue
-            has_remote = bool(
-                self._resolve_remote_url(str(hint.get("remote_url") or hint.get("url") or "").strip())
-            )
-            has_public_token = bool(str(hint.get("public_action") or "").strip()) and bool(
-                str(hint.get("public_file_token") or "").strip()
-            )
-            has_context = self._has_context_hint(hint) or self._has_forward_parent_hint(hint)
-            if not (has_remote or has_public_token or has_context):
-                continue
-            candidate_total += 1
-            if has_remote:
-                eager_remote_candidates += 1
-            elif has_public_token:
-                public_token_candidates += 1
-            else:
-                context_candidates += 1
-        return {
-            "candidate_total": candidate_total,
-            "eager_remote_candidates": eager_remote_candidates,
-            "public_token_candidates": public_token_candidates,
-            "context_candidates": context_candidates,
-        }
 
     def prepare_for_export(
         self,
@@ -626,14 +499,6 @@ class NapCatMediaDownloader:
                             classification=classified_forward_missing,
                         )
                         return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
-            direct_forward_file_id = None
-            if asset_type == "file":
-                direct_forward_file_id = self._resolve_via_direct_file_id(
-                    request,
-                    trace_callback=trace_callback,
-                )
-                if direct_forward_file_id not in {None, (None, None)}:
-                    return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
             passive_forward_resolved = self._download_via_forward_context(
                 request,
                 materialize=False,
@@ -658,13 +523,12 @@ class NapCatMediaDownloader:
                 )
                 if targeted_forward_download not in {None, (None, None)}:
                     return self._remember_shared_outcome(shared_key, request, targeted_forward_download)
-            if asset_type != "file":
-                direct_forward_file_id = self._resolve_via_direct_file_id(
-                    request,
-                    trace_callback=trace_callback,
-                )
-                if direct_forward_file_id not in {None, (None, None)}:
-                    return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
+            direct_forward_file_id = self._resolve_via_direct_file_id(
+                request,
+                trace_callback=trace_callback,
+            )
+            if direct_forward_file_id not in {None, (None, None)}:
+                return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
             if asset_type == "image":
                 classified_forward_missing = self._classify_forward_missing(request)
                 if classified_forward_missing is not None:
@@ -673,8 +537,8 @@ class NapCatMediaDownloader:
                         request,
                         substep="forward_missing_classification",
                         classification=classified_forward_missing,
-                    )
-                    return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
+                        )
+                        return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
         context_resolved = None
         if not self._has_forward_parent_hint(hint):
             context_resolved = self._resolve_via_context_only(
@@ -1519,8 +1383,27 @@ class NapCatMediaDownloader:
                 "_known_missing_detail": "cached_known_bad_token",
             }
         timeout_s = self.PUBLIC_TOKEN_ACTION_TIMEOUT_S
+        cache_key = (normalized_action, token)
 
         primary_substep = f"public_token_{normalized_action}"
+        if cache_key in self._public_token_action_outcomes:
+            cached_payload = self._public_token_action_outcomes[cache_key]
+            if request is not None:
+                self._emit_asset_substep_trace(
+                    trace_callback,
+                    request,
+                    stage="done",
+                    substep=primary_substep,
+                    timeout_s=timeout_s,
+                    status="cached" if cached_payload is not None else "cached_skip",
+                    elapsed_s=0.0,
+                    detail=(
+                        "reused cached public token result"
+                        if cached_payload is not None
+                        else "skipped repeated public token retry after cached failure"
+                    ),
+                )
+            return cached_payload
         if request is not None:
             self._emit_asset_substep_trace(
                 trace_callback,
@@ -1560,6 +1443,7 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
+            self._public_token_action_outcomes[cache_key] = None
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
@@ -1577,10 +1461,13 @@ class NapCatMediaDownloader:
                 )
             if known_missing is not None:
                 self._known_bad_public_tokens[(normalized_action, token)] = known_missing
-                return {
+                payload = {
                     "_known_missing_classification": known_missing,
                     "_known_missing_detail": str(exc),
                 }
+                self._public_token_action_outcomes[cache_key] = payload
+                return payload
+            payload = None
         else:
             elapsed_s = monotonic() - started
             if request is not None:
@@ -1600,6 +1487,7 @@ class NapCatMediaDownloader:
                     timeout_s=timeout_s,
                     elapsed_s=elapsed_s,
                 )
+            self._public_token_action_outcomes[cache_key] = payload
             return payload
 
         # Compatibility fallback for runtimes that still expect `file_id`.
@@ -1643,6 +1531,7 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
+            self._public_token_action_outcomes[cache_key] = None
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
@@ -1660,10 +1549,13 @@ class NapCatMediaDownloader:
                 )
             if known_missing is not None:
                 self._known_bad_public_tokens[(normalized_action, token)] = known_missing
-                return {
+                payload = {
                     "_known_missing_classification": known_missing,
                     "_known_missing_detail": str(exc),
                 }
+                self._public_token_action_outcomes[cache_key] = payload
+                return payload
+            self._public_token_action_outcomes[cache_key] = None
             return None
         elapsed_s = monotonic() - started
         if request is not None:
@@ -1683,6 +1575,7 @@ class NapCatMediaDownloader:
                 timeout_s=timeout_s,
                 elapsed_s=elapsed_s,
             )
+        self._public_token_action_outcomes[cache_key] = payload
         return payload
 
     @staticmethod
