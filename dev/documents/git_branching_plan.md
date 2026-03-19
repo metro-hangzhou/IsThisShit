@@ -16,6 +16,12 @@ Tracks the main exporter repository for development work:
 
 Default daily development must happen on `full-dev`.
 
+`full-dev` is a local-first development branch:
+
+- commit locally and frequently
+- do not treat remote push as the default action
+- only use it as the active working lane, not the archival lane
+
 This branch is the normal working branch for:
 
 - new feature development
@@ -67,8 +73,10 @@ It should not be treated as the default day-to-day development branch.
 Normal development workflow:
 
 1. Work on `full-dev` by default.
-2. Treat `main` and `runtime` as release / validation / archival branches.
-3. Use `main` and `runtime` for:
+2. Commit locally on `full-dev` as work accumulates.
+3. Do not push `full-dev` to remote as part of the normal workflow.
+4. Treat `main` and `runtime` as release / validation / archival branches.
+5. Use `main` and `runtime` for:
    - publishable checkpoints
    - local validation against a cleaner runtime surface
    - behavior comparison against development state
@@ -80,8 +88,9 @@ When a change set is large, important, or meaningfully changes behavior:
 - commit the relevant state on `full-dev`
 - prepare corresponding `main` and `runtime` snapshots as needed
 - push `main` and `runtime` to the remote repository for archival / rollback reference
+- do not push `full-dev` unless the workflow rule is deliberately changed later
 
-This keeps remote history useful as a deployment and validation record, while preserving `full-dev` as the main ongoing development lane.
+This keeps remote history useful as a deployment and validation record, while preserving `full-dev` as the main ongoing local development lane.
 
 ## NapCatQQ Rule
 
