@@ -219,6 +219,91 @@ class NapCatMediaDownloader:
                 "token_remote_error": 0,
             }
 
+    @staticmethod
+    def _new_download_progress_state() -> dict[str, Any]:
+        return {
+            "candidate_total": 0,
+            "eager_remote_candidates": 0,
+            "public_token_candidates": 0,
+            "context_candidates": 0,
+            "queued": 0,
+            "active": 0,
+            "completed": 0,
+            "failed": 0,
+            "cached": 0,
+            "last_asset_type": None,
+            "last_file_name": None,
+            "last_status": None,
+        }
+
+    def export_download_progress_snapshot(self) -> dict[str, Any]:
+        with self._download_progress_lock:
+            return dict(self._download_progress)
+
+    def _initialize_download_progress_for_requests(
+        self,
+        requests: list[dict[str, Any]],
+    ) -> None:
+        candidate_total = 0
+        eager_remote_candidates = 0
+        public_token_candidates = 0
+        context_candidates = 0
+        for request in requests:
+            asset_type = str(request.get("asset_type") or "").strip()
+            if asset_type not in self.REMOTE_PREFETCHABLE_ASSET_TYPES:
+                continue
+            hint = self._request_hint(request)
+            if self._resolve_from_hint_local_path(hint) != (None, None):
+                continue
+            candidate_total += 1
+            if self._has_context_hint(hint):
+                context_candidates += 1
+            token = str(request.get("public_file_token") or hint.get("public_file_token") or "").strip()
+            if token:
+                public_token_candidates += 1
+            remote_url = str(hint.get("remote_url") or hint.get("url") or "").strip()
+            if self._resolve_remote_url(remote_url):
+                eager_remote_candidates += 1
+        with self._download_progress_lock:
+            self._download_progress = {
+                **self._new_download_progress_state(),
+                "candidate_total": candidate_total,
+                "eager_remote_candidates": eager_remote_candidates,
+                "public_token_candidates": public_token_candidates,
+                "context_candidates": context_candidates,
+            }
+            self._download_operation_states.clear()
+
+    def _update_download_progress(
+        self,
+        cache_key: tuple[str, str],
+        *,
+        asset_type: str,
+        file_name: str | None,
+        next_state: str,
+    ) -> None:
+        normalized_state = str(next_state or "").strip().lower()
+        tracked_states = {"queued", "active", "completed", "failed", "cached"}
+        if not normalized_state:
+            return
+        with self._download_progress_lock:
+            previous_state = self._download_operation_states.get(cache_key)
+            if previous_state != normalized_state:
+                if previous_state in tracked_states:
+                    previous_count = int(self._download_progress.get(previous_state) or 0)
+                    if previous_count > 0:
+                        self._download_progress[previous_state] = previous_count - 1
+                if normalized_state in tracked_states:
+                    self._download_progress[normalized_state] = (
+                        int(self._download_progress.get(normalized_state) or 0) + 1
+                    )
+                    self._download_operation_states[cache_key] = normalized_state
+                else:
+                    self._download_operation_states.pop(cache_key, None)
+            self._download_progress["last_asset_type"] = asset_type or None
+            self._download_progress["last_file_name"] = file_name or None
+            self._download_progress["last_status"] = normalized_state
+
     def prepare_for_export(
         self,
         requests: list[dict[str, Any]],
