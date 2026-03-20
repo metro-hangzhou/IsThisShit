@@ -64,6 +64,7 @@ class NapCatMediaDownloader:
         self._old_context_failure_buckets: dict[tuple[str, str], int] = {}
         self._old_context_skip_logged: set[tuple[str, str]] = set()
         self._old_context_expired_buckets: set[tuple[str, str]] = set()
+        self._forward_context_timeout_cache: set[tuple[str, ...]] = set()
         self._remote_cache_root = remote_cache_dir
         self._remote_process_cache_dir = (
             remote_cache_dir / f"pid_{os.getpid()}"
@@ -205,6 +206,7 @@ class NapCatMediaDownloader:
             self._old_context_failure_buckets.clear()
             self._old_context_skip_logged.clear()
             self._old_context_expired_buckets.clear()
+            self._forward_context_timeout_cache.clear()
             self._image_placeholder_missing_cache.clear()
         with self._download_progress_lock:
             self._download_progress = self._new_download_progress_state()
@@ -246,6 +248,20 @@ class NapCatMediaDownloader:
     ) -> dict[str, Any]:
         self._initialize_download_progress_for_requests(requests)
         return self.export_download_progress_snapshot()
+
+    def settle_export_download_progress(self) -> dict[str, Any]:
+        with self._download_progress_lock:
+            pending = [
+                cache_key
+                for cache_key, state in self._download_operation_states.items()
+                if state in {"queued", "active"}
+            ]
+            if pending:
+                self._download_progress["queued"] = 0
+                self._download_progress["active"] = 0
+                for cache_key in pending:
+                    self._download_operation_states.pop(cache_key, None)
+            return dict(self._download_progress)
 
     def _initialize_download_progress_for_requests(
         self,
@@ -1096,6 +1112,10 @@ class NapCatMediaDownloader:
         if not parent_element_id:
             return None
         key = self._request_key(request)
+        timeout_cache_key = self._forward_context_timeout_key(
+            request,
+            materialize=materialize,
+        )
         prefetched = self._prefetched_forward_media.get(key)
         prefetched_payload = self._prefetched_forward_media_payloads.get(key)
         if prefetched is not None and not materialize:
@@ -1108,6 +1128,14 @@ class NapCatMediaDownloader:
             in {"single_target_download", "hydrated"}
         ):
             return prefetched
+        if (
+            not materialize
+            and timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_timeout_cache
+        ):
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return None
         timeout_s = (
             self.FORWARD_TARGET_HTTP_TIMEOUT_S if materialize else self.FORWARD_CONTEXT_TIMEOUT_S
         )
@@ -1178,6 +1206,8 @@ class NapCatMediaDownloader:
                 elapsed_s=elapsed_s,
                 detail=str(exc),
             )
+            if timeout_cache_key is not None:
+                self._forward_context_timeout_cache.add(timeout_cache_key)
             self._prefetched_forward_media[key] = (None, None)
             self._prefetched_forward_media_payloads[key] = None
             return None
@@ -1212,6 +1242,8 @@ class NapCatMediaDownloader:
             timeout_s=timeout_s,
             elapsed_s=elapsed_s,
         )
+        if timeout_cache_key is not None:
+            self._forward_context_timeout_cache.discard(timeout_cache_key)
         assets = payload.get("assets") if isinstance(payload, dict) else None
         matched, matched_payload = self._pick_forward_asset_match(
             request,
@@ -3331,6 +3363,33 @@ class NapCatMediaDownloader:
         if not isinstance(parent, dict):
             return False
         return NapCatMediaDownloader._has_context_hint(parent)
+
+    @staticmethod
+    def _forward_context_timeout_key(
+        request: dict[str, Any],
+        *,
+        materialize: bool,
+    ) -> tuple[str, ...] | None:
+        hint = NapCatMediaDownloader._request_hint(request)
+        parent = hint.get("_forward_parent")
+        if not isinstance(parent, dict) or not NapCatMediaDownloader._has_context_hint(parent):
+            return None
+        key = (
+            str(parent.get("message_id_raw") or "").strip(),
+            str(parent.get("element_id") or "").strip(),
+            str(parent.get("peer_uid") or "").strip(),
+            str(parent.get("chat_type_raw") or "").strip(),
+            str(request.get("asset_type") or "").strip(),
+            str(request.get("asset_role") or "").strip(),
+        )
+        if not materialize:
+            return ("metadata", *key)
+        return (
+            "materialize",
+            *key,
+            str(request.get("file_name") or "").strip().lower(),
+            str(request.get("md5") or "").strip().lower(),
+        )
 
     @staticmethod
     def _request_hint(request: dict[str, Any]) -> dict[str, Any]:

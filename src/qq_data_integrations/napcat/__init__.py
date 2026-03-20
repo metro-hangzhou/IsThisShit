@@ -32,6 +32,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "MetadataCache": ("models", "MetadataCache"),
     "NapCatLoginInfo": ("models", "NapCatLoginInfo"),
     "NapCatLoginStatus": ("models", "NapCatLoginStatus"),
+    "NapCatQuickLoginAccount": ("models", "NapCatQuickLoginAccount"),
     "normalize_chat_type": ("models", "normalize_chat_type"),
     "NapCatHistoryProvider": ("provider", "NapCatHistoryProvider"),
     "NapCatRealtimeProvider": ("realtime", "NapCatRealtimeProvider"),
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
         MetadataCache,
         NapCatLoginInfo,
         NapCatLoginStatus,
+        NapCatQuickLoginAccount,
         normalize_chat_type,
     )
     from .provider import NapCatHistoryProvider

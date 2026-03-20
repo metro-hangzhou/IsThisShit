@@ -16,10 +16,11 @@ from prompt_toolkit.filters import Condition, has_completions
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from qq_data_cli.completion_runtime import completion_application_is_noop
 from qq_data_cli.export_commands import (
@@ -37,6 +38,7 @@ from qq_data_cli.export_input import (
     roll_export_date_token,
 )
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
+from qq_data_cli.status_display import build_rich_status_text
 from qq_data_cli.target_display import format_target_label, format_target_name, format_target_remark
 from qq_data_cli.terminal_compat import (
     TerminalProbe,
@@ -243,16 +245,62 @@ class SlashRepl:
     def _handle_login(self, argv: list[str]) -> None:
         _, options = _parse_options(
             argv,
-            allowed_options={"timeout", "poll", "refresh"},
+            allowed_options={"timeout", "poll", "refresh", "no-quick", "quick-uin"},
             command_name="/login",
         )
         timeout_seconds = float(options.get("timeout") or 300)
         poll_interval = float(options.get("poll") or 3)
         refresh = bool(options.get("refresh"))
+        use_quick_login = not bool(options.get("no-quick"))
+        quick_uin = str(options.get("quick-uin") or "").strip() or None
 
         self._ensure_endpoint_ready("webui")
         self._refresh_settings()
         login_service = self._require_login_service()
+        if use_quick_login and not refresh:
+            quick_candidates = login_service.get_quick_login_candidates()
+            if quick_candidates:
+                chosen_uin = (
+                    quick_uin
+                    or login_service.get_default_quick_login_uin()
+                    or quick_candidates[0].uin
+                )
+                chosen_label = next(
+                    (
+                        candidate.display_label
+                        for candidate in quick_candidates
+                        if candidate.uin == chosen_uin
+                    ),
+                    chosen_uin,
+                )
+                self._console.print(f"quick_login_candidate={chosen_label}")
+                quick_info = login_service.try_quick_login(
+                    preferred_uin=chosen_uin,
+                    timeout_seconds=min(timeout_seconds, 25.0),
+                    poll_interval=min(poll_interval, 1.0),
+                    on_status=self._render_login_status,
+                )
+                if quick_info is not None:
+                    self._console.print("QQ quick login succeeded.")
+                    self._print_login_info(quick_info)
+                    self._refresh_settings()
+                    try:
+                        self._ensure_endpoint_ready("onebot_http")
+                        self._ensure_endpoint_ready("onebot_ws")
+                        self._prime_target_cache("group", quiet=True)
+                        self._prime_target_cache("private", quiet=True)
+                    except Exception as exc:
+                        log_path = get_cli_log_path()
+                        self._console.print(
+                            "\n".join(
+                                [
+                                    f"note: {exc}",
+                                    "note: 群/好友补全依赖 onebot_http；当前不可用时，像 /export group ssj 这样的目标补全不会弹出。",
+                                    f"note: 如需排查，请把 CLI 日志发回来：{log_path or ''}",
+                                ]
+                            )
+                        )
+                    return
         info = login_service.login_until_success(
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval,
@@ -262,13 +310,25 @@ class SlashRepl:
         )
         self._console.print("QQ login succeeded.")
         self._print_login_info(info)
+        # QQ 登录成功后，NapCat 可能刚刚生成了账号绑定的 onebot11_<uin>.json。
+        # 这里立即刷新 settings，避免后续 endpoint/补全预热仍拿着登录前的旧配置视图。
+        self._refresh_settings()
         try:
             self._ensure_endpoint_ready("onebot_http")
             self._ensure_endpoint_ready("onebot_ws")
             self._prime_target_cache("group", quiet=True)
             self._prime_target_cache("private", quiet=True)
         except Exception as exc:
-            self._console.print(f"note: {exc}")
+            log_path = get_cli_log_path()
+            self._console.print(
+                "\n".join(
+                    [
+                        f"note: {exc}",
+                        "note: 群/好友补全依赖 onebot_http；当前不可用时，像 /export group ssj 这样的目标补全不会弹出。",
+                        f"note: 如需排查，请把 CLI 日志发回来：{log_path or ''}",
+                    ]
+                )
+            )
 
     def _handle_status(self) -> None:
         from qq_data_cli.startup_capture import capture_startup_snapshot
@@ -536,6 +596,8 @@ class SlashRepl:
             self._console.print("login_status=offline")
         elif status.qrcode_url:
             self._console.print("login_status=waiting for scan/confirm")
+        else:
+            self._console.print("login_status=in progress")
 
     def _print_login_info(self, info) -> None:
         self._console.print(
@@ -720,7 +782,13 @@ class SlashRepl:
                 forensics_collector=forensics,
             )
             cleanup_stats = cleanup_gateway_media_cache(gateway, trace=trace, logger=self._logger)
-            content_summary = build_export_content_summary(normalized, bundle, profile=parsed.profile)
+            content_summary = build_export_content_summary(
+                normalized,
+                bundle,
+                profile=parsed.profile,
+                fmt=parsed.fmt,
+                strict_missing=parsed.strict_missing,
+            )
             summary = trace.build_summary(record_count=len(normalized.messages))
             trace.write_event(
                 "export_complete",
@@ -954,18 +1022,24 @@ class SlashRepl:
         if phase == "write_data_file":
             stage = str(update.get("stage") or "start")
             record_count = int(update.get("record_count") or 0)
-            status = "wrote" if stage == "done" else "writing"
-            return f"{prefix}export_progress: {status} data file records={record_count}"
+            status = "success" if stage == "done" else "in progress"
+            action = "wrote" if stage == "done" else "writing"
+            return f"status={status} {prefix}export_progress: {action} data file records={record_count}"
 
         if phase == "prefetch_media":
             stage = str(update.get("stage") or "start")
             request_count = int(update.get("request_count") or 0)
             if stage == "done":
                 return (
-                    f"{prefix}export_progress: prefetched media context requests={request_count} "
+                    f"status=success {prefix}export_progress: prefetched media context requests={request_count} "
                     f"elapsed={elapsed_s:.1f}s"
                 )
-            return f"{prefix}export_progress: prefetching media context requests={request_count}"
+            if stage == "error":
+                return (
+                    f"status=failed {prefix}export_progress: media prefetch degraded requests={request_count} "
+                    f"elapsed={elapsed_s:.1f}s"
+                )
+            return f"status=in progress {prefix}export_progress: prefetching media context requests={request_count}"
 
         if phase == "materialize_assets":
             current = int(update.get("current") or 0)
@@ -978,7 +1052,7 @@ class SlashRepl:
             missing = int(update.get("missing_assets") or 0)
             errors = int(update.get("error_assets") or 0)
             detail = (
-                f"{prefix}export_progress: materializing assets {current}/{total} "
+                f"status=in progress {prefix}export_progress: materializing assets {current}/{total} "
                 f"{asset_type}{role_suffix} copied={copied} reused={reused} "
                 f"missing={missing} err={errors}"
             )
@@ -1012,7 +1086,7 @@ class SlashRepl:
             timeout_s = float(update.get("timeout_s") or 0.0)
             elapsed = float(update.get("elapsed_s") or 0.0)
             detail = (
-                f"{prefix}export_progress: asset substep {status} substep={substep} "
+                f"status=failed {prefix}export_progress: asset substep {status} substep={substep} "
                 f"asset={asset_type}:{file_name}"
             )
             if timeout_s > 0:
@@ -1043,7 +1117,13 @@ class SlashRepl:
         last_status = str(update.get("last_status") or "").strip()
         if stage == "done" and not total:
             return ""
-        parts = [f"{prefix}remote_downloads(subqueue): {stage}"]
+        status = {
+            "start": "in progress",
+            "progress": "in progress",
+            "done": "success",
+            "error": "failed",
+        }.get(stage, "in progress")
+        parts = [f"status={status}", f"{prefix}remote_downloads(subqueue): {stage}"]
         parts.append(f"candidates={total}")
         parts.append(f"ok={completed}")
         parts.append(f"cached={cached}")
@@ -1264,7 +1344,14 @@ class SlashRepl:
             self._ensure_endpoint_ready("onebot_http")
             gateway = self._require_gateway()
             gateway.list_targets(chat_type, refresh=True, limit=32)
-        except Exception:
+        except Exception as exc:
+            self._logger.warning(
+                "completion_prime_failed chat_type=%s quiet=%s has_cached_targets=%s error=%s",
+                chat_type,
+                quiet,
+                has_cached_targets,
+                str(exc or "").strip() or exc.__class__.__name__,
+            )
             if has_cached_targets:
                 self._completion_prime_failed_at[chat_type] = monotonic()
                 return
@@ -1385,11 +1472,11 @@ class _RootExportProgressDisplay:
         header = self._target_label
         if self._batch_prefix:
             header = f"{self._batch_prefix} {header}"
-        lines = [header, self._progress_line]
+        lines: list[Text] = [build_rich_status_text(header), build_rich_status_text(self._progress_line)]
         if self._download_line:
-            lines.append(self._download_line)
+            lines.append(build_rich_status_text(self._download_line))
         return Panel(
-            "\n".join(lines),
+            Group(*lines),
             title="Export Progress",
             border_style="cyan",
         )

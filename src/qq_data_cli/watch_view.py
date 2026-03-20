@@ -13,6 +13,7 @@ from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app_or_none
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition, has_completions, to_filter
+from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
@@ -42,6 +43,7 @@ from qq_data_cli.export_input import (
     roll_export_date_token,
 )
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger
+from qq_data_cli.status_display import colorize_status_fields_for_ansi
 from qq_data_cli.target_display import (
     format_display_name,
     format_target_name,
@@ -976,7 +978,13 @@ class WatchConversationView:
                 logger=self._logger,
             )
             cleanup_done = True
-            content_summary = build_export_content_summary(normalized, bundle, profile=parsed.profile)
+            content_summary = build_export_content_summary(
+                normalized,
+                bundle,
+                profile=parsed.profile,
+                fmt=parsed.fmt,
+                strict_missing=parsed.strict_missing,
+            )
             return bundle, len(normalized.messages), content_summary, cleanup_stats
         finally:
             if not cleanup_done:
@@ -1144,14 +1152,15 @@ class WatchConversationView:
         new_text, new_cursor = updated
         self._command_input.buffer.document = Document(text=new_text, cursor_position=new_cursor)
 
-    def _get_status_line(self) -> str:
+    def _get_status_line(self):
         lines: list[str] = []
         if self._notice_text:
             lines.append(self._notice_text)
         if self._download_notice_text:
             lines.append(self._download_notice_text)
         lines.append(self._status_text)
-        return "\n".join(self._wrap_lines(lines))
+        rendered = "\n".join(self._wrap_lines(lines))
+        return ANSI(colorize_status_fields_for_ansi(rendered))
 
     def _get_help_line(self) -> str:
         if self._help_text != _default_watch_help_text():
