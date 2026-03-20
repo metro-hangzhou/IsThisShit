@@ -291,6 +291,12 @@ Recent field failures showed that the project has two separate but related stabi
     - public-token prefetch
   - and only disables:
     - remote media prefetch optimization
+- [x] Repair release-line login completion bundle skew
+  - `repl.py` already depended on `quick_login_lookup`
+  - release `completion.py` was still on the old constructor signature
+  - fixed by syncing:
+    - `src/qq_data_cli/completion.py`
+    - `tests/test_cli_login_completion.py`
 
 ## Reviewer-Derived Next Hardening Targets
 

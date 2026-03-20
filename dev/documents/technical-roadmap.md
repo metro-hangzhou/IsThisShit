@@ -874,3 +874,25 @@
   - 当前解释：
     - 这轮没有改动导出结果语义
     - 只是把一个高风险初始化炸点降成了可控退化
+
+### [2026-03-20][027] 修复发布线 `start_cli` 自动更新后的 REPL 启动崩溃
+
+- 现场故障：
+  - `main` 分支本地 `start_cli.bat` 自动更新后，CLI 进入 REPL 即崩：
+    - `TypeError: SlashCommandCompleter.__init__() got an unexpected keyword argument 'quick_login_lookup'`
+- 根因：
+  - 发布线里：
+    - `repl.py` 已经接了 `quick_login_lookup=...`
+  - 但：
+    - `completion.py`
+    - `tests/test_cli_login_completion.py`
+    没有同步进发布线
+  - 导致发布包处于“REPL 已升级、completer 仍是旧签名”的半新半旧状态
+- 修正方向：
+  - 把 login quick-completion 的 `completion.py` 变更和对应测试成套补进 `main/runtime`
+- 价值：
+  - 避免 `main` 自动更新后直接把 CLI 启动链炸掉
+  - 也提醒后续发布线同步要覆盖：
+    - REPL 调用侧
+    - completer 实现侧
+    - 对应回归测试
