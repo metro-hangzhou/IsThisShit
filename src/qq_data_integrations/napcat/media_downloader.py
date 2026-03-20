@@ -240,6 +240,13 @@ class NapCatMediaDownloader:
         with self._download_progress_lock:
             return dict(self._download_progress)
 
+    def begin_export_download_tracking(
+        self,
+        requests: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        self._initialize_download_progress_for_requests(requests)
+        return self.export_download_progress_snapshot()
+
     def _initialize_download_progress_for_requests(
         self,
         requests: list[dict[str, Any]],
