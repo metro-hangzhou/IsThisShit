@@ -34,6 +34,12 @@ class NapCatMediaDownloader:
     OLD_CONTEXT_BUCKET_FAILURE_LIMIT = 5
     SHARED_MISS_CACHE_MIN_AGE_DAYS = 30
     PREFETCH_BATCH_SIZE = 200
+    PREFETCH_LARGE_REQUEST_THRESHOLD = 1000
+    PREFETCH_LARGE_BATCH_SIZE = 50
+    PREFETCH_BATCH_TIMEOUT_S = 20.0
+    PREFETCH_BATCH_TIMEOUT_STRIKE_LIMIT = 2
+    PREFETCH_TOTAL_BUDGET_S = 30.0
+    PREFETCH_SLOW_CHUNK_WARN_S = 15.0
     FORWARD_TARGET_DOWNLOAD_TIMEOUT_MS = 20_000
     DIRECT_FILE_ID_TIMEOUT_S = 12.0
     PUBLIC_TOKEN_ACTION_TIMEOUT_S = 12.0
@@ -70,6 +76,7 @@ class NapCatMediaDownloader:
         self._forward_context_empty_cache: set[tuple[str, ...]] = set()
         self._forward_context_error_cache: set[tuple[str, ...]] = set()
         self._forward_context_payload_cache: dict[tuple[str, ...], dict[str, Any]] = {}
+        self._request_scoped_public_action_timeout_cache: set[tuple[str, ...]] = set()
         self._remote_cache_root = remote_cache_dir
         self._remote_process_cache_dir = (
             remote_cache_dir / f"pid_{os.getpid()}"
@@ -221,6 +228,7 @@ class NapCatMediaDownloader:
             self._forward_context_empty_cache.clear()
             self._forward_context_error_cache.clear()
             self._forward_context_payload_cache.clear()
+            self._request_scoped_public_action_timeout_cache.clear()
             self._image_placeholder_missing_cache.clear()
         with self._download_progress_lock:
             self._download_progress = self._new_download_progress_state()
@@ -359,13 +367,47 @@ class NapCatMediaDownloader:
             requests,
             progress_callback=progress_callback,
         )
+        large_prefetch_run = len(requests) >= int(self.PREFETCH_LARGE_REQUEST_THRESHOLD)
         batch_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
         seen: set[tuple[Any, ...]] = set()
-        for request in requests:
+        skipped_old_bucket_prefetch = 0
+        prefetched_local_count = 0
+        prepare_started = monotonic()
+        last_prepare_emit = prepare_started
+        overall_request_count = len(requests)
+
+        def _emit_prepare_progress(stage: str, scanned_request_count: int) -> None:
+            if progress_callback is None:
+                return
+            progress_callback(
+                {
+                    "phase": "prefetch_media_prepare",
+                    "stage": stage,
+                    "overall_request_count": overall_request_count,
+                    "scanned_request_count": scanned_request_count,
+                    "context_request_count": len(batch_items),
+                    "prefetched_local_count": prefetched_local_count,
+                    "skipped_old_bucket_count": skipped_old_bucket_prefetch,
+                    "elapsed_s": round(monotonic() - prepare_started, 4),
+                }
+            )
+
+        _emit_prepare_progress("start", 0)
+        for index, request in enumerate(requests, start=1):
             hint = self._request_hint(request)
             if not self._has_context_hint(hint):
+                if progress_callback is not None and (
+                    index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
+                ):
+                    _emit_prepare_progress("progress", index)
+                    last_prepare_emit = monotonic()
                 continue
             if self._has_forward_parent_hint(hint):
+                if progress_callback is not None and (
+                    index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
+                ):
+                    _emit_prepare_progress("progress", index)
+                    last_prepare_emit = monotonic()
                 continue
             old_bucket = self._old_context_bucket(
                 str(request.get("asset_type") or "").strip(),
@@ -377,6 +419,12 @@ class NapCatMediaDownloader:
                 self._prefetched_media[key] = stale_local
                 self._prefetched_media_payloads[key] = None
                 self._remember_shared_outcome(self._shared_request_key(request), request, stale_local)
+                prefetched_local_count += 1
+                if progress_callback is not None and (
+                    index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
+                ):
+                    _emit_prepare_progress("progress", index)
+                    last_prepare_emit = monotonic()
                 continue
             hinted_local = self._resolve_from_hint_local_path(hint)
             if hinted_local != (None, None):
@@ -384,8 +432,29 @@ class NapCatMediaDownloader:
                 self._prefetched_media[key] = hinted_local
                 self._prefetched_media_payloads[key] = None
                 self._remember_shared_outcome(self._shared_request_key(request), request, hinted_local)
+                prefetched_local_count += 1
+                if progress_callback is not None and (
+                    index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
+                ):
+                    _emit_prepare_progress("progress", index)
+                    last_prepare_emit = monotonic()
+                continue
+            if large_prefetch_run and old_bucket is not None:
+                skipped_old_bucket_prefetch += 1
+                if progress_callback is not None and (
+                    index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
+                ):
+                    _emit_prepare_progress("progress", index)
+                    last_prepare_emit = monotonic()
                 continue
             if self._should_skip_old_bucket(old_bucket):
+                if old_bucket is not None:
+                    skipped_old_bucket_prefetch += 1
+                if progress_callback is not None and (
+                    index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
+                ):
+                    _emit_prepare_progress("progress", index)
+                    last_prepare_emit = monotonic()
                 continue
             if not self._should_skip_eager_remote_prefetch(
                 request,
@@ -403,14 +472,39 @@ class NapCatMediaDownloader:
                 "chat_type_raw": int(hint["chat_type_raw"]),
                 "asset_type": str(request.get("asset_type") or "").strip() or None,
                 "asset_role": str(request.get("asset_role") or "").strip() or None,
+                "metadata_only": True,
             }
             batch_items.append((request, {k: v for k, v in item.items() if v not in {None, ""}}))
+            if progress_callback is not None and (
+                index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
+            ):
+                _emit_prepare_progress("progress", index)
+                last_prepare_emit = monotonic()
         if not batch_items:
+            _emit_prepare_progress("done", overall_request_count)
             return
-        batch_size = max(1, int(self.PREFETCH_BATCH_SIZE))
+        if skipped_old_bucket_prefetch > 0:
+            self._logger.info(
+                "skip_batch_context_prefetch_for_old_assets count=%s overall_requests=%s",
+                skipped_old_bucket_prefetch,
+                len(requests),
+            )
+        batch_size = self._prefetch_batch_size_for_request_count(len(requests))
         chunk_count = (len(batch_items) + batch_size - 1) // batch_size
+        total_request_count = len(batch_items)
+        if progress_callback is not None:
+            _emit_prepare_progress("done", overall_request_count)
+        chunk_timeout_strikes = 0
+        prefetch_started = monotonic()
         for chunk_index, start in enumerate(range(0, len(batch_items), batch_size), start=1):
+            prefetch_elapsed_s = monotonic() - prefetch_started
+            if prefetch_elapsed_s >= self.PREFETCH_TOTAL_BUDGET_S:
+                raise RuntimeError(
+                    "media prefetch degraded after exceeding total budget "
+                    f"({prefetch_elapsed_s:.1f}s >= {self.PREFETCH_TOTAL_BUDGET_S:.1f}s)"
+                )
             chunk = batch_items[start : start + batch_size]
+            chunk_started = monotonic()
             if progress_callback is not None:
                 progress_callback(
                     {
@@ -419,11 +513,44 @@ class NapCatMediaDownloader:
                         "chunk_index": chunk_index,
                         "chunk_count": chunk_count,
                         "request_count": len(chunk),
+                        "total_request_count": total_request_count,
+                        "overall_request_count": overall_request_count,
+                        "processed_request_count": start,
                         "request_offset": start,
                     }
                 )
             try:
-                payload = self._fast_client.hydrate_media_batch([item for _request, item in chunk])
+                payload = self._fast_client.hydrate_media_batch(
+                    [item for _request, item in chunk],
+                    timeout=self._prefetch_batch_timeout_s(len(chunk), len(requests)),
+                )
+            except NapCatFastHistoryTimeoutError as exc:
+                chunk_timeout_strikes += 1
+                timeout_s = self._prefetch_batch_timeout_s(len(chunk), len(requests))
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "phase": "prefetch_media_chunk",
+                            "stage": "error",
+                            "chunk_index": chunk_index,
+                            "chunk_count": chunk_count,
+                            "request_count": len(chunk),
+                            "total_request_count": total_request_count,
+                            "overall_request_count": overall_request_count,
+                            "processed_request_count": min(start + len(chunk), total_request_count),
+                            "request_offset": start,
+                            "elapsed_s": round(monotonic() - chunk_started, 4),
+                            "error": str(exc),
+                            "reason": "chunk_timeout",
+                            "timeout_s": timeout_s,
+                        }
+                    )
+                if chunk_timeout_strikes >= int(self.PREFETCH_BATCH_TIMEOUT_STRIKE_LIMIT):
+                    raise RuntimeError(
+                        "media prefetch degraded after repeated batch hydrate timeouts "
+                        f"(timeout={timeout_s:.1f}s strikes={chunk_timeout_strikes})"
+                    ) from exc
+                continue
             except NapCatFastHistoryUnavailable as exc:
                 self._fast_context_route_disabled = True
                 self._logger.info(
@@ -438,7 +565,11 @@ class NapCatMediaDownloader:
                             "chunk_index": chunk_index,
                             "chunk_count": chunk_count,
                             "request_count": len(chunk),
+                            "total_request_count": total_request_count,
+                            "overall_request_count": overall_request_count,
+                            "processed_request_count": min(start + len(chunk), total_request_count),
                             "request_offset": start,
+                            "elapsed_s": round(monotonic() - chunk_started, 4),
                             "error": str(exc),
                             "reason": "route_unavailable",
                         }
@@ -453,7 +584,11 @@ class NapCatMediaDownloader:
                             "chunk_index": chunk_index,
                             "chunk_count": chunk_count,
                             "request_count": len(chunk),
+                            "total_request_count": total_request_count,
+                            "overall_request_count": overall_request_count,
+                            "processed_request_count": min(start + len(chunk), total_request_count),
                             "request_offset": start,
+                            "elapsed_s": round(monotonic() - chunk_started, 4),
                             "error": str(exc),
                             "reason": "chunk_failed",
                         }
@@ -469,7 +604,11 @@ class NapCatMediaDownloader:
                             "chunk_index": chunk_index,
                             "chunk_count": chunk_count,
                             "request_count": len(chunk),
+                            "total_request_count": total_request_count,
+                            "overall_request_count": overall_request_count,
+                            "processed_request_count": min(start + len(chunk), total_request_count),
                             "request_offset": start,
+                            "elapsed_s": round(monotonic() - chunk_started, 4),
                             "reason": "invalid_response",
                         }
                     )
@@ -507,6 +646,7 @@ class NapCatMediaDownloader:
                     )
                 hydrated_count += 1
             if progress_callback is not None:
+                chunk_elapsed_s = round(monotonic() - chunk_started, 4)
                 progress_callback(
                     {
                         "phase": "prefetch_media_chunk",
@@ -514,10 +654,25 @@ class NapCatMediaDownloader:
                         "chunk_index": chunk_index,
                         "chunk_count": chunk_count,
                         "request_count": len(chunk),
+                        "total_request_count": total_request_count,
+                        "overall_request_count": overall_request_count,
+                        "processed_request_count": min(start + len(chunk), total_request_count),
                         "request_offset": start,
                         "hydrated_count": hydrated_count,
+                        "elapsed_s": chunk_elapsed_s,
+                        "slow": chunk_elapsed_s >= self.PREFETCH_SLOW_CHUNK_WARN_S,
+                        "slow_threshold_s": self.PREFETCH_SLOW_CHUNK_WARN_S,
                     }
                 )
+
+    def _prefetch_batch_size_for_request_count(self, request_count: int) -> int:
+        if request_count >= int(self.PREFETCH_LARGE_REQUEST_THRESHOLD):
+            return max(1, min(int(self.PREFETCH_BATCH_SIZE), int(self.PREFETCH_LARGE_BATCH_SIZE)))
+        return max(1, int(self.PREFETCH_BATCH_SIZE))
+
+    def _prefetch_batch_timeout_s(self, chunk_size: int, request_count: int) -> float:
+        _ = chunk_size, request_count
+        return float(self.PREFETCH_BATCH_TIMEOUT_S)
 
     def resolve_for_export(
         self,
@@ -990,6 +1145,17 @@ class NapCatMediaDownloader:
         old_bucket = self._old_context_bucket(asset_type, request)
         if self._should_skip_old_bucket(old_bucket):
             return None, self._missing_bucket_resolver(old_bucket)
+        if asset_type == "image" and old_bucket is not None:
+            local_placeholder_missing = self._classify_image_local_placeholder_missing(request)
+            if local_placeholder_missing is not None:
+                self._emit_missing_classification_trace(
+                    trace_callback,
+                    request,
+                    substep="context_missing_classification",
+                    classification=local_placeholder_missing,
+                )
+                self._note_old_bucket_expired_like(old_bucket)
+                return None, local_placeholder_missing
         payload = self._download_via_context(
             hint,
             asset_type=asset_type,
@@ -1097,6 +1263,7 @@ class NapCatMediaDownloader:
         asset_type = str(request.get("asset_type") or "").strip()
         if asset_type not in {"file", "video"}:
             return None
+        old_bucket = self._old_context_bucket(asset_type, request)
         hint = self._request_hint(request)
         file_id = str(hint.get("file_id") or "").strip()
         if not file_id or not file_id.startswith("/"):
@@ -1148,6 +1315,19 @@ class NapCatMediaDownloader:
                 elapsed_s=elapsed_s,
                 detail=str(exc),
             )
+            if (
+                asset_type == "file"
+                and old_bucket is not None
+                and "file not found" in str(exc).strip().lower()
+            ):
+                if request is not None:
+                    self._emit_missing_classification_trace(
+                        trace_callback,
+                        request,
+                        substep="direct_file_id_get_file_classification",
+                        classification="qq_expired_after_napcat",
+                    )
+                return None, "qq_expired_after_napcat"
             return None
         elapsed_s = monotonic() - started
         self._emit_asset_substep_trace(
@@ -1663,6 +1843,26 @@ class NapCatMediaDownloader:
         normalized_action = str(action or "").strip().lower()
         if not normalized_action or not token:
             return None
+        request_timeout_scope_key = self._request_scoped_public_action_timeout_key(
+            request,
+            action=normalized_action,
+        )
+        if (
+            request_timeout_scope_key is not None
+            and request_timeout_scope_key in self._request_scoped_public_action_timeout_cache
+        ):
+            if request is not None:
+                self._emit_asset_substep_trace(
+                    trace_callback,
+                    request,
+                    stage="done",
+                    substep=f"public_token_{normalized_action}",
+                    timeout_s=self.PUBLIC_TOKEN_ACTION_TIMEOUT_S,
+                    status="cached_skip",
+                    elapsed_s=0.0,
+                    detail="skipped repeated forward public token retry after prior timeout",
+                )
+            return None
         known_bad_token = self._known_bad_public_tokens.get((normalized_action, token))
         if known_bad_token:
             return {
@@ -1730,6 +1930,8 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
+            if request_timeout_scope_key is not None:
+                self._request_scoped_public_action_timeout_cache.add(request_timeout_scope_key)
             self._public_token_action_outcomes[cache_key] = None
             return None
         except NapCatApiError as exc:
@@ -1818,6 +2020,8 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
+            if request_timeout_scope_key is not None:
+                self._request_scoped_public_action_timeout_cache.add(request_timeout_scope_key)
             self._public_token_action_outcomes[cache_key] = None
             return None
         except NapCatApiError as exc:
@@ -3410,6 +3614,13 @@ class NapCatMediaDownloader:
             return None
         if self._resolved_path_from_payload(data) is not None:
             return None
+        blank_public_file_missing = self._classify_blank_public_get_file_missing(
+            data,
+            old_bucket=old_bucket,
+            request=request,
+        )
+        if blank_public_file_missing is not None:
+            return blank_public_file_missing
         action = str(data.get("public_action") or "").strip().lower()
         token = str(data.get("public_file_token") or "").strip()
         if not action or not token:
@@ -3445,6 +3656,13 @@ class NapCatMediaDownloader:
             return None
         if self._resolved_path_from_payload(data) is not None:
             return None
+        blank_public_file_missing = self._classify_blank_public_get_file_missing(
+            data,
+            old_bucket=old_bucket,
+            request=request,
+        )
+        if blank_public_file_missing is not None:
+            return blank_public_file_missing
         remote_url = str(data.get("url") or "").strip()
         if not remote_url:
             return None
@@ -3460,6 +3678,41 @@ class NapCatMediaDownloader:
         local_placeholder_missing = self._classify_image_local_placeholder_missing(request)
         if local_placeholder_missing is not None:
             return local_placeholder_missing
+        return "qq_expired_after_napcat"
+
+    @staticmethod
+    def _classify_blank_public_get_file_missing(
+        data: dict[str, Any] | None,
+        *,
+        old_bucket: tuple[str, str] | None,
+        request: dict[str, Any] | None = None,
+    ) -> str | None:
+        if old_bucket is None or not isinstance(data, dict):
+            return None
+        action = str(data.get("public_action") or "").strip().lower()
+        if action != "get_file":
+            return None
+        request_asset_type = str(
+            (request or {}).get("asset_type") if isinstance(request, dict) else ""
+        ).strip().lower()
+        payload_asset_type = str(data.get("asset_type") or "").strip().lower()
+        effective_asset_type = request_asset_type or payload_asset_type
+        if effective_asset_type not in {"file", "video"}:
+            return None
+        payload_file = str(data.get("file") or "").strip()
+        remote_url = str(data.get("url") or data.get("remote_url") or "").strip()
+        if payload_file or remote_url:
+            return None
+        file_name = str(
+            data.get("file_name")
+            or ((request or {}).get("file_name") if isinstance(request, dict) else "")
+            or ""
+        ).strip()
+        file_size = str(data.get("file_size") or "").strip()
+        file_id = str(data.get("file_id") or "").strip()
+        token = str(data.get("public_file_token") or "").strip()
+        if not any([file_name, file_size, file_id, token]):
+            return None
         return "qq_expired_after_napcat"
 
     def _classify_forward_missing(self, request: dict[str, Any]) -> str | None:
@@ -3597,6 +3850,25 @@ class NapCatMediaDownloader:
             str(request.get("file_name") or "").strip().lower(),
             str(request.get("md5") or "").strip().lower(),
         )
+
+    @staticmethod
+    def _request_scoped_public_action_timeout_key(
+        request: dict[str, Any] | None,
+        *,
+        action: str,
+    ) -> tuple[str, ...] | None:
+        if not isinstance(request, dict):
+            return None
+        asset_type = str(request.get("asset_type") or "").strip()
+        if asset_type not in {"file", "video"}:
+            return None
+        hint = NapCatMediaDownloader._request_hint(request)
+        if not NapCatMediaDownloader._has_forward_parent_hint(hint):
+            return None
+        if action != "get_file":
+            return None
+        request_key = NapCatMediaDownloader._request_key(request)
+        return ("forward_public_timeout", action, *(str(part) for part in request_key))
 
     @staticmethod
     def _request_hint(request: dict[str, Any]) -> dict[str, Any]:

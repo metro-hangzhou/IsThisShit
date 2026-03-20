@@ -418,11 +418,36 @@ Recent field failures showed that the project has two separate but related stabi
     - `assets`
     - `note`
   - keeps operator-facing fidelity details while dropping the worst long-form noise lines
+- [x] Surface prefetch preparation progress before context hydrate chunks begin
+  - large exports now explicitly show:
+    - `planning media prefetch scanned=... context=... local=... skip_old=...`
+  - avoids the old “static prefetching media context requests=... for tens of seconds” false-freeze feel
+- [x] Make `export_status` mean “bundle finished” and keep missing nuance in `export_verdict`
+  - completed exports with actionable missing now report:
+    - `export_status=success`
+    - `export_verdict=success_with_actionable_missing`
+  - avoids contradictory results such as:
+    - `export_status=failed export_verdict=success_with_actionable_missing`
 - [ ] Surface runtime bootstrap drift more explicitly in CLI export entrypoints
   - when `ensure_endpoint(...)` auto-starts or auto-configures the runtime, `export-history` should print the effective runtime note more prominently
 - [ ] Show active runtime session identity even when no fixed `quick_login_uin` is configured
   - current guards reject wrong-account reuse when the pinned account exists
   - reviewer still wants the active account identity to stay operator-visible in every export flow
+- [ ] Keep `10000+` window diagnosis bounded without reintroducing old-bucket prefetch regressions
+  - `2026-03-21` live verification showed:
+    - all-old-bucket metadata batch prefetch can still blow the global prefetch budget on `10000` exports
+  - current stable stance is:
+    - keep large-run old-bucket batch prefetch skipped
+    - keep chunk heartbeat / timeout / budget reporting explicit
+  - next hardening should only target:
+    - better sampling diagnostics
+    - not full old-bucket prefetch replay
+- [ ] Decide whether old `file`/`video` empty-payload cases need a dedicated background class beyond `qq_expired_after_napcat`
+  - current `2025-09-08` uploaded-file case is now reclassified into background
+  - but reviewer still wants a later pass on whether:
+    - `qq_expired_after_napcat`
+  - is semantically specific enough for:
+    - old uploaded files with empty `get_file` payloads and `file not found` on direct `file_id`
 
 ## Related Files
 

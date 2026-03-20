@@ -9,11 +9,31 @@ from concurrent.futures import Future
 
 from qq_data_integrations.napcat.fast_history_client import NapCatFastHistoryTimeoutError
 from qq_data_integrations.napcat.fast_history_client import NapCatFastHistoryUnavailable
+from qq_data_integrations.napcat.http_client import NapCatApiError
+from qq_data_integrations.napcat.http_client import NapCatApiTimeoutError
 from qq_data_integrations.napcat.media_downloader import NapCatMediaDownloader
 
 
 class _DummyClient:
     pass
+
+
+class _TimeoutPublicFileClient:
+    def __init__(self) -> None:
+        self.get_file_calls = 0
+
+    def get_file(self, *args, **kwargs):
+        self.get_file_calls += 1
+        raise NapCatApiTimeoutError("NapCat action timed out: get_file")
+
+
+class _MissingDirectFileClient:
+    def __init__(self) -> None:
+        self.get_file_calls = 0
+
+    def get_file(self, *args, **kwargs):
+        self.get_file_calls += 1
+        raise NapCatApiError("file not found")
 
 
 class _RemoteMediaDownloader(NapCatMediaDownloader):
@@ -54,7 +74,16 @@ class _TimeoutForwardClient:
 
 
 class _BatchFastClient:
-    def hydrate_media_batch(self, _items):
+    def __init__(self, *, raise_timeout: bool = False) -> None:
+        self.raise_timeout = raise_timeout
+        self.calls: list[list[dict[str, object]]] = []
+        self.timeouts: list[object] = []
+
+    def hydrate_media_batch(self, _items, *, timeout=None):
+        self.calls.append(list(_items))
+        self.timeouts.append(timeout)
+        if self.raise_timeout:
+            raise NapCatFastHistoryTimeoutError("batch timed out")
         return {"items": []}
 
 
@@ -153,6 +182,12 @@ def _build_forward_request(file_name: str) -> dict[str, object]:
             }
         },
     }
+
+
+def _build_forward_video_request(file_name: str) -> dict[str, object]:
+    request = _build_forward_request(file_name)
+    request["asset_type"] = "video"
+    return request
 
 
 def _build_context_hint_request(file_name: str) -> dict[str, object]:
@@ -323,6 +358,27 @@ def test_forward_metadata_success_payload_is_reused_for_sibling_assets() -> None
     assert len(fast_client.calls) == 1
     assert first == (Path(__file__).resolve(), "napcat_forward_hydrated")
     assert second == (Path(__file__).resolve(), "napcat_forward_hydrated")
+
+
+def test_forward_video_public_token_timeout_skips_later_retry_even_with_new_token() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request = _build_forward_video_request("slow-forward-video.mp4")
+
+    first = downloader._call_public_action_with_token(
+        "get_file",
+        "first-token",
+        request=request,
+    )
+    second = downloader._call_public_action_with_token(
+        "get_file",
+        "second-token",
+        request=request,
+    )
+
+    assert first is None
+    assert second is None
+    assert client.get_file_calls == 1
 
 
 def test_prefetched_forward_remote_payload_is_used_before_metadata_requery() -> None:
@@ -532,6 +588,201 @@ def test_prepare_for_export_skips_remote_prefetch_for_old_placeholder_image() ->
         assert downloader.scheduled_requests == []
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_resolve_via_context_only_skips_old_placeholder_image_before_context_hydration() -> None:
+    temp_root = _workspace_temp_dir()
+    source_path = temp_root / "Pic" / "2025-09" / "Ori" / "PLACEHOLDER_CONTEXT_SKIP.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"")
+    sibling_placeholder = source_path.parent.parent / "OriTemp" / source_path.name
+    sibling_placeholder.parent.mkdir(parents=True, exist_ok=True)
+    sibling_placeholder.write_bytes(b"")
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "image",
+        "file_name": source_path.name,
+        "source_path": str(source_path),
+        "timestamp_ms": 1750000000000,
+        "download_hint": {
+            "message_id_raw": "7610000000000000401",
+            "element_id": "7610000000000000400",
+            "peer_uid": "u_example",
+            "chat_type_raw": "2",
+        },
+    }
+
+    def _unexpected_context(*args, **kwargs):
+        raise AssertionError("old placeholder image should be classified before context hydration")
+
+    downloader._download_via_context = _unexpected_context  # type: ignore[method-assign]
+
+    try:
+        resolved, resolver = downloader._resolve_via_context_only(request)
+        assert resolved is None
+        assert resolver == "qq_not_downloaded_local_placeholder"
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_prepare_for_export_uses_metadata_only_batch_prefetch_with_timeout() -> None:
+    fast_client = _BatchFastClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _build_context_hint_request("sample-image.png")
+
+    downloader.prepare_for_export([request])
+
+    assert fast_client.calls
+    assert fast_client.timeouts == [downloader.PREFETCH_BATCH_TIMEOUT_S]
+    first_item = fast_client.calls[0][0]
+    assert first_item["metadata_only"] is True
+
+
+def test_prepare_for_export_emits_prepare_progress_events() -> None:
+    fast_client = _BatchFastClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    requests = [
+        _build_context_hint_request("sample-image-1.png"),
+        _build_context_hint_request("sample-image-2.png"),
+    ]
+    progress_events: list[dict[str, object]] = []
+
+    downloader.prepare_for_export(requests, progress_callback=progress_events.append)
+
+    prepare_events = [
+        event
+        for event in progress_events
+        if str(event.get("phase") or "") == "prefetch_media_prepare"
+    ]
+    assert prepare_events
+    assert str(prepare_events[0].get("stage") or "") == "start"
+    assert str(prepare_events[-1].get("stage") or "") == "done"
+    assert int(prepare_events[-1].get("scanned_request_count") or 0) == 2
+    assert int(prepare_events[-1].get("context_request_count") or 0) == 2
+    assert "elapsed_s" in prepare_events[-1]
+
+
+def test_prepare_for_export_stops_after_prefetch_budget_exceeded() -> None:
+    fast_client = _BatchFastClient(raise_timeout=True)
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader.PREFETCH_BATCH_TIMEOUT_STRIKE_LIMIT = 99
+    downloader.PREFETCH_TOTAL_BUDGET_S = 0.0
+    request = _build_context_hint_request("sample-image.png")
+
+    try:
+        downloader.prepare_for_export([request])
+    except RuntimeError as exc:
+        assert "exceeding total budget" in str(exc)
+    else:
+        raise AssertionError("expected prefetch budget guard to stop the batch prefetch")
+
+
+def test_prepare_for_export_skips_old_bucket_requests_in_metadata_batch_prefetch() -> None:
+    fast_client = _BatchFastClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader.PREFETCH_LARGE_REQUEST_THRESHOLD = 1
+    request = {
+        "asset_type": "image",
+        "file_name": "old-prefetch-skip.jpg",
+        "timestamp_ms": 1750000000000,
+        "download_hint": {
+            "message_id_raw": "7610000000000000301",
+            "element_id": "7610000000000000300",
+            "peer_uid": "u_example",
+            "chat_type_raw": "2",
+        },
+    }
+
+    downloader.prepare_for_export([request])
+
+    assert fast_client.calls == []
+
+
+def test_prepare_for_export_uses_smaller_batches_and_explicit_timeout_for_large_runs() -> None:
+    fast_client = _BatchFastClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader.PREFETCH_LARGE_REQUEST_THRESHOLD = 50
+    downloader.PREFETCH_LARGE_BATCH_SIZE = 10
+    downloader.PREFETCH_BATCH_TIMEOUT_S = 12.5
+    requests = []
+    for index in range(0, 51):
+        request = _build_context_hint_request(f"context-{index}.jpg")
+        request["timestamp_ms"] = 1770000000000
+        requests.append(request)
+
+    downloader.prepare_for_export(requests)
+
+    assert [len(batch) for batch in fast_client.calls] == [10, 10, 10, 10, 10, 1]
+    assert fast_client.timeouts == [12.5, 12.5, 12.5, 12.5, 12.5, 12.5]
+
+
+def test_prepare_for_export_degrades_after_repeated_batch_timeouts() -> None:
+    fast_client = _BatchFastClient(raise_timeout=True)
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader.PREFETCH_BATCH_SIZE = 5
+    downloader.PREFETCH_BATCH_TIMEOUT_STRIKE_LIMIT = 2
+    requests = []
+    for index in range(0, 15):
+        request = _build_context_hint_request(f"timeout-{index}.jpg")
+        request["timestamp_ms"] = 1770000000000
+        requests.append(request)
+    progress_events: list[dict[str, object]] = []
+
+    try:
+        downloader.prepare_for_export(
+            requests,
+            progress_callback=progress_events.append,
+        )
+    except RuntimeError as exc:
+        assert "repeated batch hydrate timeouts" in str(exc)
+    else:
+        raise AssertionError("prepare_for_export should degrade after repeated batch timeouts")
+
+    assert len(fast_client.calls) == 2
+    error_events = [
+        event for event in progress_events
+        if str(event.get("phase") or "") == "prefetch_media_chunk"
+        and str(event.get("stage") or "") == "error"
+    ]
+    assert len(error_events) == 2
+    assert all(str(event.get("reason") or "") == "chunk_timeout" for event in error_events)
+
+
+def test_classify_missing_from_public_payload_marks_old_file_without_path_or_url_as_background() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+
+    classification = downloader._classify_missing_from_public_payload(
+        {
+            "asset_type": "file",
+            "public_action": "get_file",
+            "file": "",
+            "url": "",
+            "file_name": "old-uploaded.jpg",
+        },
+        old_bucket=("file", "2025-09"),
+        request={
+            "asset_type": "file",
+            "file_name": "old-uploaded.jpg",
+        },
+    )
+
+    assert classification == "qq_expired_after_napcat"
+
+
+def test_resolve_via_direct_file_id_marks_old_file_not_found_as_background() -> None:
+    downloader = NapCatMediaDownloader(_MissingDirectFileClient())
+    request = {
+        "asset_type": "file",
+        "file_name": "old-uploaded.jpg",
+        "timestamp_ms": 1757268507000,
+        "download_hint": {
+            "file_id": "/494603f2-038f-4fd0-bffa-934b4553f019",
+        },
+    }
+
+    resolved = downloader._resolve_via_direct_file_id(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
 
 
 def test_consume_remote_media_prefetch_peek_does_not_block_on_inflight_future() -> None:

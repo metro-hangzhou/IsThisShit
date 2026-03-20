@@ -1173,3 +1173,85 @@
     - 时间窗和历史源
     - 资产恢复总体结果
     - missing 是否只是背景缺失
+
+### [2026-03-21][040] `10000` 条导出的 bounded diagnosis 已收口到两条明确结论
+
+- 新现场诉求：
+  - 当 `data_count` 拉到 `10000` 或者直接导出超长历史窗口时：
+    - 不能再靠“等很久看它会不会 finally failed”
+  - 需要尽早拿到：
+    - 当前到底卡在哪个阶段
+    - 是真的阻塞，还是只是大窗正常运行中
+- 本轮针对 `group 922065597` 的 live probe 结论：
+  - `prefetch_media_chunk` 现在已经有稳定心跳和耗时速率显示
+  - 但如果把所有 old-bucket context 资产都重新纳入 batch prefetch：
+    - metadata-only 预热仍会把 `10000` 条导出的 prefetch 阶段拖爆预算
+  - 因此当前保留：
+    - 大窗 old-bucket batch prefetch 跳过
+  - 只对较新的 context 资产做 batch prefetch
+- 同时收紧了一个误报：
+  - `2025-09-08` 那条旧 `file` 资产：
+    - context hydration 可达
+    - public token `get_file` 也返回
+    - 但本地 path/url 为空
+    - direct `file_id` 再返回 `file not found`
+  - 这类 case 现在从：
+    - `missing_after_napcat`
+  - 改为：
+    - `qq_expired_after_napcat`
+- 当前 maintainer 侧 live baseline：
+  - `export-history group 922065597 --limit 10000 --format jsonl`
+  - 约 `122.1s` 完成
+  - `actionable_missing=0`
+  - `background_missing=900`
+  - `prefetch_chunks=3`
+  - `prefetch_degraded=no`
+- 当前价值：
+  - `10000` 量级现在已经能在可接受时间里拿到完整 verdict
+  - 不再需要盲等很久才知道是不是 exporter 主链真的炸了
+
+### [2026-03-21][041] `prefetch` 准备阶段现已显式出心跳，导出结果不再把“已完成但有可行动 missing”误标成 failed
+
+- 新现场反馈：
+  - 大窗 root export 在：
+    - `status=in progress export_progress: prefetching media context requests=3150`
+  - 这一步仍然会静止几十秒，operator 不知道它到底是在卡住还是在正常扫描待预热资产
+  - 同时导出完成后还出现了语义冲突：
+    - `export_status=failed export_verdict=success_with_actionable_missing`
+- 根因复核：
+  - downloader 已经发出了：
+    - `phase=prefetch_media_prepare`
+  - 但 REPL / CLI / watch 的进度路由仍然只接：
+    - `prefetch_media`
+    - `prefetch_media_chunk`
+  - 所以这段“正在枚举 / 分类 / 跳过 old bucket / 复用本地 path”的准备工作没有被显示出来
+  - 另外 `export_status` 之前仍被 `actionable_missing_count > 0` 直接映射成：
+    - `failed`
+  - 这不适合“数据文件已经成功写出，但仍有部分可行动 missing”的场景
+- 本轮修正：
+  - `prefetch_media_prepare` 已接入：
+    - CLI
+    - REPL
+    - watch view
+  - 现在 large export 会显式显示：
+    - `planning media prefetch scanned=... context=... local=... skip_old=...`
+  - `export_status` 统一改成表达“导出流程是否完成”：
+    - 成功写出 bundle 时为：
+      - `success`
+  - 细分结果继续留在：
+    - `export_verdict`
+  - 同时新增 note：
+    - 若存在 actionable missing，会明确提示优先查看 `actionable_missing_reason` 和 trace
+- maintainer 侧 live 验证：
+  - `export-history group 922065597 --limit 2000 --format jsonl`
+  - 现在在 prefetch 阶段可见连续心跳：
+    - `planning media prefetch scanned=105/570 context=41 local=64 skip_old=0 ...`
+    - `planning media prefetch scanned=500/570 context=248 local=247 skip_old=0 ...`
+    - `planned media prefetch scanned=570/570 context=254 local=304 skip_old=0 ...`
+  - 最终结果块也已变成：
+    - `export_status=success export_verdict=success_with_background_missing`
+- 当前价值：
+  - operator 终于能区分：
+    - 真卡死
+    - 还是正在做 prefetch 规划
+  - 导出完成后的 `status` / `verdict` 语义也更直观，不再互相打架
