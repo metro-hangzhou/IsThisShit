@@ -969,3 +969,27 @@
     - `prime_failed`
 - 当前价值：
   - 避免“后台查过一次空结果，然后 /login 长时间只有参数没有 QQ”这一类假死体验
+
+### [2026-03-20][031] REPL 启动阶段预热 NapCat WebUI，并把 quick-login 补全来源顺序改成 NapCat 优先
+
+- 新现场反馈：
+  - `main` 上：
+    - `/login`
+  - 仍然可能先看到参数补全，没有 QQ 候选
+  - 用户同时提出：
+    - 打开程序时就应先加载 NapCat service
+    - 加载完成后再开放输入
+- 本轮修正：
+  - REPL 启动时先执行一轮：
+    - `startup_napcat`
+    - 预热 `webui`
+  - 然后才开始 quick-login 候选预热和放出交互提示
+  - `/login` 候选顺序调整为：
+    - NapCat 候选缓存优先
+    - 本地 pinned `quick_login_uin` 仅作兜底
+- 关联风险：
+  - 这轮现场又暴露出新的 release skew：
+    - `repl.py` 已经开始给 `ensure_endpoint(...)` 传 `quick_login_uin`
+    - 但发布线 `bootstrap.py` 仍是旧签名
+  - 这条已单独记录进：
+    - `branch-sync-incidents.md`

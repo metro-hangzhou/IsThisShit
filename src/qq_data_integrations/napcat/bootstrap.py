@@ -37,19 +37,40 @@ class NapCatBootstrapper:
         *,
         timeout_seconds: float = 20.0,
         poll_interval: float = 0.5,
+        quick_login_uin: str | None = None,
     ) -> NapCatStartResult:
         result = self._runtime_starter.ensure_endpoint(
             endpoint,
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval,
+            quick_login_uin=quick_login_uin,
         )
-        if result.ready or endpoint == "webui":
+        if endpoint == "webui":
+            if not result.ready:
+                return result
+            active_settings = self._load_settings_for_active_runtime()
+            client = self._webui_client_factory(active_settings)
+            try:
+                client.ensure_authenticated()
+            except NapCatWebUiError as exc:
+                return NapCatStartResult(
+                    endpoint=endpoint,
+                    attempted_start=result.attempted_start,
+                    launcher_path=active_settings.napcat_launcher_path,
+                    napcat_log_path=result.napcat_log_path,
+                    message=str(exc) + _napcat_log_hint(result.napcat_log_path),
+                )
+            finally:
+                client.close()
+            return result
+        if result.ready:
             return result
 
         webui_result = self._runtime_starter.ensure_endpoint(
             "webui",
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval,
+            quick_login_uin=quick_login_uin,
         )
         if not webui_result.ready:
             return result
@@ -82,6 +103,20 @@ class NapCatBootstrapper:
                         "Run /login first, then retry the command."
                         + _napcat_log_hint(result.napcat_log_path or webui_result.napcat_log_path)
                     ),
+                )
+            login_info = client.get_login_info()
+            if not login_info.is_usable_session():
+                return NapCatStartResult(
+                    endpoint=endpoint,
+                    attempted_start=result.attempted_start or webui_result.attempted_start,
+                    launcher_path=active_settings.napcat_launcher_path,
+                    napcat_log_path=result.napcat_log_path or webui_result.napcat_log_path,
+                    message=(
+                        "NapCat WebUI reports a logged-in state, but did not return usable QQ session info. "
+                        "This usually means an old runtime/session is stuck or the login state is inconsistent. "
+                        "Restart NapCat or run /login again."
+                    )
+                    + _napcat_log_hint(result.napcat_log_path or webui_result.napcat_log_path),
                 )
 
             changed = client.ensure_default_onebot_servers(

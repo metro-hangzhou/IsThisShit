@@ -3,6 +3,7 @@ from __future__ import annotations
 from qq_data_cli.export_commands import ParsedExportCommand
 from qq_data_cli.repl import SlashRepl
 from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
+from qq_data_integrations.napcat.runtime import NapCatStartResult
 
 
 class _QuickLoginOnlyService:
@@ -169,6 +170,19 @@ def test_repl_quick_login_completion_returns_pinned_uin_without_blocking_on_serv
     assert [item.uin for item in results] == ["3956020260"]
 
 
+def test_repl_quick_login_completion_prefers_napcat_candidates_before_local_pin(monkeypatch) -> None:
+    repl = SlashRepl()
+    repl._settings = repl._settings.model_copy(update={"quick_login_uin": "3956020260"})
+    repl._quick_login_candidates_cache = [("1507833383", "blank"), ("3956020260", "wiki")]
+    repl._quick_login_candidates_cached_at = 1.0
+
+    monkeypatch.setattr("qq_data_cli.repl.monotonic", lambda: 2.0)
+
+    results = repl._lookup_quick_login_candidates_for_completion(None, 10)
+
+    assert [item.uin for item in results] == ["1507833383", "3956020260"]
+
+
 def test_repl_quick_login_completion_background_prime_populates_cache(monkeypatch) -> None:
     repl = SlashRepl()
 
@@ -236,3 +250,25 @@ def test_repl_quick_login_completion_empty_prime_does_not_mark_cache_fresh(monke
     assert repl._quick_login_candidates_cache == []
     assert repl._quick_login_candidates_cached_at is None
     assert repl._quick_login_candidates_prime_failed_at is not None
+
+
+def test_repl_startup_warm_napcat_service_uses_pinned_quick_login_uin(monkeypatch) -> None:
+    repl = SlashRepl()
+    repl._settings = repl._settings.model_copy(update={"quick_login_uin": "3956020260"})
+    captured: dict[str, object] = {}
+    printed: list[str] = []
+
+    class _Bootstrapper:
+        def ensure_endpoint(self, endpoint, **kwargs):
+            captured["endpoint"] = endpoint
+            captured["kwargs"] = kwargs
+            return NapCatStartResult(endpoint="webui", ready=True, message="NapCat WebUI ready")
+
+    monkeypatch.setattr(repl, "_require_bootstrapper", lambda: _Bootstrapper())
+    monkeypatch.setattr(repl._console, "print", lambda message, *args, **kwargs: printed.append(str(message)))
+
+    repl._warm_napcat_service_for_startup()
+
+    assert captured["endpoint"] == "webui"
+    assert captured["kwargs"]["quick_login_uin"] == "3956020260"
+    assert "NapCat WebUI ready" in " ".join(printed)
