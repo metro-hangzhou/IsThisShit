@@ -15,6 +15,7 @@ from prompt_toolkit.application.current import get_app_or_none
 from prompt_toolkit.filters import Condition, has_completions
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
 from rich.console import Console, Group
 from rich.live import Live
@@ -1542,6 +1543,8 @@ class SlashRepl:
             session_kwargs["style"] = Style.from_dict({"export-date-literal": "bg:#ffffff #000000"})
         if self._ui_profile.show_completion_menu:
             session_kwargs["reserve_space_for_menu"] = 8
+        if self._ui_profile.mode == "compat":
+            session_kwargs["complete_style"] = CompleteStyle.READLINE_LIKE
         return PromptSession(
             "> ",
             **session_kwargs,
@@ -1951,13 +1954,20 @@ def _build_key_bindings() -> KeyBindings:
     def _(event) -> None:
         buffer = event.app.current_buffer
         if buffer.complete_state:
+            if _is_login_completion_context(buffer.text):
+                _navigate_completion_menu_without_inserting(buffer, direction=1)
+                return
             buffer.complete_next()
         else:
             buffer.start_completion(select_first=_should_select_first_completion(buffer.text))
 
     @bindings.add("down", filter=has_completions)
     def _(event) -> None:
-        event.app.current_buffer.complete_next()
+        buffer = event.app.current_buffer
+        if _is_login_completion_context(buffer.text):
+            _navigate_completion_menu_without_inserting(buffer, direction=1)
+            return
+        buffer.complete_next()
 
     @bindings.add("down", filter=~has_completions & can_roll_export_date)
     def _(event) -> None:
@@ -1965,7 +1975,11 @@ def _build_key_bindings() -> KeyBindings:
 
     @bindings.add("up", filter=has_completions)
     def _(event) -> None:
-        event.app.current_buffer.complete_previous()
+        buffer = event.app.current_buffer
+        if _is_login_completion_context(buffer.text):
+            _navigate_completion_menu_without_inserting(buffer, direction=-1)
+            return
+        buffer.complete_previous()
 
     @bindings.add("up", filter=~has_completions & can_roll_export_date)
     def _(event) -> None:
@@ -2093,6 +2107,31 @@ def _completion_followup(text: str, *, accepted_text: str | None = None) -> str 
     if len(tokens) in {2, 3, 4} and tokens[0].casefold() in EXPORT_COMMAND_PROFILES and _is_batch_export_token(tokens[1]):
         return "space_then_complete"
     return "cancel"
+
+
+def _is_login_completion_context(text: str) -> bool:
+    tokens = _split_cli_tokens(text.rstrip())
+    return bool(tokens) and tokens[0].casefold() == "/login"
+
+
+def _navigate_completion_menu_without_inserting(buffer, *, direction: int) -> None:
+    state = buffer.complete_state
+    if state is None:
+        return
+    completions = getattr(state, "completions", None) or []
+    if not completions:
+        return
+    index = getattr(state, "complete_index", None)
+    last_index = len(completions) - 1
+    if direction >= 0:
+        next_index = 0 if index is None else (None if index >= last_index else index + 1)
+    else:
+        next_index = last_index if index is None else (None if index <= 0 else index - 1)
+    state.go_to_index(next_index)
+    buffer.complete_state = state
+    app = get_app_or_none()
+    if app is not None:
+        app.invalidate()
 
 
 def _should_start_completion_on_space(text: str) -> bool:

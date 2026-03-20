@@ -399,12 +399,10 @@ class SlashCommandCompleter(Completer):
 
         if not positionals and not ends_with_space:
             yield from self._complete_quick_login_candidates(current_token or None, start_position=start_position)
-            yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)
             return
 
         if not positionals and ends_with_space:
             yield from self._complete_quick_login_candidates(None, start_position=start_position)
-            yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)
             return
 
         yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)

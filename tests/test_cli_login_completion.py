@@ -42,7 +42,7 @@ def test_login_completion_suggests_quick_login_uins_after_command() -> None:
     completion_texts = {item.text for item in completions}
     assert "3956020260" in completion_texts
     assert "1507833383" in completion_texts
-    assert "--refresh" in completion_texts
+    assert "--refresh" not in completion_texts
 
 
 def test_login_completion_suggests_quick_login_uins_for_quick_uin_option() -> None:
@@ -75,3 +75,20 @@ def test_login_completion_suggests_inline_quick_uin_values_without_trailing_spac
     completion_texts = {item.text for item in completions}
     assert "--quick-uin 3956020260" in completion_texts
     assert "--quick-uin 1507833383" in completion_texts
+
+
+def test_login_completion_only_shows_options_after_explicit_dash_prefix() -> None:
+    completer = SlashCommandCompleter(
+        target_lookup=_empty_target_lookup,
+        quick_login_lookup=_quick_login_lookup,
+        now_provider=lambda: datetime.now(EXPORT_TIMEZONE),
+    )
+
+    completions = list(
+        completer.get_completions(Document("/login --"), None)
+    )
+
+    completion_texts = {item.text for item in completions}
+    assert "--refresh" in completion_texts
+    assert "--quick-uin" in completion_texts
+    assert "3956020260" not in completion_texts

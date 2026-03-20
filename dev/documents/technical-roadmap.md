@@ -66,6 +66,16 @@
 
 ## 4. 里程碑日志
 
+### [2026-03-20][033] `/login` quick-login completion and `start_cli` launcher update handoff hardened
+
+- `/login` quick-login completion in classic Windows console no longer auto-applies the first QQ candidate during menu navigation
+- login completion navigation now keeps the buffer text stable during `Tab/Up/Down`; the selected QQ number is only inserted on explicit accept
+- compat-mode REPL sessions now use readline-like completion rendering for login-style flows to reduce horizontal menu corruption in classic console hosts
+- `start_cli.bat` now hands off to the freshly updated launcher script after a successful `git pull`, so launcher/runtime changes can take effect in the same run
+- when the fetched diff touches NapCat runtime paths or launcher helpers, `start_cli` now marks the run for a best-effort NapCat service restart before starting the CLI
+- repo-scoped NapCat restart logic now lives in:
+  - [restart_napcat_service.ps1](../../restart_napcat_service.ps1)
+
 ### [2026-03-06][001] 导出器与 NapCat 公共接口基线冻结
 
 - 根规则以 [AGENTS.md](../../AGENTS.md) 为准
@@ -1013,3 +1023,26 @@
 - 修正方向：
   - 将 `runtime.py` 和对应的 launch/diagnostic 测试也纳入 release bundle
   - 不再允许“上层签名升级、底层 runtime 还停留旧版”这种半套状态
+
+### [2026-03-20][034] `/login` 补全交互继续收口：默认优先 QQ 号，不把参数和 QQ 混在一起，经典控制台导航不再污染输入行
+
+- 新现场反馈：
+  - `main` 更新后：
+    - `/login`
+  - 已经能看到 QQ 候选，但仍会：
+    - 默认把第一个 QQ 塞进输入框
+    - `Up/Down` 导航时把多个 QQ 号拼进同一行
+    - QQ 候选和 `--refresh/--timeout/...` 混在同一菜单里
+- 当前判断：
+  - 这不是候选源问题，而是：
+    - prompt_toolkit 默认 completion 导航会重写 buffer
+    - `/login` 在“用户还没输入 `--`”时仍同时吐出参数和 QQ 候选
+- 本轮修正方向：
+  - 经典 Windows 控制台下，`/login` completion 菜单导航只切换菜单索引，不再改写 buffer
+  - `/login` 在尚未显式输入 `--` 之前，默认只展示 QQ 号候选
+  - 只有用户显式输入 `--` 或 `--quick-uin` 上下文时，才展示 login 选项
+- 目标效果：
+  - `/login`
+    - 默认就是“按 QQ 号作为输入”
+  - `/watch` / `/export`
+    - 行为保持不变

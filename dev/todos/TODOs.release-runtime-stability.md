@@ -373,6 +373,22 @@ Recent field failures showed that the project has two separate but related stabi
     - `bootstrap`
     - `runtime`
   - prevents one-layer-deeper signature failures after partial release sync
+- [x] Stop `/login` completion from mutating the input buffer while the operator is only navigating the quick-login menu
+  - classic Windows console now keeps `/login` buffer text stable during `Tab/Up/Down`
+  - selected QQ is only inserted on explicit accept
+- [x] Make `start_cli.bat` hand off to the freshly updated script after a successful `main` fast-forward
+  - ensures newly pulled launcher/runtime logic can take effect in the same run
+- [x] Add a best-effort NapCat service restart helper for update runs that touch NapCat runtime/launcher paths
+  - implemented via:
+    - [restart_napcat_service.ps1](../../restart_napcat_service.ps1)
+  - current policy is repo-scoped process stop + relaunch through [start_napcat_logged.bat](../../start_napcat_logged.bat)
+- [x] Make `/login` default completion QQ-first and option-on-demand
+  - when the operator has not explicitly typed `--`, `/login` now only shows QQ number candidates
+  - login options are still available once the operator enters an option prefix such as:
+    - `--`
+    - `--quick-uin`
+- [x] Stop classic-console `/login` completion navigation from concatenating multiple QQ numbers into one line
+  - compat-mode `Tab/Up/Down` navigation now keeps the input buffer stable and only moves the menu cursor
 - [ ] Surface runtime bootstrap drift more explicitly in CLI export entrypoints
   - when `ensure_endpoint(...)` auto-starts or auto-configures the runtime, `export-history` should print the effective runtime note more prominently
 - [ ] Show active runtime session identity even when no fixed `quick_login_uin` is configured
