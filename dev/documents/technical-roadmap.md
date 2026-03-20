@@ -245,6 +245,19 @@
   - asset timeout / 阻塞主矛盾已明显下降
   - 可以继续往下更狠地刁 deep-forward / route downgrade / operator guardrail
 
+### [2026-03-20][015] forward route 与普通 context route 健康状态拆分
+
+- exporter 现在不再用一个全局 kill switch 同时关闭：
+  - `/hydrate-media`
+  - `/hydrate-forward-media`
+- 当前行为：
+  - forward route 单独不可用时，只关闭 deep-forward hydration
+  - ordinary context route 仍保持可用
+  - 反之亦然
+- 价值：
+  - 减少“某一路由抖了一次，整个进程都像降级成慢路径”的误伤
+  - 更贴近朋友机器那种环境漂移/插件局部异常的真实故障形态
+
 ## 5. 当前主线任务
 
 当前主线开发按优先级排序：
@@ -830,3 +843,34 @@
   - 方便朋友机器和大群导出现场更快判断：
     - 到底是背景缺失
     - 还是新的可行动故障
+
+### [2026-03-20][026] remote prefetch runtime 启动失败改为受控降级，不再把 downloader 构造直接炸掉
+
+- reviewer 继续往死里刁时，发现当前还有一个“看着像偶发、实则很伤”的点：
+  - `NapCatMediaDownloader` 构造阶段如果远程预取 async runtime `5s` 内没 ready
+  - 会直接抛：
+    - `remote media async runtime failed to start`
+  - 这会把本来只是“远程预取优化不可用”的情况，放大成整个导出器初始化失败
+- 本轮修正：
+  - `remote prefetch runtime` 启动失败时：
+    - 记录禁用状态
+    - 保留 `public token` 预取线程池
+    - 正式导出链继续可用
+  - 也就是说现在语义变成：
+    - “少一个优化子系统”
+    - 而不是：
+    - “整个 exporter 构造炸掉”
+- focused regression：
+  - `tests/test_media_downloader_progress_and_forward_timeout.py`
+  - `tests/test_export_selection_summary.py`
+  - `23 passed`
+- live sanity：
+  - `group 922065597 --limit 300 --format jsonl`
+  - 结果：
+    - `records=300`
+    - `copied=79 reused=16 missing=13`
+    - `actionable_missing=0`
+    - `background_missing=13`
+  - 当前解释：
+    - 这轮没有改动导出结果语义
+    - 只是把一个高风险初始化炸点降成了可控退化

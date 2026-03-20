@@ -62,6 +62,7 @@ class NapCatMediaDownloader:
         self._fast_client = fast_client
         self._logger = logging.getLogger(__name__)
         self._fast_context_route_disabled = False
+        self._fast_forward_context_route_disabled = False
         self._old_context_failure_buckets: dict[tuple[str, str], int] = {}
         self._old_context_skip_logged: set[tuple[str, str]] = set()
         self._old_context_expired_buckets: set[tuple[str, str]] = set()
@@ -75,6 +76,8 @@ class NapCatMediaDownloader:
             if remote_cache_dir is not None
             else None
         )
+        self._remote_prefetch_runtime_disabled = False
+        self._remote_prefetch_runtime_disable_reason: str | None = None
         self._remote_cache_dir: Path | None = None
         self._active_export_cache_token: str | None = None
         self._use_system_proxy = use_system_proxy
@@ -199,6 +202,7 @@ class NapCatMediaDownloader:
     def _reset_transient_export_state(self) -> None:
         with self._prefetch_state_lock:
             self._fast_context_route_disabled = False
+            self._fast_forward_context_route_disabled = False
             self._prefetched_media.clear()
             self._prefetched_media_payloads.clear()
             self._prefetched_forward_media.clear()
@@ -1184,7 +1188,7 @@ class NapCatMediaDownloader:
         materialize: bool = False,
         trace_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[Path | None, str | None] | None:
-        if self._fast_client is None or self._fast_context_route_disabled:
+        if self._fast_client is None or self._fast_forward_context_route_disabled:
             return None
         hint = self._request_hint(request)
         parent = hint.get("_forward_parent")
@@ -1309,9 +1313,10 @@ class NapCatMediaDownloader:
                 elapsed_s=elapsed_s,
                 detail=str(exc),
             )
-            self._fast_context_route_disabled = True
+            self._fast_forward_context_route_disabled = True
             self._logger.info(
-                "fast_forward_hydration_unavailable; disabling fast forward hydration for this process. detail=%s",
+                "fast_forward_hydration_unavailable; disabling only /hydrate-forward-media for this process. "
+                "Ordinary /hydrate-media remains enabled. detail=%s",
                 exc,
             )
             self._prefetched_forward_media[key] = (None, None)
@@ -1427,7 +1432,11 @@ class NapCatMediaDownloader:
         request: dict[str, Any] | None = None,
         trace_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any] | None:
-        if self._fast_client is None or self._fast_context_route_disabled or not self._has_context_hint(hint):
+        if (
+            self._fast_client is None
+            or self._fast_context_route_disabled
+            or not self._has_context_hint(hint)
+        ):
             return None
         timeout_s = self.CONTEXT_ROUTE_TIMEOUT_S
         if request is not None:
@@ -1465,7 +1474,8 @@ class NapCatMediaDownloader:
             self._fast_context_route_disabled = True
             self._logger.info(
                 "fast_context_hydration_unavailable; disabling /hydrate-media for this process and "
-                "falling back to local/public recovery. A NapCat restart may be required. detail=%s",
+                "falling back to local/public recovery. /hydrate-forward-media remains independently available. "
+                "A NapCat restart may be required. detail=%s",
                 exc,
             )
             return None
@@ -2977,7 +2987,22 @@ class NapCatMediaDownloader:
         self._rebuild_prefetch_executors(wait=False, recreate=True)
 
     def _create_prefetch_executors(self) -> None:
-        self._start_remote_download_runtime()
+        if not self._remote_prefetch_runtime_disabled:
+            try:
+                self._start_remote_download_runtime()
+                self._remote_prefetch_runtime_disabled = False
+                self._remote_prefetch_runtime_disable_reason = None
+            except Exception as exc:
+                self._remote_prefetch_runtime_disabled = True
+                self._remote_prefetch_runtime_disable_reason = str(exc)
+                self._remote_loop = None
+                self._remote_loop_thread = None
+                self._remote_async_client = None
+                self._remote_async_semaphore = None
+                self._logger.warning(
+                    "remote_media_prefetch_runtime_disabled detail=%s",
+                    exc,
+                )
         self._public_token_executor = ThreadPoolExecutor(
             max_workers=self._public_token_prefetch_workers,
             thread_name_prefix="qq-public-token",
