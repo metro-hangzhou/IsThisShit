@@ -186,3 +186,53 @@ def test_repl_quick_login_completion_background_prime_populates_cache(monkeypatc
     results = repl._lookup_quick_login_candidates_for_completion(None, 10)
 
     assert any(item.uin == "3956020260" for item in results)
+
+
+def test_repl_quick_login_completion_background_prime_falls_back_to_active_login_info(monkeypatch) -> None:
+    repl = SlashRepl()
+
+    class _Service:
+        def get_quick_login_candidates(self):
+            return []
+
+        def get_ready_login_info(self):
+            return NapCatLoginInfo(uin="3956020260", nick="wiki", online=True)
+
+        def get_login_info(self):
+            return NapCatLoginInfo(uin="3956020260", nick="wiki", online=True)
+
+    monkeypatch.setattr(repl, "_require_login_service", lambda: _Service())
+
+    repl._kickoff_quick_login_candidates_prime_if_needed(announce=False)
+    thread = repl._quick_login_candidates_prime_thread
+    assert thread is not None
+    thread.join(timeout=2.0)
+
+    results = repl._lookup_quick_login_candidates_for_completion(None, 10)
+
+    assert any(item.uin == "3956020260" for item in results)
+
+
+def test_repl_quick_login_completion_empty_prime_does_not_mark_cache_fresh(monkeypatch) -> None:
+    repl = SlashRepl()
+
+    class _Service:
+        def get_quick_login_candidates(self):
+            return []
+
+        def get_ready_login_info(self):
+            return None
+
+        def get_login_info(self):
+            return NapCatLoginInfo()
+
+    monkeypatch.setattr(repl, "_require_login_service", lambda: _Service())
+
+    repl._kickoff_quick_login_candidates_prime_if_needed(announce=False)
+    thread = repl._quick_login_candidates_prime_thread
+    assert thread is not None
+    thread.join(timeout=2.0)
+
+    assert repl._quick_login_candidates_cache == []
+    assert repl._quick_login_candidates_cached_at is None
+    assert repl._quick_login_candidates_prime_failed_at is not None
