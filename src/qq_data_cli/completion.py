@@ -18,7 +18,12 @@ from qq_data_core.models import EXPORT_TIMEZONE
 from qq_data_cli.export_commands import EXPORT_COMMAND_PROFILES, FORMAT_MARKERS
 from qq_data_cli.export_input import render_export_date_literal_display
 from qq_data_cli.logging_utils import get_cli_logger
-from qq_data_cli.target_display import format_target_label, format_target_remark, is_blank_like_text
+from qq_data_cli.target_display import (
+    format_display_name,
+    format_target_label,
+    format_target_remark,
+    is_blank_like_text,
+)
 
 if TYPE_CHECKING:
     from qq_data_integrations.napcat.models import ChatTarget
@@ -426,12 +431,15 @@ class SlashCommandCompleter(Completer):
             uin = str(candidate.uin).strip()
             if not uin or uin in seen:
                 continue
-            if normalized_keyword:
-                haystacks = [uin, str(candidate.nick_name or "").strip()]
-                if not any(normalized_keyword in item.casefold() for item in haystacks if item):
-                    continue
+            nick_name = str(candidate.nick_name or "").strip()
+            if normalized_keyword and not _quick_login_candidate_matches(
+                normalized_keyword,
+                uin=uin,
+                nick_name=nick_name,
+            ):
+                continue
             seen.add(uin)
-            display_meta = candidate.nick_name or "quick login"
+            display_meta = _format_quick_login_candidate_meta(candidate.nick_name)
             yield Completion(
                 text=uin,
                 start_position=start_position,
@@ -459,12 +467,15 @@ class SlashCommandCompleter(Completer):
             uin = str(candidate.uin).strip()
             if not uin or uin in seen:
                 continue
-            if normalized_keyword:
-                nick = str(candidate.nick_name or "").strip()
-                if normalized_keyword not in uin.casefold() and normalized_keyword not in nick.casefold():
-                    continue
+            nick_name = str(candidate.nick_name or "").strip()
+            if normalized_keyword and not _quick_login_candidate_matches(
+                normalized_keyword,
+                uin=uin,
+                nick_name=nick_name,
+            ):
+                continue
             seen.add(uin)
-            display_meta = candidate.nick_name or "quick login"
+            display_meta = _format_quick_login_candidate_meta(candidate.nick_name)
             yield Completion(
                 text=f"{option_prefix}{uin}",
                 start_position=start_position,
@@ -641,6 +652,21 @@ def _complete_data_count_inline(current_token: str, *, start_position: int):
             display=DATA_COUNT_INLINE,
             display_meta="limit exported messages",
         )
+
+
+def _quick_login_candidate_matches(keyword: str, *, uin: str, nick_name: str) -> bool:
+    normalized_uin = uin.casefold()
+    normalized_nick = nick_name.casefold()
+    if keyword.isdigit():
+        return normalized_uin.startswith(keyword)
+    return keyword in normalized_uin or keyword in normalized_nick
+
+
+def _format_quick_login_candidate_meta(nick_name: str | None) -> str:
+    raw = str(nick_name or "")
+    if not raw:
+        return "quick login"
+    return format_display_name(raw, kind="ID")
 
 
 def _build_date_stage_candidate(

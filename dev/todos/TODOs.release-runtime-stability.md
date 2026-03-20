@@ -389,6 +389,16 @@ Recent field failures showed that the project has two separate but related stabi
     - `--quick-uin`
 - [x] Stop classic-console `/login` completion navigation from concatenating multiple QQ numbers into one line
   - compat-mode `Tab/Up/Down` navigation now keeps the input buffer stable and only moves the menu cursor
+- [x] Make `/login` quick-login filtering behave like QQ-number input rather than loose substring search
+  - numeric input now filters quick-login candidates by QQ-number prefix
+  - blank-like quick-login nicknames now render as:
+    - `<空白ID>`
+- [x] Add light auto-refresh for command/login completion while typing
+  - covers:
+    - `/l`
+    - `/login `
+    - `/login 3`
+    - `/login --quick-uin`
 - [ ] Surface runtime bootstrap drift more explicitly in CLI export entrypoints
   - when `ensure_endpoint(...)` auto-starts or auto-configures the runtime, `export-history` should print the effective runtime note more prominently
 - [ ] Show active runtime session identity even when no fixed `quick_login_uin` is configured
