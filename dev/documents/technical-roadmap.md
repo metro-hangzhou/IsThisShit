@@ -205,6 +205,46 @@
   - 大窗 forward metadata timeout 数量下降，不再每个 sibling 都完整吃一次 12 秒
   - 已登录本机 QQ 的情况下，`/login` 可优先走 quick login
 
+### [2026-03-20][013] reviewer 模式继续收敛导出阻塞与 operator 误判面
+
+- 继续以“朋友机器大群导出”作为 reviewer 主样本，确认两类根因：
+  - 真正的主链阻塞
+  - 看起来像挂了但其实只是 background missing / fast path 降级 / wrong-session 的误判
+- 本轮已落地：
+  - `cleanup_remote_cache()` 不再等待 stale prefetch futures，避免“数据和 manifest 已写完，但 CLI 还卡住不退出”
+  - REPL `data_count` 导出页大小策略与 CLI 对齐，不再意外扩大 page-size
+  - deep-forward metadata 空结果 / route error / timeout 的 sibling 短路缓存继续补强
+  - old placeholder image 只在没有 prefetched usable payload/path 时才短路为背景缺失，避免误伤可恢复老图
+- 本轮 live 结论：
+  - `group 922065597 limit=2000`
+    - 维持 `copied=341 reused=100 missing=129`
+    - `actionable_missing=0`
+    - 剩余 missing 全是 background-only
+  - `private 1507833383 limit=100`
+    - `missing=0`
+
+### [2026-03-20][014] deep-forward 命中后的重复打树与来源可见性补强
+
+- `NapCatMediaDownloader` 现已对相同 forward parent 的 metadata 成功 payload 做本轮进程内缓存：
+  - 同一组 sibling asset 不再反复重打 `/hydrate-forward-media` 再全树匹配
+- forward 命中后的恢复顺序改为：
+  1. 本地 path
+  2. forward remote URL
+  3. public token action
+- operator 可见性补强：
+  - `export_summary` 现可显示：
+    - `history_source`
+    - `history_fallback=partial`
+    - `forward_detail_count`
+    - `forward_structure_unavailable`
+  - app / REPL 首屏结果行也会带：
+    - `src=...`
+    - `history_fallback=...`
+    - `fwd_gap=...`
+- 当前判定：
+  - asset timeout / 阻塞主矛盾已明显下降
+  - 可以继续往下更狠地刁 deep-forward / route downgrade / operator guardrail
+
 ## 5. 当前主线任务
 
 当前主线开发按优先级排序：

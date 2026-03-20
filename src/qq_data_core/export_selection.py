@@ -192,6 +192,13 @@ def build_export_content_summary(
         "latest_timestamp_iso": latest_timestamp_iso,
         "format": fmt,
         "strict_missing": strict_missing,
+        "history_source": str(snapshot.metadata.get("source") or "").strip() or None,
+        "bulk_partial_fallback": bool(snapshot.metadata.get("bulk_partial_fallback")),
+        "pages_scanned": int(snapshot.metadata.get("pages_scanned") or 0),
+        "forward_detail_count": int(snapshot.metadata.get("forward_detail_count") or 0),
+        "forward_structure_unavailable_count": int(
+            snapshot.metadata.get("forward_structure_unavailable_count") or 0
+        ),
         "segment_counts": {key: int(segment_counts[key]) for key in CONTENT_SEGMENT_ORDER},
         "source_segment_counts": {
             key: int(source_segment_counts[key]) for key in CONTENT_SEGMENT_ORDER
@@ -243,6 +250,26 @@ def format_export_content_summary(summary: dict[str, object]) -> list[str]:
         lines.append(
             f"  time_range={summary['oldest_timestamp_iso']} -> {summary['latest_timestamp_iso']}"
         )
+    history_source = str(summary.get("history_source") or "").strip()
+    if history_source:
+        source_parts = [f"history_source={history_source}"]
+        if bool(summary.get("bulk_partial_fallback")):
+            source_parts.append("history_fallback=partial")
+        pages_scanned = int(summary.get("pages_scanned") or 0)
+        if pages_scanned > 0:
+            source_parts.append(f"pages_scanned={pages_scanned}")
+        lines.append("  " + " ".join(source_parts))
+    forward_detail_count = int(summary.get("forward_detail_count") or 0)
+    forward_structure_unavailable_count = int(
+        summary.get("forward_structure_unavailable_count") or 0
+    )
+    if forward_detail_count > 0 or forward_structure_unavailable_count > 0:
+        detail_parts = [f"forward_detail_count={forward_detail_count}"]
+        if forward_structure_unavailable_count > 0:
+            detail_parts.append(
+                f"forward_structure_unavailable={forward_structure_unavailable_count}"
+            )
+        lines.append("  " + " ".join(detail_parts))
     lines.append(
         "  content_export=["
         + ", ".join(
@@ -392,6 +419,9 @@ def format_export_content_summary_compact(summary: dict[str, object]) -> str:
     missing_breakdown = summary.get("missing_breakdown") or {}
     actionable_missing_count = int(summary.get("actionable_missing_count") or 0)
     background_missing_count = int(summary.get("background_missing_count") or 0)
+    history_source = str(summary.get("history_source") or "").strip() or "-"
+    bulk_partial_fallback = bool(summary.get("bulk_partial_fallback"))
+    forward_structure_unavailable_count = int(summary.get("forward_structure_unavailable_count") or 0)
 
     segment_type_count = len(segment_counts)
     expected_total = sum(int(value) for value in expected_assets.values())
@@ -405,11 +435,14 @@ def format_export_content_summary_compact(summary: dict[str, object]) -> str:
         f"profile={summary['profile']} "
         f"msgs={message_count}/{source_message_count} "
         f"req={requested_data_count} "
+        f"src={history_source} "
+        f"history_fallback={'partial' if bulk_partial_fallback else '-'} "
         f"segment_types={segment_type_count} "
         f"final_assets={actual_total}/{expected_total} "
         f"final_missing={missing_total} "
         f"actionable_missing={actionable_missing_count} "
         f"background_missing={background_missing_count} "
+        f"fwd_gap={forward_structure_unavailable_count} "
         f"expired_occurrences={expired_total} "
         f"errors={error_total}"
     )
@@ -425,6 +458,9 @@ def format_watch_export_result_summary(summary: dict[str, object]) -> str:
     missing_breakdown = summary.get("missing_breakdown") or {}
     actionable_missing_count = int(summary.get("actionable_missing_count") or 0)
     background_missing_count = int(summary.get("background_missing_count") or 0)
+    history_source = str(summary.get("history_source") or "").strip() or "-"
+    bulk_partial_fallback = bool(summary.get("bulk_partial_fallback"))
+    forward_structure_unavailable_count = int(summary.get("forward_structure_unavailable_count") or 0)
 
     expected_total = sum(int(value) for value in expected_assets.values())
     actual_total = sum(int(value) for value in actual_assets.values())
@@ -434,10 +470,13 @@ def format_watch_export_result_summary(summary: dict[str, object]) -> str:
     return (
         f"m={message_count}/{source_message_count} "
         f"req={requested_data_count} "
+        f"src={history_source} "
+        f"history_fallback={'partial' if bulk_partial_fallback else '-'} "
         f"final_a={actual_total}/{expected_total} "
         f"final_miss={missing_total} "
         f"actionable_miss={actionable_missing_count} "
         f"background_miss={background_missing_count} "
+        f"fwd_gap={forward_structure_unavailable_count} "
         f"expired_occurrences={expired_total}"
     )
 

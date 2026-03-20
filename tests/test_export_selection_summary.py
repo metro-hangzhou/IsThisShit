@@ -26,6 +26,13 @@ def _build_snapshot() -> NormalizedSnapshot:
     return NormalizedSnapshot(
         chat_type="group",
         chat_id="922065597",
+        metadata={
+            "source": "napcat_fast_history_bulk+napcat_http",
+            "bulk_partial_fallback": True,
+            "pages_scanned": 11,
+            "forward_detail_count": 5,
+            "forward_structure_unavailable_count": 2,
+        },
         messages=[
             NormalizedMessage(
                 chat_type="group",
@@ -151,9 +158,17 @@ def test_compact_and_detailed_format_include_actionable_and_background_counts() 
 
     assert "actionable_missing=1" in compact
     assert "background_missing=2" in compact
+    assert "src=napcat_fast_history_bulk+napcat_http" in compact
+    assert "history_fallback=partial" in compact
+    assert "fwd_gap=2" in compact
     assert "actionable_miss=1" in watch_summary
     assert "background_miss=2" in watch_summary
+    assert "src=napcat_fast_history_bulk+napcat_http" in watch_summary
+    assert "history_fallback=partial" in watch_summary
+    assert "fwd_gap=2" in watch_summary
     assert "actionable_missing_reason=[missing_after_napcat:1]" in detailed
+    assert "history_source=napcat_fast_history_bulk+napcat_http history_fallback=partial pages_scanned=11" in detailed
+    assert "forward_detail_count=5 forward_structure_unavailable=2" in detailed
     assert (
         "background_missing_reason=[qq_expired_after_napcat:1, qq_not_downloaded_local_placeholder:1]"
         in detailed

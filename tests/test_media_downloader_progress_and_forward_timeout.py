@@ -23,6 +23,15 @@ class _RemoteMediaDownloader(NapCatMediaDownloader):
         return b"fake-bytes" if remote_url else None
 
 
+class _CleanupProbeDownloader(NapCatMediaDownloader):
+    def __init__(self) -> None:
+        super().__init__(_DummyClient())
+        self.rebuild_calls: list[tuple[bool, bool]] = []
+
+    def _rebuild_prefetch_executors(self, *, wait: bool, recreate: bool) -> None:  # type: ignore[override]
+        self.rebuild_calls.append((wait, recreate))
+
+
 def _workspace_temp_dir() -> Path:
     root = Path(".tmp") / f"pytest_remote_cache_{uuid.uuid4().hex}"
     root.mkdir(parents=True, exist_ok=True)
@@ -41,6 +50,49 @@ class _TimeoutForwardClient:
 class _BatchFastClient:
     def hydrate_media_batch(self, _items):
         return {"items": []}
+
+
+class _EmptyForwardClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"assets": []}
+
+
+class _ErrorForwardClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        raise RuntimeError("forward route exploded")
+
+
+class _SuccessForwardClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "targeted_mode": "metadata_only",
+            "assets": [
+                {
+                    "asset_type": "image",
+                    "asset_role": "forward_media",
+                    "file_name": "2C167901425EF469C0B1F0BF859E4B2C.jpg",
+                    "file": str(Path(__file__).resolve()),
+                },
+                {
+                    "asset_type": "image",
+                    "asset_role": "forward_media",
+                    "file_name": "49D109C31C9FADA0A156408B75DC1620.png",
+                    "file": str(Path(__file__).resolve()),
+                },
+            ],
+        }
 
 
 def _build_forward_request(file_name: str) -> dict[str, object]:
@@ -93,6 +145,64 @@ def test_forward_metadata_timeout_is_short_circuited_for_sibling_assets() -> Non
     assert len(fast_client.calls) == 1
 
 
+def test_forward_metadata_empty_result_is_short_circuited_for_sibling_assets() -> None:
+    fast_client = _EmptyForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    first = downloader._download_via_forward_context(
+        _build_forward_request("2C167901425EF469C0B1F0BF859E4B2C.jpg"),
+        materialize=False,
+    )
+    second = downloader._download_via_forward_context(
+        _build_forward_request("49D109C31C9FADA0A156408B75DC1620.png"),
+        materialize=False,
+    )
+
+    assert first is None
+    assert second is None
+    assert len(fast_client.calls) == 1
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_context_empty_count"] == 1
+
+
+def test_forward_metadata_error_is_short_circuited_for_sibling_assets() -> None:
+    fast_client = _ErrorForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    first = downloader._download_via_forward_context(
+        _build_forward_request("2C167901425EF469C0B1F0BF859E4B2C.jpg"),
+        materialize=False,
+    )
+    second = downloader._download_via_forward_context(
+        _build_forward_request("49D109C31C9FADA0A156408B75DC1620.png"),
+        materialize=False,
+    )
+
+    assert first is None
+    assert second is None
+    assert len(fast_client.calls) == 1
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_context_error_count"] == 1
+
+
+def test_forward_metadata_success_payload_is_reused_for_sibling_assets() -> None:
+    fast_client = _SuccessForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    first = downloader._download_via_forward_context(
+        _build_forward_request("2C167901425EF469C0B1F0BF859E4B2C.jpg"),
+        materialize=False,
+    )
+    second = downloader._download_via_forward_context(
+        _build_forward_request("49D109C31C9FADA0A156408B75DC1620.png"),
+        materialize=False,
+    )
+
+    assert len(fast_client.calls) == 1
+    assert first == (Path(__file__).resolve(), "napcat_forward_hydrated")
+    assert second == (Path(__file__).resolve(), "napcat_forward_hydrated")
+
+
 def test_prefetched_forward_remote_payload_is_used_before_metadata_requery() -> None:
     temp_root = _workspace_temp_dir()
     downloader = _RemoteMediaDownloader(temp_root / "remote_cache")
@@ -140,6 +250,40 @@ def test_prefetched_forward_public_token_is_used_before_metadata_requery() -> No
 
     assert resolved == Path(__file__).resolve()
     assert resolver == "napcat_get_image"
+
+
+def test_forward_match_prefers_remote_url_before_public_token() -> None:
+    temp_root = _workspace_temp_dir()
+    downloader = _RemoteMediaDownloader(temp_root / "remote_cache")
+    request = _build_forward_request("forward-remote-first.jpg")
+    public_token_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def _unexpected_public_token(*args, **kwargs):
+        public_token_calls.append((args, kwargs))
+        raise AssertionError("public token action should not run when forward remote URL already succeeds")
+
+    downloader._resolve_from_public_token = _unexpected_public_token  # type: ignore[method-assign]
+
+    try:
+        resolved, matched = downloader._pick_forward_asset_match(
+            request,
+            [
+                {
+                    "asset_type": "image",
+                    "asset_role": "forward_media",
+                    "file_name": "forward-remote-first.jpg",
+                    "remote_url": "https://example.invalid/forward-remote-first.jpg",
+                    "public_action": "get_image",
+                    "public_file_token": "public-token",
+                }
+            ],
+        )
+        assert matched is not None
+        assert resolved[0] is not None
+        assert resolved[1] == "napcat_forward_remote_url"
+        assert public_token_calls == []
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def test_remote_media_download_prepares_cache_dir_on_first_use() -> None:
@@ -193,9 +337,15 @@ def test_public_token_placeholder_missing_is_classified_before_remote_attempt() 
     sibling_placeholder.write_bytes(b"")
 
     downloader = NapCatMediaDownloader(_DummyClient())
-    downloader._call_public_action_with_token = lambda *args, **kwargs: {  # type: ignore[method-assign]
-        "url": "https://gchat.qpic.cn/gchatpic_new/0/0-0-700B81F97B9D06E7999DF7504442D46C/0"
-    }
+    public_token_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def _unexpected_public_token(*args, **kwargs):
+        public_token_calls.append((args, kwargs))
+        return {
+            "url": "https://gchat.qpic.cn/gchatpic_new/0/0-0-700B81F97B9D06E7999DF7504442D46C/0"
+        }
+
+    downloader._call_public_action_with_token = _unexpected_public_token  # type: ignore[method-assign]
 
     def _unexpected_remote_download(*args, **kwargs):
         raise AssertionError("remote URL download should not run when placeholder missing is already classified")
@@ -219,6 +369,7 @@ def test_public_token_placeholder_missing_is_classified_before_remote_attempt() 
         )
         assert resolved is None
         assert resolver == "qq_not_downloaded_local_placeholder"
+        assert public_token_calls == []
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -272,3 +423,26 @@ def test_consume_remote_media_prefetch_peek_does_not_block_on_inflight_future() 
 
     assert resolved is ...
     assert elapsed < 0.5
+
+
+def test_cleanup_remote_cache_rebuilds_prefetch_runtime_without_waiting() -> None:
+    downloader = _CleanupProbeDownloader()
+
+    stats = downloader.cleanup_remote_cache()
+
+    assert downloader.rebuild_calls == [(False, True)]
+    assert stats["cache_cleared"] is False
+
+
+def test_forward_timeout_updates_download_progress_counters() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    downloader._download_via_forward_context(
+        _build_forward_request("2C167901425EF469C0B1F0BF859E4B2C.jpg"),
+        materialize=False,
+    )
+
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["timeout_count"] == 1
+    assert snapshot["forward_context_timeout_count"] == 1
