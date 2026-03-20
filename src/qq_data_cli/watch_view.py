@@ -43,7 +43,7 @@ from qq_data_cli.export_input import (
     roll_export_date_token,
 )
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger
-from qq_data_cli.status_display import colorize_status_fields_for_ansi
+from qq_data_cli.status_display import colorize_status_fields_for_ansi, format_prefetch_media_progress_line
 from qq_data_cli.target_display import (
     format_display_name,
     format_target_name,
@@ -823,16 +823,10 @@ class WatchConversationView:
                 self._notice_text = f"Export wrote data file... records={record_count}"
             else:
                 self._notice_text = f"Export writing data file... records={record_count}"
-        elif phase == "prefetch_media":
-            stage = str(update.get("stage") or "start")
-            request_count = int(update.get("request_count") or 0)
-            if stage == "done":
-                self._notice_text = (
-                    f"Export prefetched media context... requests={request_count} "
-                    f"elapsed={elapsed_s:.1f}s"
-                )
-            else:
-                self._notice_text = f"Export prefetching media context... requests={request_count}"
+        elif phase in {"prefetch_media", "prefetch_media_prepare", "prefetch_media_chunk"}:
+            progress_text = format_prefetch_media_progress_line(update)
+            if progress_text:
+                self._notice_text = progress_text
         elif phase == "materialize_assets":
             current = int(update.get("current") or 0)
             total = int(update.get("total") or 0)

@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 import typer
 
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
-from qq_data_cli.status_display import colorize_status_fields_for_ansi, format_export_result_lines
+from qq_data_cli.status_display import (
+    colorize_status_fields_for_ansi,
+    format_export_result_lines,
+    format_prefetch_media_progress_line,
+)
 from qq_data_cli.terminal_compat import (
     apply_cli_ui_mode_override,
     probe_terminal_environment,
@@ -786,14 +790,8 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
         action = "wrote" if stage == "done" else "writing"
         return f"status={status} export_progress: {action} data file records={record_count}"
 
-    if phase == "prefetch_media":
-        stage = str(update.get("stage") or "start")
-        request_count = int(update.get("request_count") or 0)
-        if stage == "done":
-            return f"status=success export_progress: prefetched media context requests={request_count} elapsed={elapsed_s:.1f}s"
-        if stage == "error":
-            return f"status=failed export_progress: media prefetch degraded requests={request_count} elapsed={elapsed_s:.1f}s"
-        return f"status=in progress export_progress: prefetching media context requests={request_count}"
+    if phase in {"prefetch_media", "prefetch_media_prepare", "prefetch_media_chunk"}:
+        return format_prefetch_media_progress_line(update)
 
     if phase == "materialize_assets":
         current = int(update.get("current") or 0)
