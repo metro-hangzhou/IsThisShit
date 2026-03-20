@@ -1542,9 +1542,11 @@ class SlashRepl:
         if self._ui_profile.use_highlight_style:
             session_kwargs["style"] = Style.from_dict({"export-date-literal": "bg:#ffffff #000000"})
         if self._ui_profile.show_completion_menu:
-            session_kwargs["reserve_space_for_menu"] = 8
-        if self._ui_profile.mode == "compat":
-            session_kwargs["complete_style"] = CompleteStyle.READLINE_LIKE
+            session_kwargs["reserve_space_for_menu"] = _completion_menu_reserve_lines(
+                self._ui_profile,
+                self._terminal_probe,
+            )
+            session_kwargs["complete_style"] = _completion_style_for_ui_profile(self._ui_profile)
         session = PromptSession(
             "> ",
             **session_kwargs,
@@ -2155,6 +2157,22 @@ def _navigate_completion_menu_without_inserting(buffer, *, direction: int) -> No
     app = get_app_or_none()
     if app is not None:
         app.invalidate()
+
+
+def _completion_menu_reserve_lines(ui_profile: Any, terminal_probe: TerminalProbe) -> int:
+    mode = getattr(ui_profile, "mode", None)
+    if mode == "compat":
+        terminal_lines = max(0, int(getattr(terminal_probe, "lines", 0) or 0))
+        dynamic_reserve = terminal_lines // 3 if terminal_lines else 0
+        return min(12, max(8, dynamic_reserve))
+    return 8
+
+
+def _completion_style_for_ui_profile(ui_profile: Any) -> CompleteStyle:
+    mode = getattr(ui_profile, "mode", None)
+    if mode == "compat":
+        return CompleteStyle.COLUMN
+    return CompleteStyle.COLUMN
 
 
 def _should_start_completion_on_space(text: str) -> bool:
