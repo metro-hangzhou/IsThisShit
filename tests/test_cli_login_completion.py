@@ -59,3 +59,19 @@ def test_login_completion_suggests_quick_login_uins_for_quick_uin_option() -> No
     completion_texts = {item.text for item in completions}
     assert "3956020260" in completion_texts
     assert "1507833383" in completion_texts
+
+
+def test_login_completion_suggests_inline_quick_uin_values_without_trailing_space() -> None:
+    completer = SlashCommandCompleter(
+        target_lookup=_empty_target_lookup,
+        quick_login_lookup=_quick_login_lookup,
+        now_provider=lambda: datetime.now(EXPORT_TIMEZONE),
+    )
+
+    completions = list(
+        completer.get_completions(Document("/login --quick-uin"), None)
+    )
+
+    completion_texts = {item.text for item in completions}
+    assert "--quick-uin 3956020260" in completion_texts
+    assert "--quick-uin 1507833383" in completion_texts
