@@ -128,6 +128,7 @@ class SlashRepl:
 
     def run(self) -> None:
         self._kickoff_startup_capture_if_needed()
+        self._warm_napcat_service_for_startup()
         self._kickoff_quick_login_candidates_prime_if_needed(announce=True)
         self._wait_briefly_for_quick_login_candidates_prime()
         self._console.print("Slash REPL ready. 输入 /help 查看命令；常用有 /friends、/watch、/export。")
@@ -1573,12 +1574,12 @@ class SlashRepl:
             seen.add(value)
             results.append(NapCatQuickLoginAccount(uin=value, nick_name=nick_name))
 
-        _append(self._settings.quick_login_uin)
         with self._quick_login_candidates_lock:
             cached_candidates = list(self._quick_login_candidates_cache)
             cache_fresh = self._quick_login_candidates_cache_is_fresh()
         for uin, nick_name in cached_candidates:
             _append(uin, nick_name)
+        _append(self._settings.quick_login_uin)
         if not cache_fresh:
             self._kickoff_quick_login_candidates_prime_if_needed(announce=False)
         return results[:limit]
@@ -1656,6 +1657,44 @@ class SlashRepl:
         if thread is None or not thread.is_alive():
             return
         thread.join(timeout=self.QUICK_LOGIN_STARTUP_PRIME_WAIT_S)
+
+    def _warm_napcat_service_for_startup(self) -> None:
+        self._console.print("startup_napcat: 正在预热 NapCatQQ Service...")
+        self._logger.info(
+            "startup_napcat_warm_begin quick_login_uin=%s",
+            self._settings.quick_login_uin or "",
+        )
+        try:
+            result = self._require_bootstrapper().ensure_endpoint(
+                "webui",
+                timeout_seconds=8.0,
+                poll_interval=0.5,
+                quick_login_uin=self._settings.quick_login_uin,
+            )
+        except Exception as exc:
+            self._logger.info("startup_napcat_warm_failed error=%s", exc)
+            self._console.print(
+                f"startup_napcat: WebUI 预热失败，但 CLI 仍可继续使用。detail={exc}"
+            )
+            return
+        if result.ready:
+            self._logger.info(
+                "startup_napcat_warm_ready attempted_start=%s attempted_configure=%s already_running=%s",
+                result.attempted_start,
+                result.attempted_configure,
+                result.already_running,
+            )
+            self._console.print(
+                f"startup_napcat: {result.message or 'NapCatQQ Service ready.'}"
+            )
+            return
+        self._logger.info(
+            "startup_napcat_warm_not_ready message=%s",
+            result.message,
+        )
+        self._console.print(
+            f"startup_napcat: {result.message or 'NapCatQQ Service 未就绪，后续可继续用 /login 排查。'}"
+        )
 
     def _collect_quick_login_candidates_from_service(
         self,
