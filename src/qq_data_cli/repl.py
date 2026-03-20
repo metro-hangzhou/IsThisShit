@@ -243,48 +243,72 @@ class SlashRepl:
         return False
 
     def _handle_login(self, argv: list[str]) -> None:
-        _, options = _parse_options(
+        positionals, options = _parse_options(
             argv,
             allowed_options={"timeout", "poll", "refresh", "no-quick", "quick-uin"},
             command_name="/login",
         )
+        if len(positionals) > 1:
+            raise ValueError("/login 最多只接受一个 QQ 号参数，例如：/login 3956020260")
         timeout_seconds = float(options.get("timeout") or 300)
         poll_interval = float(options.get("poll") or 3)
         refresh = bool(options.get("refresh"))
         use_quick_login = not bool(options.get("no-quick"))
-        quick_uin = str(options.get("quick-uin") or "").strip() or None
+        quick_uin = (
+            str(options.get("quick-uin") or "").strip()
+            or (positionals[0].strip() if positionals else "")
+            or None
+        )
 
-        self._ensure_endpoint_ready("webui")
+        self._ensure_endpoint_ready("webui", quick_login_uin=quick_uin)
         self._refresh_settings()
         login_service = self._require_login_service()
         initial_status = login_service.check_status()
-        if initial_status.effectively_logged_in():
-            self._console.print("QQ already logged in.")
-            self._print_login_info(login_service.get_login_info())
-            self._refresh_settings()
+        desired_quick_uin = None
+        if not refresh and use_quick_login:
             try:
-                self._ensure_endpoint_ready("onebot_http")
-                self._ensure_endpoint_ready("onebot_ws")
-                self._prime_target_cache("group", quiet=True)
-                self._prime_target_cache("private", quiet=True)
-            except Exception as exc:
-                log_path = get_cli_log_path()
-                self._console.print(
-                    "\n".join(
-                        [
-                            f"note: {exc}",
-                            "note: 群/好友补全依赖 onebot_http；当前不可用时，像 /export group ssj 这样的目标补全不会弹出。",
-                            f"note: 如需排查，请把 CLI 日志发回来：{log_path or ''}",
-                        ]
+                desired_quick_uin = login_service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
+            except Exception:
+                desired_quick_uin = None
+        if initial_status.effectively_logged_in():
+            ready_info = login_service.get_ready_login_info()
+            if ready_info is not None:
+                if desired_quick_uin and ready_info.uin and ready_info.uin != desired_quick_uin:
+                    self._console.print(
+                        "QQ session mismatch. "
+                        f"current_uin={ready_info.uin} requested_uin={desired_quick_uin}. "
+                        "Close the current NapCat/QQ session or switch the QQ account, then retry /login."
                     )
-                )
-            return
+                    return
+                self._console.print("QQ already logged in.")
+                self._print_login_info(ready_info)
+                self._refresh_settings()
+                try:
+                    self._ensure_endpoint_ready("onebot_http")
+                    self._ensure_endpoint_ready("onebot_ws")
+                    self._prime_target_cache("group", quiet=True)
+                    self._prime_target_cache("private", quiet=True)
+                except Exception as exc:
+                    log_path = get_cli_log_path()
+                    self._console.print(
+                        "\n".join(
+                            [
+                                f"note: {exc}",
+                                "note: 群/好友补全依赖 onebot_http；当前不可用时，像 /export group ssj 这样的目标补全不会弹出。",
+                                f"note: 如需排查，请把 CLI 日志发回来：{log_path or ''}",
+                            ]
+                        )
+                    )
+                return
         if use_quick_login and not refresh:
-            quick_candidates = login_service.get_quick_login_candidates()
+            try:
+                quick_candidates = login_service.get_quick_login_candidates()
+            except Exception:
+                quick_candidates = []
             if quick_candidates:
                 chosen_uin = (
-                    quick_uin
-                    or login_service.get_default_quick_login_uin()
+                    desired_quick_uin
+                    or quick_uin
                     or quick_candidates[0].uin
                 )
                 chosen_label = next(
@@ -711,17 +735,22 @@ class SlashRepl:
         batch_prefix: str | None,
         output_dir: Path | None = None,
     ) -> None:
+        from qq_data_cli.app import _build_zero_result_hint, _describe_runtime_session
         from qq_data_core import (
             apply_export_profile,
             build_export_content_summary,
             ExportForensicsCollector,
             ExportPerfTraceWriter,
             format_export_content_summary,
+            format_export_verdict_compact,
             resolve_strict_missing_policy,
             trim_snapshot_to_last_messages,
         )
 
         gateway = self._require_gateway()
+        session_line = _describe_runtime_session(self._settings)
+        if session_line:
+            self._console.print(session_line)
         service = self._require_service()
         out_path = self._resolve_export_output_path(parsed, target=target, output_dir=output_dir)
         trace = ExportPerfTraceWriter(
@@ -841,6 +870,14 @@ class SlashRepl:
                 bundle.forensic_summary_path = forensic_summary_path
                 bundle.forensic_run_dir = forensic_summary_path.parent
                 bundle.forensic_incident_count = forensics.incident_count
+            zero_result_hint = _build_zero_result_hint(
+                gateway,
+                target=target,
+                record_count=len(normalized.messages),
+            )
+            if zero_result_hint:
+                self._console.print(zero_result_hint)
+            self._console.print(format_export_verdict_compact(content_summary))
             prefix = f"{batch_prefix} " if batch_prefix else ""
             self._console.print(
                 f"written: {prefix}{bundle.data_path.resolve()} "
@@ -1334,16 +1371,44 @@ class SlashRepl:
         self._completion_primed_at.clear()
         self._completion_prime_failed_at.clear()
 
-    def _ensure_endpoint_ready(self, endpoint: str) -> None:
-        result = self._require_bootstrapper().ensure_endpoint(endpoint)
+    def _ensure_endpoint_ready(self, endpoint: str, *, quick_login_uin: str | None = None) -> None:
+        result = self._require_bootstrapper().ensure_endpoint(
+            endpoint,
+            quick_login_uin=quick_login_uin,
+        )
         if result.already_running:
+            self._assert_expected_runtime_session(endpoint)
             return
         if result.ready:
             if result.attempted_start or result.attempted_configure:
                 self._console.print(result.message)
                 self._refresh_settings()
+            self._assert_expected_runtime_session(endpoint)
             return
         raise RuntimeError(result.message)
+
+    def _assert_expected_runtime_session(self, endpoint: str) -> None:
+        if endpoint == "webui":
+            return
+        expected_uin = str(self._settings.quick_login_uin or "").strip()
+        if not expected_uin:
+            return
+        try:
+            from qq_data_integrations.napcat.login import detect_session_mismatch
+
+            mismatch_message = detect_session_mismatch(
+                self._require_login_service(),
+                expected_uin=expected_uin,
+            )
+        except Exception as exc:
+            self._logger.debug(
+                "session_mismatch_check_skipped endpoint=%s error=%s",
+                endpoint,
+                exc,
+            )
+            return
+        if mismatch_message:
+            raise RuntimeError(mismatch_message)
 
     def _prime_target_cache(self, chat_type: str, *, quiet: bool) -> None:
         if self._completion_cache_is_fresh(
@@ -1423,7 +1488,10 @@ class SlashRepl:
         history_path = self._settings.state_dir / "cli_history.txt"
         history_path.parent.mkdir(parents=True, exist_ok=True)
         if self._completer is None:
-            self._completer = SlashCommandCompleter(target_lookup=self._lookup_targets_for_completion)
+            self._completer = SlashCommandCompleter(
+                target_lookup=self._lookup_targets_for_completion,
+                quick_login_lookup=self._lookup_quick_login_candidates_for_completion,
+            )
         session_kwargs: dict[str, Any] = {
             "completer": self._completer,
             "history": FileHistory(str(history_path)),
@@ -1445,6 +1513,41 @@ class SlashRepl:
         from qq_data_integrations.napcat.diagnostics import collect_debug_preflight_evidence
 
         return collect_debug_preflight_evidence(self._settings)
+
+    def _lookup_quick_login_candidates_for_completion(
+        self,
+        keyword: str | None,
+        limit: int,
+    ):
+        from qq_data_integrations.napcat.models import NapCatQuickLoginAccount
+
+        keyword_text = str(keyword or "").strip().casefold()
+        seen: set[str] = set()
+        results: list[NapCatQuickLoginAccount] = []
+
+        def _append(uin: str | None, nick_name: str | None = None) -> None:
+            value = str(uin or "").strip()
+            if not value or value in seen:
+                return
+            if keyword_text:
+                nick = str(nick_name or "").strip()
+                if keyword_text not in value.casefold() and keyword_text not in nick.casefold():
+                    return
+            seen.add(value)
+            results.append(NapCatQuickLoginAccount(uin=value, nick_name=nick_name))
+
+        _append(self._settings.quick_login_uin)
+        try:
+            service = self._require_login_service()
+            for candidate in service.get_quick_login_candidates():
+                _append(candidate.uin, candidate.nick_name)
+        except Exception as exc:
+            self._logger.debug(
+                "quick_login_completion_lookup_failed keyword=%r error=%s",
+                keyword,
+                exc,
+            )
+        return results[:limit]
 
 
 class _RootExportProgressDisplay:
@@ -1589,7 +1692,7 @@ def _render_root_help_lines() -> list[str]:
         "  /export group_asBatch=<名称1,名称2,...> [<time-a> <time-b>] [data_count=NN]",
         "  /export friend_asBatch=<名称1,名称2,...> [<time-a> <time-b>] [data_count=NN]",
         "  /export_onlyText ...    /export_TextImage ...    /export_TextImageEmoji ...",
-        "  /login [--refresh] [--timeout N] [--poll N]",
+        "  /login [QQ号] [--refresh] [--timeout N] [--poll N] [--quick-uin QQ号]",
         "  /status    /doctor    /terminal-doctor    /fixture-export <fixture_json> <out_path> [jsonl|txt]    /quit",
         "",
         "默认行为：",

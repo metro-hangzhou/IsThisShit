@@ -264,6 +264,9 @@
   - 或需要人工审阅真实输出时
   才进行
 - 运行面修复进入 `main` / `runtime` 前，应优先补最小回归测试
+- 本地账号约束：
+  - 默认只使用 `3956020260` 作为本地 live 测试账号
+  - 未经用户明确说明，不得切换或尝试其它本地 QQ 账号
 
 ### 默认推进风格
 
@@ -381,11 +384,11 @@
   - REPL `/login` 已支持 quick login first
   - `app.py login` 命令行入口已补齐同样行为
   - 若 quick login 不可用，仍自动回退到二维码流程
-- 现场验证：
-  - live smoke 输出：
-    - `quick_login_candidate=ㅤㅤㅤㅤㅤㅤㅤㅤ (1507833383)`
-    - `QQ quick login succeeded.`
-    - `uin=3956020260`
+- 修正说明：
+  - 早期一轮现场输出曾把“已有在线会话复用”误记成“quick login 成功”
+  - 后续已修正为：
+    - 若 NapCat 已有可用在线会话，则明确打印 `QQ already logged in.`
+    - 不再把已有会话误写成 quick login 成功
 
 ### [2026-03-20][014] 导出进度状态显式着色
 
@@ -424,3 +427,366 @@
     - 只记录到 1 条代表性 `forward_context_metadata` timeout，而非整串兄弟图重复刷屏
 - 当前解释：
   - 这类超时仍然真实存在，但已从“重复放大故障”收敛成“单点慢点”
+
+### [2026-03-20][016] 本地 live 测试账号固定
+
+- 新约束：
+  - 本地测试账号默认固定为 `3956020260`
+  - 未经用户明确说明，不再尝试其它 quick login 候选账号
+  - 本地 live/export 测试目标默认固定为：
+    - `group 922065597` `蕾米二次元萌萌群`
+    - `private 1507833383`
+- 原因：
+  - 避免误用用户机器上其它长期在线账号
+  - 避免把“已有会话复用”和“切换账号成功”混淆
+
+### [2026-03-20][017] quick login 现场故障收敛：启动期与运行中是两套链路
+
+- 新现场结论：
+  - NapCat quick login 不能只理解成一条链
+  - 现场已确认至少存在两套相关路径：
+    1. 启动期命令行参数：
+       - `-q <uin>`
+    2. WebUI 启动后自动 quick-login / 手动 quick-login：
+       - `NAPCAT_QUICK_ACCOUNT`
+       - `WebUiConfig.autoLoginAccount`
+       - `/QQLogin/SetQuickLoginQQ`
+       - `/QQLogin/SetQuickLogin`
+- 现场症状：
+  - 用户机器上的 NapCat 控制台仍出现：
+    - `没有 -q 指令指定快速登录，将使用二维码登录方式`
+    - 随后又按默认历史候选去碰 `1507833383`
+  - 说明至少在该次现场里，NapCat 最终没有按预期吃到“指定账号=3956020260”的启动语义
+- 本轮收敛动作：
+  - Python 侧 wrapper 已确认会在显式传入 `quick_login_uin` 时生成：
+    - `call "...launcher-win10.bat" -q 3956020260`
+  - 同时新增防守型环境变量注入：
+    - `NAPCAT_QUICK_ACCOUNT=3956020260`
+  - 这样即使某一层没按预期消费 `-q`，NapCat 启动后的 WebUI 自动 quick-login 也仍会优先落到同一账号
+  - 另已为 wrapper 增加启动命令诊断输出，便于后续对照现场日志
+- 当前解释：
+  - 若仍看到 NapCat 去碰 `1507833383`，优先怀疑：
+    - 该轮启动并未使用显式账号参数路径
+    - 或者该轮是旧进程/旧二维码页继续复用，而非 fresh start
+
+### [2026-03-20][018] 本地 quick-login 账号覆盖改为统一本地文件
+
+- 新现场发现：
+  - `NapCat/napcat/config/webui.json` 中仍存在历史：
+    - `autoLoginAccount = 1507833383`
+  - 这意味着任何没有显式传入 `-q` / `NAPCAT_QUICK_ACCOUNT` 的手动 NapCat 启动，都可能被旧账号抢跑
+- 本轮修正：
+  - `NapCatSettings.from_env()` 现在会读取本地覆盖文件：
+    - `state/config/napcat_quick_login_uin.txt`
+  - `start_napcat_logged.bat` 也会读取同一文件
+  - 若该文件存在且启动参数里没有显式 `-q`，logged 启动器会自动补：
+    - `-q <uin>`
+    - `NAPCAT_QUICK_ACCOUNT=<uin>`
+- 当前本地默认：
+  - 覆盖文件已落地为：
+    - `3956020260`
+  - 因此手动 logged 启动与 CLI 启动将默认朝同一个账号收敛
+- 设计目标：
+  - 不把本地测试 QQ 号硬写进受版本控制的 NapCat 配置文件
+  - 同时避免继续被 `webui.json` 中的历史 `autoLoginAccount` 污染
+
+### [2026-03-20][019] 2000 条群导出现场基线：导出成功，剩余噪声集中在单个 deep-forward 包
+
+- 现场命令：
+  - `/export group 蕾米二次元萌萌群 data_count=2000 asJSONL`
+- 现场结果：
+  - `records=2000`
+  - `elapsed=32.734s`
+  - `pages=11`
+  - `assets copied=225 reused=100 missing=245`
+- 本轮关键解释：
+  - `245 missing` 看起来大，但主成分并不是新回归
+  - manifest 分解为：
+    - `qq_not_downloaded_local_placeholder = 233`
+    - `missing_after_napcat = 7`
+    - `qq_expired_after_napcat = 5`
+  - 也就是说，这次真正和当前导出链残余问题直接相关的，只是：
+    - `7` 个 `missing_after_napcat`
+    - `5` 个 `qq_expired_after_napcat`
+- deep-forward 现场细节：
+  - 只剩 `1` 次真实：
+    - `forward_context_metadata status=timeout`
+  - 该 timeout 对应单个 forward 父消息：
+    - `message_id_raw = 7617760641125573795`
+  - 同一个 forward 包里有 `7` 张图：
+    - `2C167901425EF469C0B1F0BF859E4B2C.jpg`
+    - `49D109C31C9FADA0A156408B75DC1620.png`
+    - `5AFEB7CD692F6C908EEA82E9DF26986B.jpg`
+    - `4D5CD0D6C6CE08CB5ABC8FF7479ABE30.png`
+    - `09C868CB47C64A1ED520F7A4190F4C5B.png`
+    - `1C824B386DAB0CBBCC41DB7F77188D1C.png`
+    - `F9140E7ADB6458C3F9958E79CEDF5EA4.jpg`
+- 当前判断：
+  - 导出本身是成功的，不属于“又炸了”
+  - 先前的同父级 timeout 放大问题已经被压住
+  - 现在的剩余怪相更准确地说是：
+    - 单个 deep-forward 包里的 forward 元数据水合超时
+
+### [2026-03-20][020] runtime 自动启动链改走 project logged launcher helper
+
+- 新现场结论：
+  - `app.py /login --refresh` 若直接打 `launcher-win10.bat`，会落到管理员限制 / quick-login 注入链和手动 logged 启动不一致的问题
+- 本轮修正：
+  - runtime wrapper 现在优先走：
+    - `start_napcat_logged.bat`
+  - 并通过：
+    - `NAPCAT_LAUNCHER_OVERRIDE`
+    - `NAPCAT_QUICK_ACCOUNT`
+    - `-q 3956020260`
+    把显式 quick-login 账号和真实 NapCat launcher 继续传下去
+- 同轮还修正了一个真实 batch bug：
+  - `start_napcat_logged.bat` 的管理员 relaunch 分支原先在括号块内提前展开 `%NAPCAT_ELEVATED_WRAPPER%`
+  - 现场等价于执行：
+    - `Start-Process '' -Verb RunAs`
+  - 现在已改为 delayed expansion，不再把提权 wrapper 的 `FilePath` 吃空
+- 当前判断：
+  - 后续 Python 侧 runtime 自动启动、手动 logged 启动、quick-login 固定账号三条链现在已经基本对齐
+
+### [2026-03-20][021] live 验证矩阵固定，并补上静默 0 条导出的 operator 提示
+
+- 新约束：
+  - 后续本地 live/export 验证只使用：
+    - `group 922065597` `蕾米二次元萌萌群`
+    - `private 1507833383`
+- 现场补充验证：
+  - `private 1507833383 --limit 300 asJSONL`
+    - `records=53`
+    - `missing=0`
+  - `group 922065597 --limit 200 asTXT`
+    - `records=200`
+    - `missing=0`
+- 同轮发现：
+  - `group 751365230 --limit 300` 返回 `records=0`
+  - 进一步核实后确认：当前在线账号 `3956020260` 的 `get_group_list` 视角下并没有这个群
+  - 因此它不是 exporter 静默坏掉，而是目标在当前账号视角下不可解析
+- 本轮修正：
+  - CLI 现在会在 `records=0` 时补一个 `zero_result_hint`
+  - 明确区分：
+    - 当前账号视角里根本解析不到目标
+    - 目标可解析，但本次切片本来就没有消息
+    - 再叠加旧时间窗的大量 placeholder 资产
+- NapCat 控制台里这类报错当前可视为已知噪声而不是整次导出失败：
+  - `Protocol FetchForwardMsg fallback failed`
+  - `protocolFallbackLogic: 找不到相关的聊天记录`
+  - 在该次现场里，它们没有阻止：
+    - `records=2000` 完整写出
+    - forward 文本细节进入 `content` / `segments[*].extra.forward_messages`
+
+### [2026-03-20][020] deep-forward 远程 URL 回收路径真正打通，2000 条导出缺失显著下降
+
+- 二次现场核查发现：
+  - `NapCatMediaDownloader` 的远程媒体缓存目录准备函数：
+    - `_prepare_remote_cache_dir()`
+  - 之前只有定义，没有在实际远程 URL 下载前被调用
+  - 这会让：
+    - `forward_remote_url`
+    - `forward_remote_url_prefetched`
+    - `sticker remote_url`
+    这些路径在逻辑上存在、但运行时始终拿不到可写缓存目录
+- 直接影响：
+  - `2026-03-16T13:12:57+08:00`
+  - `message_id_raw=7617760641125573795`
+  - 那个 deep-forward 图串里的 `7` 张图在第一次 2000 条导出中全部落成：
+    - `missing_after_napcat`
+- 本轮修复：
+  - 在真正执行远程 URL 下载前主动准备 remote cache dir
+  - 同时为：
+    - 远程媒体下载
+    - sticker 远程下载
+    增加回归测试
+- 定点复测结果：
+  - 窄窗仅含该 forward 消息时：
+    - `7/7` 图全部恢复成功
+    - 解析器返回：
+      - `napcat_forward_remote_url`
+      - `napcat_forward_remote_url_prefetched`
+- 全量 `2000` 条重跑结果：
+  - 旧结果：
+    - `copied=225 reused=100 missing=245`
+    - `missing_breakdown = {qq_not_downloaded_local_placeholder:233, missing_after_napcat:7, qq_expired_after_napcat:5}`
+  - 新结果：
+    - `copied=341 reused=100 missing=129`
+    - `missing_breakdown = {qq_not_downloaded_local_placeholder:124, qq_expired_after_napcat:5}`
+- 当前解释：
+  - deep-forward 这条残余导出链问题已被明显压下去
+  - 现在大盘缺失已基本回到：
+    - 老 placeholder 图
+    - 少量已过期图
+  - 不再是“当前导出链还在持续丢当期 forward 图”
+
+### [2026-03-20][021] operator-facing export summary 改成分离 actionable/background missing，并完成异源 smoke
+
+- 现场再次确认：
+  - 导出成功时最容易误导操作者的，不再是主链崩溃
+  - 而是摘要把：
+    - `missing_after_napcat`
+    - `qq_not_downloaded_local_placeholder`
+    - `qq_expired_after_napcat`
+    混在一起报，导致看起来像“仍有大量新故障”
+- 本轮调整：
+  - export summary 现在会同时显示：
+    - `final_missing_reason`
+    - `actionable_missing_reason`
+    - `background_missing_reason`
+  - 并且 retry hints 只针对 actionable missing 生成
+- 当前口径：
+  - background missing:
+    - `qq_not_downloaded_local_placeholder`
+    - `qq_expired_after_napcat`
+  - actionable missing:
+    - 其余当前链路仍值得立即重试/排查的缺失
+- 现场复跑验证：
+  - `group 922065597 limit=2000 asJSONL`
+    - `missing=129`
+    - `actionable_missing_reason=[-]`
+    - `background_missing_reason=[qq_expired_after_napcat:5, qq_not_downloaded_local_placeholder:124]`
+  - `private 1507833383 limit=50 asJSONL`
+    - `missing=0`
+  - `group 922065597 limit=50 asTXT`
+    - `missing=0`
+- 当前解释：
+  - 大群 JSONL
+  - 私聊 JSONL
+  - 小窗 TXT
+  这三条主路径都已通过现场 smoke
+  - 若朋友环境仍报异常，应优先怀疑：
+    - 本地 NapCat/QQ 状态
+    - 旧发布线残留
+    - 环境配置漂移
+  - 而不是默认怀疑当前 exporter 主链
+
+### [2026-03-20][022] reviewer 继续加压后补上的 runtime/login guardrail
+
+- 本轮第三者 reviewer 继续从：
+  - login/bootstrap/runtime 启动链
+  - quick-login 账号漂移
+  - REPL/CLI 行为不一致
+  - WebUI “ready 但其实不可认证/不可用”
+  这几条线继续咬代码。
+- 新确认的高风险点：
+  - `QQ already logged in.` 之前会把“错误账号已在线”也当成成功返回
+  - REPL 的 quick-login 候选获取异常时，之前比 CLI 更容易直接命令失败，而不是优雅回退二维码
+  - bootstrap 之前对：
+    - WebUI ready
+    - “看起来已登录”
+    的判定都偏乐观，容易把 ghost session / 旧 runtime 误当成可用状态
+  - `start_napcat_logged.bat` 在管理员提权重启路径上，计算出来的 quick-login 账号有丢失风险
+- 本轮已补的 guardrail：
+  - `/login` 在请求账号与当前在线账号不一致时，明确报：
+    - `QQ session mismatch`
+    而不是继续把错误账号当成成功
+  - CLI / REPL 都对 quick-login lookup 异常做了保守回退
+  - bootstrap 的：
+    - `webui`
+    - `onebot_http/ws`
+    相关路径现在会再多核一层认证/可用会话信息，减少 ghost-ready
+  - `start_napcat_logged.bat` 的提权路径现在显式保留 quick-login 注入信息
+- 当前解释：
+  - 这轮修的不是“现有现场已炸点”
+  - 而是多账号、多运行时、多机器环境下最容易在朋友环境里继续复现的漂移型问题
+
+### [2026-03-20][023] placeholder-heavy public-token 图像链继续降噪，错误账号导出 guard 正式接入
+
+- reviewer 新抓到的高频噪声：
+  - 在 `group 922065597 limit=2000` 的上一轮 trace 里，普通顶层图像存在：
+    - `public_token_get_image_remote_url cached_error = 124`
+    - `public_token_get_image_classification classified_missing = 124`
+  - 这说明代码先走了：
+    - `public token -> remote_url`
+  - 然后才承认它其实只是：
+    - `qq_not_downloaded_local_placeholder`
+- 本轮修正：
+  - 对 image public-token payload：
+    - 先做 placeholder / expired 分类
+    - 再决定是否需要 remote URL 尝试
+  - 对 operator summary：
+    - 若 `missing` 全部只是 background missing，则显式输出：
+      - `missing_note: 当前剩余 missing 全是背景缺失`
+  - 对运行时账号：
+    - `app.py export-history`
+    - REPL `/export`
+    现在都会在固定 quick-login 账号配置存在时，再核一次当前在线会话
+    - 若检测到当前在线 `uin` 与请求/固定账号不一致，会直接报：
+      - `QQ session mismatch`
+- 回归：
+  - `33 passed`
+- live 结果：
+  - `group 922065597 limit=2000 asJSONL`
+    - 仍成功完成
+    - `missing=129`
+    - `actionable_missing_reason=[-]`
+    - `background_missing_reason=[qq_expired_after_napcat:5, qq_not_downloaded_local_placeholder:124]`
+  - 关键 trace 变化：
+    - 旧：
+      - `public_token_get_image_remote_url cached_error = 124`
+    - 新：
+      - `public_token_get_image_remote_url cached_error = 0`
+    - `public_token_get_image_classification classified_missing = 124`
+      仍保留，表示这些资产被直接判为背景缺失，而不再先做一轮无意义远程尝试
+- 当前解释：
+  - 这轮不是把更多旧资产“神奇救活”
+  - 而是把：
+    - 不必要的远程重试
+    - 容易误导 operator 的错误噪音
+    - 错账号会话下看起来像成功的风险
+    一起压下去了
+
+### [2026-03-20][024] remote prefetch 热路径改成“短 peek + 真正需要时再等”，2000 条群导出继续提速
+
+- reviewer 新抓到的硬点：
+  - `remote prefetch` 在热路径上仍可能调用：
+    - `future.result(timeout=...)`
+  - 这会把“正在后台下载”的状态重新带回主导出循环里阻塞等待
+- 本轮修正：
+  - `remote prefetch` 消费改成：
+    - 先做短 `peek`
+    - 真正需要该资产时，才在最终下载路径里等待完整结果
+  - `prepare_for_export(...)` 里：
+    - 不再先对所有请求一股脑做 eager remote prefetch
+    - 先过：
+      - forward-parent skip
+      - stale-local
+      - hinted-local
+      - old placeholder 跳过 eager prefetch
+- live 结果（`group 922065597 limit=2000 asJSONL`）：
+  - 正确性保持：
+    - `copied=341 reused=100 missing=129`
+  - 总耗时继续下降：
+    - 旧：`42.48s`
+    - 新：`36.914s`
+  - 平均单步 materialize：
+    - 旧：`0.0206s`
+    - 新：`0.0128s`
+- 当前解释：
+  - 最折磨人的“主循环被 prefetch 反向拖住”已经继续被压了一刀
+  - 现在 remaining missing 仍然主要是：
+    - `qq_not_downloaded_local_placeholder`
+    - `qq_expired_after_napcat`
+  - 不再像前几轮那样主要体现为 exporter 主链阻塞
+
+### [2026-03-20][025] operator 首屏提示继续降噪：显式会话、显式 verdict、REPL/CLI 对齐
+
+- 本轮补的 operator-facing 改动：
+  - `app.py export-history` 现在会显式打印：
+    - `export_session: uin=3956020260 nick=wiki online=True`
+  - 首屏增加统一 verdict：
+    - `export_verdict: success`
+    - 或 `success_with_background_missing`
+    - 或 `success_with_actionable_missing`
+  - REPL `/export` 也补上了：
+    - `export_session`
+    - `zero_result_hint`
+    - `export_verdict`
+  - compact retry hint 现在会带：
+    - `kinds=[...]`
+- 当前解释：
+  - 这轮没改核心导出逻辑
+  - 主要是把“看起来很吓人但其实没炸”的现场体验再压一层
+  - 方便朋友机器和大群导出现场更快判断：
+    - 到底是背景缺失
+    - 还是新的可行动故障

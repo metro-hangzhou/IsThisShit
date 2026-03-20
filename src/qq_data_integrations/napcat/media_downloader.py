@@ -38,6 +38,7 @@ class NapCatMediaDownloader:
     DIRECT_FILE_ID_TIMEOUT_S = 12.0
     PUBLIC_TOKEN_ACTION_TIMEOUT_S = 12.0
     PUBLIC_TOKEN_PREFETCH_WAIT_S = 0.15
+    REMOTE_PREFETCH_PEEK_WAIT_S = 0.05
     CONTEXT_ROUTE_TIMEOUT_S = 12.0
     FORWARD_CONTEXT_TIMEOUT_S = 12.0
     FORWARD_TARGET_HTTP_TIMEOUT_S = 25.0
@@ -345,7 +346,6 @@ class NapCatMediaDownloader:
         seen: set[tuple[Any, ...]] = set()
         for request in requests:
             hint = self._request_hint(request)
-            self._schedule_request_remote_prefetch(request)
             if not self._has_context_hint(hint):
                 continue
             if self._has_forward_parent_hint(hint):
@@ -361,8 +361,20 @@ class NapCatMediaDownloader:
                 self._prefetched_media_payloads[key] = None
                 self._remember_shared_outcome(self._shared_request_key(request), request, stale_local)
                 continue
+            hinted_local = self._resolve_from_hint_local_path(hint)
+            if hinted_local != (None, None):
+                key = self._request_key(request)
+                self._prefetched_media[key] = hinted_local
+                self._prefetched_media_payloads[key] = None
+                self._remember_shared_outcome(self._shared_request_key(request), request, hinted_local)
+                continue
             if self._should_skip_old_bucket(old_bucket):
                 continue
+            if not self._should_skip_eager_remote_prefetch(
+                request,
+                old_bucket=old_bucket,
+            ):
+                self._schedule_request_remote_prefetch(request)
             key = self._request_key(request)
             if key in self._prefetched_media or key in seen:
                 continue
@@ -593,9 +605,27 @@ class NapCatMediaDownloader:
             )
             if request_forward_url != (None, None):
                 return self._remember_shared_outcome(shared_key, request, request_forward_url)
+            forward_payload = self._prefetched_forward_media_payloads.get(key)
+            if isinstance(forward_payload, dict):
+                prefetched_forward_url = self._resolve_from_forward_remote_url(
+                    forward_payload,
+                    request=request,
+                    trace_callback=trace_callback,
+                )
+                if prefetched_forward_url != (None, None):
+                    return self._remember_shared_outcome(shared_key, request, prefetched_forward_url)
+                public_resolved = self._resolve_from_public_token(
+                    forward_payload,
+                    request=request,
+                    trace_callback=trace_callback,
+                )
+                if public_resolved not in {None, (None, None)}:
+                    return self._remember_shared_outcome(shared_key, request, public_resolved)
+                fast_resolved = self._resolve_from_fast_payload(forward_payload)
+                if fast_resolved != (None, None):
+                    return self._remember_shared_outcome(shared_key, request, fast_resolved)
             if asset_type == "image":
-                prefetched_forward_payload = self._prefetched_forward_media_payloads.get(key)
-                has_forward_payload = isinstance(prefetched_forward_payload, dict)
+                has_forward_payload = isinstance(forward_payload, dict)
                 has_hint_file_id = bool(str(hint.get("file_id") or "").strip())
                 if not has_forward_payload and not has_hint_file_id:
                     classified_forward_missing = self._classify_forward_missing(request)
@@ -616,6 +646,13 @@ class NapCatMediaDownloader:
                 return self._remember_shared_outcome(shared_key, request, passive_forward_resolved)
             forward_payload = self._prefetched_forward_media_payloads.get(key)
             if isinstance(forward_payload, dict):
+                forward_remote_url = self._resolve_from_forward_remote_url(
+                    forward_payload,
+                    request=request,
+                    trace_callback=trace_callback,
+                )
+                if forward_remote_url != (None, None):
+                    return self._remember_shared_outcome(shared_key, request, forward_remote_url)
                 public_resolved = self._resolve_from_public_token(
                     forward_payload,
                     request=request,
@@ -623,6 +660,9 @@ class NapCatMediaDownloader:
                 )
                 if public_resolved not in {None, (None, None)}:
                     return self._remember_shared_outcome(shared_key, request, public_resolved)
+                fast_resolved = self._resolve_from_fast_payload(forward_payload)
+                if fast_resolved != (None, None):
+                    return self._remember_shared_outcome(shared_key, request, fast_resolved)
             if asset_type in {"video", "file"}:
                 targeted_forward_download = self._download_via_forward_context(
                     request,
@@ -1804,22 +1844,6 @@ class NapCatMediaDownloader:
         resolved = self._resolved_path_from_payload(payload if isinstance(payload, dict) else None)
         if resolved is not None:
             return resolved, f"napcat_public_token_{action}"
-        remote_downloaded = None
-        remote_attempt_already_failed = bool(
-            isinstance(prefetched_public, dict)
-            and prefetched_public.get("remote_attempted")
-            and not str(prefetched_public.get("resolved_path") or "").strip()
-        )
-        if not remote_attempt_already_failed:
-            remote_downloaded = self._resolve_remote_from_public_payload(
-                data,
-                payload if isinstance(payload, dict) else None,
-                action=action,
-                request=request,
-                trace_callback=trace_callback,
-            )
-        if remote_downloaded is not None:
-            return remote_downloaded, f"napcat_public_token_{action}_remote_url"
         classified_missing = self._classify_missing_from_public_payload(
             payload if isinstance(payload, dict) else None,
             old_bucket=old_bucket,
@@ -1835,6 +1859,22 @@ class NapCatMediaDownloader:
                     classification=classified_missing,
                 )
             return None, classified_missing
+        remote_downloaded = None
+        remote_attempt_already_failed = bool(
+            isinstance(prefetched_public, dict)
+            and prefetched_public.get("remote_attempted")
+            and not str(prefetched_public.get("resolved_path") or "").strip()
+        )
+        if not remote_attempt_already_failed:
+            remote_downloaded = self._resolve_remote_from_public_payload(
+                data,
+                payload if isinstance(payload, dict) else None,
+                action=action,
+                request=request,
+                trace_callback=trace_callback,
+        )
+        if remote_downloaded is not None:
+            return remote_downloaded, f"napcat_public_token_{action}_remote_url"
         return None
 
     def _remember_shared_outcome(
@@ -2627,14 +2667,19 @@ class NapCatMediaDownloader:
     def _consume_remote_media_prefetch(
         self,
         cache_key: tuple[str, str],
+        *,
+        wait_s: float | None = None,
     ) -> str | None | object:
         cached_resolution, future = self._remote_prefetch_state(cache_key)
         if cached_resolution is not ...:
             return cached_resolution
         if future is None:
             return ...
+        wait_budget = self.REMOTE_PREFETCH_PEEK_WAIT_S if wait_s is None else max(0.0, float(wait_s))
+        if wait_budget <= 0.0 and not future.done():
+            return ...
         try:
-            cached_resolution = future.result(timeout=self.REMOTE_MEDIA_FETCH_TIMEOUT_S)
+            cached_resolution = future.result(timeout=wait_budget)
         except FutureTimeoutError:
             return ...
         except Exception:
@@ -3024,10 +3069,11 @@ class NapCatMediaDownloader:
     ) -> str | None:
         remote_url = str(hint.get("remote_url") or "").strip()
         remote_file_name = str(hint.get("remote_file_name") or "").strip()
-        if not remote_url or self._remote_cache_dir is None:
+        cache_dir = self._remote_cache_dir or self._prepare_remote_cache_dir()
+        if not remote_url or cache_dir is None:
             return None
 
-        cache_root = self._remote_cache_dir / "remote_stickers"
+        cache_root = cache_dir / "remote_stickers"
         native_name = remote_file_name or file_name or "sticker.gif"
         role_folder = "dynamic" if asset_role == "dynamic" else "static"
         native_path = cache_root / role_folder / self._remote_cache_file_name(
@@ -3086,13 +3132,14 @@ class NapCatMediaDownloader:
         hint: dict[str, Any],
     ) -> tuple[str | None, bool]:
         remote_url = str(hint.get("url") or "").strip()
-        if not remote_url or self._remote_cache_dir is None:
+        cache_dir = self._remote_cache_dir or self._prepare_remote_cache_dir()
+        if not remote_url or cache_dir is None:
             return None, False
 
         remote_name = self._remote_file_name(remote_url, file_name=file_name)
         if not remote_name:
             return None, False
-        cache_root = self._remote_cache_dir / "remote_media" / asset_type
+        cache_root = cache_dir / "remote_media" / asset_type
         target_path = cache_root / self._remote_cache_file_name(
             remote_url,
             file_name=remote_name,
@@ -3124,7 +3171,7 @@ class NapCatMediaDownloader:
         if not resolved_remote_url:
             return None
         cache_key = (asset_type, self._normalized_match_url(resolved_remote_url))
-        cached_resolution = self._consume_remote_media_prefetch(cache_key)
+        cached_resolution = self._consume_remote_media_prefetch(cache_key, wait_s=0.0)
         if cached_resolution is not ...:
             return cached_resolution
         future, _created = self._ensure_remote_media_future(
@@ -3139,6 +3186,16 @@ class NapCatMediaDownloader:
         except Exception:
             future.cancel()
             return None
+
+    def _should_skip_eager_remote_prefetch(
+        self,
+        request: dict[str, Any],
+        *,
+        old_bucket: tuple[str, str] | None,
+    ) -> bool:
+        if old_bucket is None and not self._should_share_missing_outcome(request):
+            return False
+        return self._classify_image_local_placeholder_missing(request) is not None
 
     def _should_skip_old_bucket(self, old_bucket: tuple[str, str] | None) -> bool:
         if old_bucket is None:
