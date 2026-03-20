@@ -22,6 +22,7 @@ from qq_data_cli.target_display import format_target_label, format_target_remark
 
 if TYPE_CHECKING:
     from qq_data_integrations.napcat.models import ChatTarget
+    from qq_data_integrations.napcat.models import NapCatQuickLoginAccount
 
 COMMANDS = [
     "/doctor",
@@ -45,7 +46,7 @@ EXPORT_TARGET_MODES = ["group", "friend", "group_asBatch=", "friend_asBatch="]
 LIST_OPTIONS = ["--refresh", "--limit"]
 EXPORT_OPTIONS = ["--format", "--out", "--limit", "--data-count", "--refresh", "--include-raw"]
 WATCH_OPTIONS = ["--refresh"]
-LOGIN_OPTIONS = ["--refresh", "--timeout", "--poll"]
+LOGIN_OPTIONS = ["--refresh", "--timeout", "--poll", "--no-quick", "--quick-uin"]
 FORMAT_VALUES = ["jsonl", "txt"]
 DATE_FUNCTIONS = list(SPECIAL_TIME_EXPRESSIONS)
 DATE_FUNCTION_COMPLETIONS = [
@@ -72,9 +73,11 @@ class SlashCommandCompleter(Completer):
         self,
         *,
         target_lookup: Callable[[str, str | None, int], Iterable[ChatTarget]],
+        quick_login_lookup: Callable[[str | None, int], Iterable[NapCatQuickLoginAccount]] | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self._target_lookup = target_lookup
+        self._quick_login_lookup = quick_login_lookup
         self._now_provider = now_provider or (lambda: datetime.now(EXPORT_TIMEZONE).replace(microsecond=0))
         self._logger = get_cli_logger("completion")
         self._reported_lookup_failures: set[tuple[str, str, str, str, str]] = set()
@@ -105,7 +108,12 @@ class SlashCommandCompleter(Completer):
             return
 
         if command == "/login":
-            yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)
+            yield from self._complete_login_command(
+                previous_tokens,
+                current_token,
+                ends_with_space=ends_with_space,
+                start_position=start_position,
+            )
             return
 
         if command in {"/groups", "/friends"}:
@@ -349,6 +357,72 @@ class SlashCommandCompleter(Completer):
             keyword,
             message,
         )
+
+    def _complete_login_command(
+        self,
+        previous_tokens: list[str],
+        current_token: str,
+        *,
+        ends_with_space: bool,
+        start_position: int,
+    ):
+        if previous_tokens and previous_tokens[-1] == "--quick-uin":
+            yield from self._complete_quick_login_candidates(current_token or None, start_position=start_position)
+            return
+
+        login_tokens = previous_tokens[1:]
+        positionals, _ = _parse_option_like_tokens(
+            login_tokens,
+            value_options={"--timeout", "--poll", "--quick-uin"},
+        )
+
+        if current_token.startswith("--"):
+            yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)
+            return
+
+        if not positionals and not ends_with_space:
+            yield from self._complete_quick_login_candidates(current_token or None, start_position=start_position)
+            yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)
+            return
+
+        if not positionals and ends_with_space:
+            yield from self._complete_quick_login_candidates(None, start_position=start_position)
+            yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)
+            return
+
+        yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)
+
+    def _complete_quick_login_candidates(
+        self,
+        keyword: str | None,
+        *,
+        start_position: int,
+    ):
+        if self._quick_login_lookup is None:
+            return
+        try:
+            candidates = list(self._quick_login_lookup(keyword, 6))
+        except Exception as exc:
+            self._report_target_lookup_failure("quick_login", "quick_login", keyword, exc)
+            return
+        seen: set[str] = set()
+        normalized_keyword = str(keyword or "").strip().casefold()
+        for candidate in candidates:
+            uin = str(candidate.uin).strip()
+            if not uin or uin in seen:
+                continue
+            if normalized_keyword:
+                haystacks = [uin, str(candidate.nick_name or "").strip()]
+                if not any(normalized_keyword in item.casefold() for item in haystacks if item):
+                    continue
+            seen.add(uin)
+            display_meta = candidate.nick_name or "quick login"
+            yield Completion(
+                text=uin,
+                start_position=start_position,
+                display=uin,
+                display_meta=display_meta,
+            )
 
     def _complete_time_expressions(
         self,
@@ -668,6 +742,36 @@ def _split_tokens(text: str) -> tuple[list[str], str]:
     if not tokens:
         return [], ""
     return tokens[:-1], tokens[-1]
+
+
+def _parse_option_like_tokens(
+    tokens: list[str],
+    *,
+    value_options: set[str],
+) -> tuple[list[str], dict[str, str | bool]]:
+    positionals: list[str] = []
+    options: dict[str, str | bool] = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            positionals.append(token)
+            index += 1
+            continue
+        if "=" in token:
+            option_name, option_value = token.split("=", 1)
+            options[option_name] = option_value
+            index += 1
+            continue
+        if token in value_options and index + 1 < len(tokens):
+            next_value = tokens[index + 1]
+            if not next_value.startswith("--"):
+                options[token] = next_value
+                index += 2
+                continue
+        options[token] = True
+        index += 1
+    return positionals, options
 
 
 def before_cursor_ends_with_option_value(tokens: list[str]) -> bool:
