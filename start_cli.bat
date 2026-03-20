@@ -141,9 +141,7 @@ if errorlevel 1 (
     echo Restarting start_cli to apply updated launcher logic...
     set "CLI_POST_UPDATE_HANDOFF=1"
     set "_CLI_EXIT_AFTER_UPDATE=1"
-    set "_CLI_REEXEC_CMD=\"%~f0\""
-    if defined _CLI_ARGS set "_CLI_REEXEC_CMD=!_CLI_REEXEC_CMD! !_CLI_ARGS!"
-    "%ComSpec%" /d /s /c !_CLI_REEXEC_CMD!
+    "%ComSpec%" /d /s /c call "%~f0" %_CLI_ARGS%
     exit /b %ERRORLEVEL%
   )
 )
