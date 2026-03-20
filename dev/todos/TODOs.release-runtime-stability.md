@@ -258,6 +258,55 @@ Recent field failures showed that the project has two separate but related stabi
   - full waits now happen only in the final asset path that truly needs the remote download result
   - current `group 922065597 limit=2000` baseline improved from:
     - `42.48s`
+- [x] Avoid export-cleanup hangs after the JSONL/manifest are already written
+  - `cleanup_remote_cache()` now rebuilds prefetch runtime with `wait=False`
+  - prevents stale remote-prefetch futures from keeping CLI alive after export work is already done
+- [x] Reuse successful forward metadata payloads for sibling assets under the same forward parent
+  - metadata-only `/hydrate-forward-media` success is now cached per outer forward bundle/type-role key
+  - reduces repeated “load forward tree -> find sibling -> return metadata” work inside one export run
+- [x] Prefer forward remote URL recovery before public-token action for matched forward assets
+  - current order is:
+    - local path
+    - forward remote URL
+    - public token
+  - goal is to reduce needless `get_image/get_file` blocking on deep-forward assets whose remote URL is already good
+- [x] Surface history source / partial fallback / forward-structure gap in operator-facing export summaries
+  - detailed summary now prints:
+    - `history_source`
+    - `history_fallback=partial`
+    - `forward_detail_count`
+    - `forward_structure_unavailable`
+  - compact app / REPL output now also includes:
+    - `src=...`
+    - `history_fallback=...`
+    - `fwd_gap=...`
+
+## Reviewer-Derived Next Hardening Targets
+
+- [ ] Add runtime/account identity banner before export and after login
+  - print:
+    - effective `uin/nick/online`
+    - pinned `quick_login_uin`
+    - launcher / webui endpoint
+    - whether runtime was reused or newly started
+- [ ] Emit explicit fast-path downgrade note when history source falls from fast plugin to HTTP fallback mid-run
+  - avoid operator seeing “suddenly slow” with no explanation
+- [ ] Reword `materialize_asset_substep timeout/unavailable` as degraded-substep, not hard failed-export semantics
+  - current red `status=failed` line is too easy to over-read as global export failure
+- [ ] Split forward-route health from ordinary `/hydrate-media` route health
+  - do not let one transient forward-route unavailable event disable all fast context hydration for the whole process
+- [ ] Add in-flight bundle coalescing for forward metadata requests
+  - current cache helps after success/timeout/error
+  - still vulnerable to sibling stampede if multiple equivalent requests enter before the first one settles
+- [ ] Reduce or eliminate plugin-side catastrophic target-miss fallback in `/hydrate-forward-media`
+  - targeted miss should not recursively hydrate an entire deep/nested forward tree just to say “not found”
+- [ ] Memoize plugin-side forward tree expansion by outer forward/resId
+  - avoid reloading and rescanning the same bundle for sibling asset lookups
+- [ ] Make retry hints explicitly show retryability and asset-type coverage
+  - especially distinguish:
+    - actionable missing
+    - background-only missing
+    - asset classes without useful second-pass recovery
     - to `36.914s`
 - [x] Reorder eager remote prefetch scheduling behind the cheapest local recovery checks
   - `prepare_for_export(...)` now delays eager request remote prefetch until after:

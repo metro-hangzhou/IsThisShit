@@ -884,7 +884,11 @@ class SlashRepl:
                 f"(assets copied={bundle.copied_asset_count} reused={bundle.reused_asset_count} "
                 f"missing={bundle.missing_asset_count} manifest={bundle.manifest_path.resolve()}) "
                 f"(records={len(normalized.messages)} elapsed={summary['elapsed_s']}s "
-                f"pages={summary['pages_scanned']} retries={summary['retry_events']} trace={trace.path})"
+                f"pages={summary['pages_scanned']} retries={summary['retry_events']} "
+                f"src={content_summary.get('history_source') or '-'} "
+                f"history_fallback={'partial' if content_summary.get('bulk_partial_fallback') else '-'} "
+                f"fwd_gap={int(content_summary.get('forward_structure_unavailable_count') or 0)} "
+                f"trace={trace.path})"
             )
             if int(getattr(bundle, "forensic_incident_count", 0) or 0):
                 self._console.print(
@@ -1171,6 +1175,10 @@ class SlashRepl:
         eager = int(update.get("eager_remote_candidates") or 0)
         token = int(update.get("public_token_candidates") or 0)
         context = int(update.get("context_candidates") or 0)
+        timeout_count = int(update.get("timeout_count") or 0)
+        forward_context_timeouts = int(update.get("forward_context_timeout_count") or 0)
+        forward_context_empty = int(update.get("forward_context_empty_count") or 0)
+        forward_context_errors = int(update.get("forward_context_error_count") or 0)
         last_asset_type = str(update.get("last_asset_type") or "").strip()
         last_file_name = str(update.get("last_file_name") or "").strip()
         last_status = str(update.get("last_status") or "").strip()
@@ -1196,12 +1204,24 @@ class SlashRepl:
             if last_file_name:
                 last_label = f"{last_label}:{last_file_name}"
             parts.append(f"last={last_status}@{last_label}")
+        diag_parts: list[str] = []
+        if timeout_count > 0:
+            diag_parts.append(f"timeouts={timeout_count}")
+        if forward_context_timeouts > 0:
+            diag_parts.append(f"forward_meta_timeout={forward_context_timeouts}")
+        if forward_context_empty > 0:
+            diag_parts.append(f"forward_meta_empty={forward_context_empty}")
+        if forward_context_errors > 0:
+            diag_parts.append(f"forward_meta_error={forward_context_errors}")
+        if diag_parts:
+            parts.append("diag=" + ",".join(diag_parts))
         return " ".join(parts)
 
     def _build_export_snapshot(self, parsed: ParsedExportCommand, *, target: ChatTarget, progress_callback=None):
         from qq_data_core import ExportRequest, format_export_datetime
 
-        history_page_size = max(100, parsed.limit, min(parsed.data_count or 0, 500))
+        requested_window = parsed.data_count or parsed.limit or 100
+        history_page_size = max(100, min(requested_window, 500))
         request = ExportRequest(
             chat_type=target.chat_type,
             chat_id=target.chat_id,

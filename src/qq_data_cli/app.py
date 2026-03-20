@@ -583,6 +583,9 @@ def export_history(
             (
                 f"records={len(normalized.messages)} copied={bundle.copied_asset_count} "
                 f"reused={bundle.reused_asset_count} missing={bundle.missing_asset_count} "
+                f"src={content_summary.get('history_source') or '-'} "
+                f"history_fallback={'partial' if content_summary.get('bulk_partial_fallback') else '-'} "
+                f"fwd_gap={int(content_summary.get('forward_structure_unavailable_count') or 0)} "
                 f"final_missing_reason=[{missing_kinds}] "
                 f"actionable_missing_reason=[{actionable_missing_kinds}] "
                 f"background_missing_reason=[{background_missing_kinds}] "
@@ -842,6 +845,10 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
         eager = int(update.get("eager_remote_candidates") or 0)
         token = int(update.get("public_token_candidates") or 0)
         context = int(update.get("context_candidates") or 0)
+        timeout_count = int(update.get("timeout_count") or 0)
+        forward_context_timeouts = int(update.get("forward_context_timeout_count") or 0)
+        forward_context_empty = int(update.get("forward_context_empty_count") or 0)
+        forward_context_errors = int(update.get("forward_context_error_count") or 0)
         last_asset_type = str(update.get("last_asset_type") or "").strip()
         last_file_name = str(update.get("last_file_name") or "").strip()
         last_status = str(update.get("last_status") or "").strip()
@@ -867,6 +874,17 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
             if last_file_name:
                 last_label = f"{last_label}:{last_file_name}"
             parts.append(f"last={last_status}@{last_label}")
+        diag_parts: list[str] = []
+        if timeout_count > 0:
+            diag_parts.append(f"timeouts={timeout_count}")
+        if forward_context_timeouts > 0:
+            diag_parts.append(f"forward_meta_timeout={forward_context_timeouts}")
+        if forward_context_empty > 0:
+            diag_parts.append(f"forward_meta_empty={forward_context_empty}")
+        if forward_context_errors > 0:
+            diag_parts.append(f"forward_meta_error={forward_context_errors}")
+        if diag_parts:
+            parts.append("diag=" + ",".join(diag_parts))
         return " ".join(parts)
 
     if phase == "forensic_incident" and str(update.get("stage") or "") == "recorded":
