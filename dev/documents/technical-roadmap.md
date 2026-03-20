@@ -993,3 +993,23 @@
     - 但发布线 `bootstrap.py` 仍是旧签名
   - 这条已单独记录进：
     - `branch-sync-incidents.md`
+
+### [2026-03-20][032] 启动链再向下一层收口：`runtime.py` 也必须进入 quick-login/startup 同步包
+
+- 新现场反馈：
+  - `main` 更新到上一轮后：
+    - `startup_napcat`
+  - 不再炸在 `bootstrap.py`
+  - 但继续炸在：
+    - `NapCatRuntimeStarter.ensure_endpoint(... quick_login_uin=...)`
+- 当前判断：
+  - 这说明 quick-login/startup 功能包仍然没有完整下沉到 runtime starter 层
+  - 只同步：
+    - `repl.py`
+    - `bootstrap.py`
+  - 不同步：
+    - `runtime.py`
+  - 会继续形成逐层冒泡式故障
+- 修正方向：
+  - 将 `runtime.py` 和对应的 launch/diagnostic 测试也纳入 release bundle
+  - 不再允许“上层签名升级、底层 runtime 还停留旧版”这种半套状态

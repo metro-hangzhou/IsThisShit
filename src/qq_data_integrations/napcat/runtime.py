@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import shlex
 from contextlib import suppress
 from pathlib import Path
 from collections.abc import Callable
@@ -45,13 +46,17 @@ class NapCatRuntimeStarter:
         *,
         monotonic: Callable[[], float] | None = None,
         sleep: Callable[[float], None] | None = None,
-        launch_process: Callable[[Path], Path | None] | None = None,
+        launch_process: Callable[[Path, str | None], Path | None] | None = None,
     ) -> None:
         self._settings = settings
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleep or time.sleep
         self._launch_process = launch_process or (
-            lambda launcher_path: _launch_napcat_process(launcher_path, settings.state_dir)
+            lambda launcher_path, quick_login_uin: _launch_napcat_process(
+                launcher_path,
+                settings.state_dir,
+                quick_login_uin=quick_login_uin or settings.quick_login_uin,
+            )
         )
 
     def describe_launch(self) -> NapCatLaunchInfo:
@@ -82,6 +87,7 @@ class NapCatRuntimeStarter:
         *,
         timeout_seconds: float = 20.0,
         poll_interval: float = 0.5,
+        quick_login_uin: str | None = None,
     ) -> NapCatStartResult:
         url = _endpoint_url(self._settings, endpoint)
         current = _probe_configured_endpoint(self._settings, endpoint)
@@ -160,7 +166,11 @@ class NapCatRuntimeStarter:
                 message=launch_info.reason or f"{endpoint} is not listening and no launchable NapCat runtime was found.",
             )
 
-        napcat_log_path = self._launch_process(launch_info.launcher_path)
+        napcat_log_path = self._launch_process(
+            launch_info.launcher_path,
+            quick_login_uin,
+        )
+        effective_launcher = _read_napcat_effective_launcher(napcat_log_path) or launch_info.launcher_path
         deadline = self._monotonic() + timeout_seconds
         while self._monotonic() < deadline:
             self._sleep(poll_interval)
@@ -171,24 +181,42 @@ class NapCatRuntimeStarter:
                     endpoint=endpoint,
                     attempted_start=True,
                     ready=True,
-                    launcher_path=launch_info.launcher_path,
+                    launcher_path=effective_launcher,
                     napcat_log_path=napcat_log_path,
                     message=_append_napcat_log_hint(
-                        f"Started NapCat via {launch_info.launcher_path}",
+                        f"Started NapCat via {effective_launcher}",
                         napcat_log_path,
                     ),
                 )
         return NapCatStartResult(
             endpoint=endpoint,
             attempted_start=True,
-            launcher_path=launch_info.launcher_path,
+            launcher_path=effective_launcher,
             napcat_log_path=napcat_log_path,
             message=_append_napcat_log_hint(
-                f"Tried to start NapCat via {launch_info.launcher_path}, but {endpoint} at {url} "
+                f"Tried to start NapCat via {effective_launcher}, but {endpoint} at {url} "
                 "did not become ready in time.",
                 napcat_log_path,
             ),
         )
+
+    def _retry_protocol_identification(
+        self,
+        endpoint: EndpointName,
+        *,
+        timeout_seconds: float,
+        poll_interval: float,
+    ):
+        deadline = self._monotonic() + min(timeout_seconds, 2.0)
+        sleep_interval = min(poll_interval, 0.25)
+        while self._monotonic() < deadline:
+            self._sleep(sleep_interval)
+            probe = _probe_configured_endpoint(self._settings, endpoint)
+            if probe.protocol_identified:
+                return probe
+            if not probe.transport_listening:
+                return None
+        return None
 
 
 def _endpoint_url(settings: NapCatSettings, endpoint: EndpointName) -> str:
@@ -224,8 +252,17 @@ def _looks_like_launchable_runtime(launcher_path: Path) -> bool:
     return all(path.exists() for path in source_files)
 
 
-def _launch_napcat_process(launcher_path: Path, state_dir: Path) -> Path | None:
-    log_path, wrapper_path, latest_pointer_path = _prepare_napcat_launch_artifacts(launcher_path, state_dir)
+def _launch_napcat_process(
+    launcher_path: Path,
+    state_dir: Path,
+    *,
+    quick_login_uin: str | None = None,
+) -> Path | None:
+    log_path, wrapper_path, latest_pointer_path = _prepare_napcat_launch_artifacts(
+        launcher_path,
+        state_dir,
+        quick_login_uin=quick_login_uin,
+    )
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
         ["cmd.exe", "/d", "/c", str(wrapper_path)],
@@ -239,7 +276,12 @@ def _launch_napcat_process(launcher_path: Path, state_dir: Path) -> Path | None:
     return log_path
 
 
-def _prepare_napcat_launch_artifacts(launcher_path: Path, state_dir: Path) -> tuple[Path, Path, Path]:
+def _prepare_napcat_launch_artifacts(
+    launcher_path: Path,
+    state_dir: Path,
+    *,
+    quick_login_uin: str | None = None,
+) -> tuple[Path, Path, Path]:
     logs_dir = state_dir / "napcat_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     _prune_old_launch_wrappers(logs_dir)
@@ -247,18 +289,58 @@ def _prepare_napcat_launch_artifacts(launcher_path: Path, state_dir: Path) -> tu
     log_path = logs_dir / f"napcat_{stamp}.log"
     wrapper_path = logs_dir / f"launch_napcat_{stamp}.cmd"
     latest_pointer_path = logs_dir / "latest.path"
+    effective_launcher, launcher_override = _resolve_effective_launch_entrypoint(launcher_path, state_dir)
+    launch_command = f'call "{effective_launcher}"'
+    normalized_uin = str(quick_login_uin or "").strip()
+    if normalized_uin:
+        launch_command = f'{launch_command} -q {shlex.quote(normalized_uin)}'
+    wrapper_lines = [
+        "@echo off",
+        f'cd /d "{effective_launcher.parent}"',
+    ]
+    if launcher_override is not None:
+        wrapper_lines.append(f'set "NAPCAT_LAUNCHER_OVERRIDE={launcher_override}"')
+    if normalized_uin:
+        wrapper_lines.append(f'set "NAPCAT_QUICK_ACCOUNT={normalized_uin}"')
+        wrapper_lines.append(f'echo wrapper_quick_account_env={normalized_uin} >> "{log_path}"')
+    wrapper_lines.extend(
+        [
+            f'echo wrapper_effective_launcher={effective_launcher} >> "{log_path}"',
+            (
+                f'echo wrapper_launcher_override={launcher_override} >> "{log_path}"'
+                if launcher_override is not None
+                else "rem no launcher override"
+            ),
+            f'echo wrapper_launch_command={launch_command} >> "{log_path}"',
+            f'{launch_command} >> "{log_path}" 2>&1',
+        ]
+    )
     atomic_write_text(
         wrapper_path,
-        "\n".join(
-            [
-                "@echo off",
-                f'cd /d "{launcher_path.parent}"',
-                f'call "{launcher_path}" >> "{log_path}" 2>&1',
-            ]
-        ) + "\n",
+        "\n".join(wrapper_lines) + "\n",
         encoding="utf-8",
     )
     return log_path, wrapper_path, latest_pointer_path
+
+
+def _resolve_effective_launch_entrypoint(launcher_path: Path, state_dir: Path) -> tuple[Path, str | None]:
+    try:
+        project_root = state_dir.resolve().parent
+    except OSError:
+        project_root = state_dir.parent
+    helper_launcher = project_root / "start_napcat_logged.bat"
+    try:
+        resolved_launcher = launcher_path.resolve()
+    except OSError:
+        resolved_launcher = launcher_path
+    if helper_launcher.exists():
+        try:
+            resolved_helper = helper_launcher.resolve()
+        except OSError:
+            resolved_helper = helper_launcher
+        if resolved_helper != resolved_launcher:
+            return resolved_helper, str(resolved_launcher)
+    return resolved_launcher, None
 
 
 def _prune_old_launch_wrappers(logs_dir: Path) -> None:
@@ -274,9 +356,50 @@ def _prune_old_launch_wrappers(logs_dir: Path) -> None:
 
 
 def _append_napcat_log_hint(message: str, log_path: Path | None) -> str:
+    diagnosis = _read_napcat_launch_diagnosis(log_path)
+    if diagnosis:
+        message = f"{message} detail={diagnosis}"
     if log_path is None:
         return message
     return f"{message} NapCat log: {log_path}"
+
+
+def _read_napcat_launch_diagnosis(log_path: Path | None) -> str | None:
+    if log_path is None or not log_path.exists() or not log_path.is_file():
+        return None
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+    if not lines:
+        return None
+    joined = "\n".join(lines[-80:])
+    if "Please run this script in administrator mode." in joined:
+        return "NapCat launcher exited immediately because administrator mode is required."
+    if "Cannot find module" in joined:
+        return "NapCat runtime is missing a required local module/dependency."
+    return None
+
+
+def _read_napcat_effective_launcher(log_path: Path | None) -> Path | None:
+    if log_path is None or not log_path.exists() or not log_path.is_file():
+        return None
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if not line.startswith("wrapper_effective_launcher="):
+            continue
+        value = line.partition("=")[2].strip()
+        if not value:
+            return None
+        candidate = Path(value)
+        try:
+            return candidate.resolve()
+        except OSError:
+            return candidate
+    return None
 
 
 def get_latest_napcat_launch_log_path(state_dir: Path) -> Path | None:
@@ -329,22 +452,3 @@ def _set_path_env(key: str, value: Path | None) -> None:
     if value is None:
         return
     os.environ[key] = str(value)
-
-
-    def _retry_protocol_identification(
-        self,
-        endpoint: EndpointName,
-        *,
-        timeout_seconds: float,
-        poll_interval: float,
-    ):
-        deadline = self._monotonic() + min(timeout_seconds, 2.0)
-        sleep_interval = min(poll_interval, 0.25)
-        while self._monotonic() < deadline:
-            self._sleep(sleep_interval)
-            probe = _probe_configured_endpoint(self._settings, endpoint)
-            if probe.protocol_identified:
-                return probe
-            if not probe.transport_listening:
-                return None
-        return None

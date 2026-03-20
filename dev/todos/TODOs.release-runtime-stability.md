@@ -367,6 +367,12 @@ Recent field failures showed that the project has two separate but related stabi
     - `startup_napcat: ...`
   - REPL tries to get WebUI into a ready state before `Slash REPL ready`
   - reduces first-command friction on `/login`
+- [x] Include runtime starter in the quick-login/startup release bundle
+  - `quick_login_uin` propagation now must cover:
+    - `repl/app`
+    - `bootstrap`
+    - `runtime`
+  - prevents one-layer-deeper signature failures after partial release sync
 - [ ] Surface runtime bootstrap drift more explicitly in CLI export entrypoints
   - when `ensure_endpoint(...)` auto-starts or auto-configures the runtime, `export-history` should print the effective runtime note more prominently
 - [ ] Show active runtime session identity even when no fixed `quick_login_uin` is configured
