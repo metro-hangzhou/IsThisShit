@@ -66,6 +66,7 @@ class SlashRepl:
     COMPLETION_PRIME_RETRY_COOLDOWN_S = 20.0
     QUICK_LOGIN_CACHE_TTL_S = 300.0
     QUICK_LOGIN_CACHE_RETRY_COOLDOWN_S = 20.0
+    QUICK_LOGIN_STARTUP_PRIME_WAIT_S = 0.8
 
     def __init__(
         self,
@@ -128,6 +129,7 @@ class SlashRepl:
     def run(self) -> None:
         self._kickoff_startup_capture_if_needed()
         self._kickoff_quick_login_candidates_prime_if_needed(announce=True)
+        self._wait_briefly_for_quick_login_candidates_prime()
         self._console.print("Slash REPL ready. 输入 /help 查看命令；常用有 /friends、/watch、/export。")
         ui_notice = render_cli_ui_mode_notice(self._ui_decision)
         if ui_notice:
@@ -1606,30 +1608,37 @@ class SlashRepl:
                 return
             if announce and not self._quick_login_cache_notice_shown:
                 self._quick_login_cache_notice_shown = True
-                self._console.print("startup_cache: 正在后台预加载 quick-login QQ 号补全，/login 会优先走本地缓存。")
+                self._console.print("startup_cache: 正在后台预加载 NapCat quick-login QQ 号补全，/login 会优先走 NapCat 候选缓存。")
 
             def _worker() -> None:
                 try:
                     service = self._require_login_service()
-                    candidates = service.get_quick_login_candidates()
-                    normalized: list[tuple[str, str | None]] = []
-                    seen: set[str] = set()
-                    for candidate in candidates:
-                        uin = str(candidate.uin or "").strip()
-                        if not uin or uin in seen:
-                            continue
-                        seen.add(uin)
-                        normalized.append((uin, candidate.nick_name))
+                    normalized = self._collect_quick_login_candidates_from_service(service)
+                    if normalized:
+                        self._logger.info(
+                            "quick_login_completion_cache_ready source=napcat candidates=%s",
+                            ",".join(uin for uin, _nick in normalized),
+                        )
+                        with self._quick_login_candidates_lock:
+                            self._quick_login_candidates_cache = normalized
+                            self._quick_login_candidates_cached_at = monotonic()
+                            self._quick_login_candidates_prime_failed_at = None
+                        return
+                    self._logger.info(
+                        "quick_login_completion_cache_empty source=napcat"
+                    )
                     with self._quick_login_candidates_lock:
-                        self._quick_login_candidates_cache = normalized
-                        self._quick_login_candidates_cached_at = monotonic()
-                        self._quick_login_candidates_prime_failed_at = None
+                        self._quick_login_candidates_cache.clear()
+                        self._quick_login_candidates_cached_at = None
+                        self._quick_login_candidates_prime_failed_at = monotonic()
                 except Exception as exc:
-                    self._logger.debug(
+                    self._logger.info(
                         "quick_login_completion_cache_prime_failed error=%s",
                         exc,
                     )
                     with self._quick_login_candidates_lock:
+                        self._quick_login_candidates_cache.clear()
+                        self._quick_login_candidates_cached_at = None
                         self._quick_login_candidates_prime_failed_at = monotonic()
                 finally:
                     with self._quick_login_candidates_lock:
@@ -1641,6 +1650,48 @@ class SlashRepl:
                 daemon=True,
             )
             self._quick_login_candidates_prime_thread.start()
+
+    def _wait_briefly_for_quick_login_candidates_prime(self) -> None:
+        thread = self._quick_login_candidates_prime_thread
+        if thread is None or not thread.is_alive():
+            return
+        thread.join(timeout=self.QUICK_LOGIN_STARTUP_PRIME_WAIT_S)
+
+    def _collect_quick_login_candidates_from_service(
+        self,
+        service: NapCatQrLoginService,
+    ) -> list[tuple[str, str | None]]:
+        normalized: list[tuple[str, str | None]] = []
+        seen: set[str] = set()
+
+        def _append(uin: str | None, nick_name: str | None = None) -> None:
+            value = str(uin or "").strip()
+            if not value or value in seen:
+                return
+            seen.add(value)
+            normalized.append((value, str(nick_name or "").strip() or None))
+
+        try:
+            candidates = service.get_quick_login_candidates()
+        except Exception as exc:
+            self._logger.debug(
+                "quick_login_completion_candidates_fetch_failed error=%s",
+                exc,
+            )
+            candidates = []
+        for candidate in candidates:
+            _append(candidate.uin, candidate.nick_name)
+        try:
+            info = service.get_ready_login_info() or service.get_login_info()
+        except Exception as exc:
+            self._logger.debug(
+                "quick_login_completion_login_info_fetch_failed error=%s",
+                exc,
+            )
+            info = None
+        if info is not None:
+            _append(getattr(info, "uin", None), getattr(info, "nick", None))
+        return normalized
 
 
 class _RootExportProgressDisplay:
