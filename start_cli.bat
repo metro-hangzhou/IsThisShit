@@ -36,7 +36,7 @@ if "%~1"=="" (
 :run_cli
 call :close_existing_cli
 call :update_main_branch
-call :handoff_after_update
+if defined _CLI_EXIT_AFTER_UPDATE exit /b %ERRORLEVEL%
 call :restart_napcat_if_needed
 echo Starting CLI...
 if exist ".venv\Scripts\python.exe" (
@@ -102,6 +102,7 @@ goto :eof
 
 :update_main_branch
 set "_CLI_UPDATED="
+set "_CLI_EXIT_AFTER_UPDATE="
 set "_NAPCAT_DIFF_CHANGED="
 if /I "%CLI_SKIP_GIT_UPDATE%"=="1" goto :eof
 if not exist ".git" goto :eof
@@ -135,6 +136,16 @@ if errorlevel 1 (
 ) else (
   set "_CLI_UPDATED=1"
   echo Updated to latest %_CLI_GIT_BRANCH%.
+  if /I not "%CLI_POST_UPDATE_HANDOFF%"=="1" (
+    if defined _NAPCAT_DIFF_CHANGED set "CLI_NAPCAT_RESTART_REQUIRED=1"
+    echo Restarting start_cli to apply updated launcher logic...
+    set "CLI_POST_UPDATE_HANDOFF=1"
+    set "_CLI_EXIT_AFTER_UPDATE=1"
+    set "_CLI_REEXEC_CMD=\"%~f0\""
+    if defined _CLI_ARGS set "_CLI_REEXEC_CMD=!_CLI_REEXEC_CMD! !_CLI_ARGS!"
+    "%ComSpec%" /d /s /c !_CLI_REEXEC_CMD!
+    exit /b %ERRORLEVEL%
+  )
 )
 goto :eof
 
@@ -152,15 +163,6 @@ if /I "!_UPDATED_PATH!"=="restart_napcat_service.ps1" set "_NAPCAT_DIFF_CHANGED=
 if /I "!_UPDATED_PATH:~0,7!"=="NapCat/" set "_NAPCAT_DIFF_CHANGED=1"
 if /I "!_UPDATED_PATH:~0,32!"=="src/qq_data_integrations/napcat/" set "_NAPCAT_DIFF_CHANGED=1"
 goto :eof
-
-:handoff_after_update
-if not defined _CLI_UPDATED goto :eof
-if /I "%CLI_POST_UPDATE_HANDOFF%"=="1" goto :eof
-if defined _NAPCAT_DIFF_CHANGED set "CLI_NAPCAT_RESTART_REQUIRED=1"
-echo Restarting start_cli to apply updated launcher logic...
-set "CLI_POST_UPDATE_HANDOFF=1"
-call "%~f0" %_CLI_ARGS%
-exit /b %ERRORLEVEL%
 
 :restart_napcat_if_needed
 if /I not "%CLI_NAPCAT_RESTART_REQUIRED%"=="1" goto :eof
