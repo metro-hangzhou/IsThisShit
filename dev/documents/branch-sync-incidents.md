@@ -125,6 +125,33 @@ Focus on incidents where:
     - `runtime starter`
     - launch/diagnostic regression tests
 
+### [2026-03-20][006] `start_cli` internal handoff flag leaked into `app.py`
+
+- Symptom:
+  - local `main` auto-update succeeded
+  - launcher printed:
+    - `Restarting start_cli to apply updated launcher logic...`
+  - but the restarted CLI then failed before entering REPL with:
+    - `No such option: --post-update-handoff`
+- Root cause:
+  - this was not a release skew
+  - the same `start_cli.bat` content existed in:
+    - `full-dev`
+    - release worktrees
+    - the user's updated `main` clone
+  - launcher self-handoff depended on an internal command-line sentinel:
+    - `--post-update-handoff`
+  - that sentinel was brittle enough to leak through to `app.py` on the restarted run
+- Fix:
+  - remove the internal CLI sentinel entirely
+  - keep handoff state in environment only:
+    - `CLI_POST_UPDATE_HANDOFF=1`
+  - restart the freshly updated launcher with the original operator args only
+  - tighten start-script regression coverage so the sentinel string must stay absent
+- Lesson:
+  - launcher self-restart state should never travel through public CLI argv
+  - internal handoff markers belong in environment/process state, not user-visible argument lists
+
 ## Required Release Sync Checklist
 
 When syncing a feature from `full-dev` into `main` / `runtime`, check whether the change touches any of these families and ship the whole family together:

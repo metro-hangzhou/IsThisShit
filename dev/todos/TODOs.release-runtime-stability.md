@@ -378,6 +378,9 @@ Recent field failures showed that the project has two separate but related stabi
   - selected QQ is only inserted on explicit accept
 - [x] Make `start_cli.bat` hand off to the freshly updated script after a successful `main` fast-forward
   - ensures newly pulled launcher/runtime logic can take effect in the same run
+- [x] Remove internal launcher-only CLI sentinels from `start_cli.bat` handoff
+  - `--post-update-handoff` leaked into `app.py` on a real `main` clone after auto-update
+  - launcher now keeps post-update handoff state in environment only
 - [x] Add a best-effort NapCat service restart helper for update runs that touch NapCat runtime/launcher paths
   - implemented via:
     - [restart_napcat_service.ps1](../../restart_napcat_service.ps1)

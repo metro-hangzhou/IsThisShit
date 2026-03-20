@@ -1094,3 +1094,31 @@
     这些场景不再只等手动 `Tab`
 - 目标：
   - `/login` 这条补全链更像真实命令行输入，而不是“先开菜单再手动逼它刷新”
+
+### [2026-03-20][037] `start_cli` 更新后 handoff 再收口：去掉内部 CLI 哨兵参数
+
+- 新现场反馈：
+  - 用户本地 `main` clone 在自动更新后出现：
+    - `Restarting start_cli to apply updated launcher logic...`
+  - 紧接着 `app.py` 直接收到：
+    - `--post-update-handoff`
+  - 然后报：
+    - `No such option: --post-update-handoff`
+- 这轮核查结论：
+  - 不是新的 release skew
+  - `start_cli.bat` 在：
+    - 根仓
+    - release worktree
+    - 用户更新后的 `main` clone
+  - 内容一致
+  - 真问题是 launcher 自己的 handoff 方案过于脆弱：
+    - 用内部 CLI 参数做“二次启动标记”
+- 本轮修正：
+  - 去掉：
+    - `--post-update-handoff`
+  - handoff 状态只放在环境变量里：
+    - `CLI_POST_UPDATE_HANDOFF=1`
+  - 更新后重新调用 launcher 时，只传原始 operator 参数
+- 当前价值：
+  - 避免内部标记再漏进 `app.py`
+  - 也避免后续把这类 launcher 设计问题误判成“又一次 branch sync 故障”

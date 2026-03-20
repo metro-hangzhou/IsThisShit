@@ -8,7 +8,8 @@ def test_start_cli_handoffs_after_update_and_marks_napcat_restart() -> None:
 
     assert "CLI_POST_UPDATE_HANDOFF" in script_text
     assert "CLI_NAPCAT_RESTART_REQUIRED=1" in script_text
-    assert 'call "%~f0" --post-update-handoff %_CLI_ARGS%' in script_text
+    assert 'call "%~f0" %_CLI_ARGS%' in script_text
+    assert "--post-update-handoff" not in script_text
     assert "restart_napcat_service.ps1" in script_text
     assert "NapCat update detected. Restarting NapCatQQ Service..." in script_text
 
