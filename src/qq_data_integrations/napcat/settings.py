@@ -16,6 +16,7 @@ class NapCatSettings(BaseModel):
     napcat_launcher_path: Path | None = None
     auto_start_napcat: bool = True
     auto_configure_onebot: bool = True
+    quick_login_uin: str | None = None
     http_url: str = Field(default="http://127.0.0.1:3000")
     ws_url: str = Field(default="ws://127.0.0.1:3001")
     access_token: str | None = None
@@ -37,6 +38,11 @@ class NapCatSettings(BaseModel):
         napcat_dir = _resolve_napcat_dir(project_root)
         launcher_path = _resolve_launcher_path(project_root, napcat_dir)
         workdir = _resolve_workdir(project_root, napcat_dir)
+        state_dir = _resolve_relative_path(
+            os.getenv("STATE_DIR", "state"),
+            project_root=project_root,
+            base_dir=project_root,
+        )
         try:
             onebot_config_path = _resolve_config_path(
                 os.getenv("NAPCAT_ONEBOT_CONFIG"),
@@ -96,6 +102,10 @@ class NapCatSettings(BaseModel):
         webui_token_env = os.getenv("NAPCAT_WEBUI_TOKEN")
         fast_history_plugin_id = os.getenv("NAPCAT_FAST_HISTORY_PLUGIN_ID", FAST_HISTORY_PLUGIN_ID)
         webui_url = os.getenv("NAPCAT_WEBUI_URL", webui_defaults["url"])
+        quick_login_uin = _first_non_none(
+            _normalize_optional_text(os.getenv("NAPCAT_QUICK_LOGIN_UIN")),
+            _read_local_quick_login_uin(project_root=project_root, state_dir=state_dir),
+        )
         return cls(
             project_root=project_root,
             napcat_dir=napcat_dir,
@@ -105,6 +115,7 @@ class NapCatSettings(BaseModel):
                 os.getenv("NAPCAT_AUTO_CONFIGURE_ONEBOT"),
                 default=True,
             ),
+            quick_login_uin=quick_login_uin,
             http_url=os.getenv("NAPCAT_HTTP_URL", http_defaults["url"]),
             ws_url=os.getenv("NAPCAT_WS_URL", ws_defaults["url"]),
             access_token=_first_non_none(access_token_env, http_defaults["token"], ws_defaults["token"]),
@@ -122,11 +133,7 @@ class NapCatSettings(BaseModel):
                 project_root=project_root,
                 base_dir=project_root,
             ),
-            state_dir=_resolve_relative_path(
-                os.getenv("STATE_DIR", "state"),
-                project_root=project_root,
-                base_dir=project_root,
-            ),
+            state_dir=state_dir,
             workdir=workdir,
             onebot_config_path=onebot_config_path,
             webui_config_path=webui_config_path,
@@ -257,6 +264,34 @@ def _resolve_project_root() -> Path:
         if (root / "pyproject.toml").exists() or (root / "AGENTS.md").exists():
             return root
     return Path(__file__).resolve().parents[3]
+
+
+def _normalize_optional_text(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _read_local_quick_login_uin(*, project_root: Path, state_dir: Path) -> str | None:
+    explicit = _normalize_optional_text(os.getenv("NAPCAT_QUICK_LOGIN_UIN_FILE"))
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(
+            _resolve_relative_path(explicit, project_root=project_root, base_dir=project_root)
+        )
+    candidates.extend(
+        [
+            state_dir / "config" / "napcat_quick_login_uin.txt",
+            project_root / "state" / "config" / "napcat_quick_login_uin.txt",
+        ]
+    )
+    for candidate in _dedupe_paths(candidates):
+        if candidate is None or not candidate.exists() or not candidate.is_file():
+            continue
+        try:
+            return _normalize_optional_text(candidate.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+    return None
 
 
 def _resolve_napcat_dir(project_root: Path) -> Path | None:
