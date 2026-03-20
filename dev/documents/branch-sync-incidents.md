@@ -75,6 +75,33 @@ Focus on incidents where:
   - "it starts" is not a sufficient release check
   - release validation must include narrow smoke tests for the feature family being shipped
 
+### [2026-03-20][004] Release line missed runtime bootstrap family while REPL/login family had already advanced
+
+- Symptom:
+  - `main` local `start_cli.bat` auto-updated successfully
+  - REPL entered normally
+  - but `/login` immediately failed with:
+    - `NapCatBootstrapper.ensure_endpoint() got an unexpected keyword argument 'quick_login_uin'`
+- Root cause:
+  - release line had already received:
+    - REPL `/login` startup warmup
+    - `quick_login_uin`-aware endpoint calls
+  - but release `src/qq_data_integrations/napcat/bootstrap.py` was still on the older signature
+  - release `tests/test_napcat_bootstrap.py` was also absent, so this bundle skew had no guardrail
+- Fix:
+  - sync the runtime bootstrap family into `main` / `runtime`:
+    - `src/qq_data_integrations/napcat/bootstrap.py`
+    - `tests/test_napcat_bootstrap.py`
+  - validate together with:
+    - `tests/test_repl_login.py`
+    - `tests/test_cli_login_completion.py`
+- Lesson:
+  - login/startup work cannot be released as:
+    - REPL-only
+    - completion-only
+    - startup banner-only
+  - it must ship with the runtime bootstrap family as one bundle
+
 ## Required Release Sync Checklist
 
 When syncing a feature from `full-dev` into `main` / `runtime`, check whether the change touches any of these families and ship the whole family together:

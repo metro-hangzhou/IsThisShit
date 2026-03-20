@@ -362,6 +362,11 @@ Recent field failures showed that the project has two separate but related stabi
     - current NapCat session login info
   - empty warmup results no longer get cached as fresh
   - startup warmup now gets a short head start before REPL is shown
+- [x] Warm NapCat WebUI during REPL startup before exposing the prompt
+  - startup now prints:
+    - `startup_napcat: ...`
+  - REPL tries to get WebUI into a ready state before `Slash REPL ready`
+  - reduces first-command friction on `/login`
 - [ ] Surface runtime bootstrap drift more explicitly in CLI export entrypoints
   - when `ensure_endpoint(...)` auto-starts or auto-configures the runtime, `export-history` should print the effective runtime note more prominently
 - [ ] Show active runtime session identity even when no fixed `quick_login_uin` is configured
