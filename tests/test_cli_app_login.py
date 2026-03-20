@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from qq_data_cli import app as cli_app
-from qq_data_integrations.napcat.models import NapCatLoginInfo
+from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatus
 from qq_data_integrations.napcat.settings import NapCatSettings
 
 
@@ -32,6 +32,14 @@ class _QuickLoginService:
     def __init__(self, _client) -> None:
         self.quick_calls: list[str | None] = []
         self.qr_calls = 0
+        self.status_checks = 0
+
+    def check_status(self) -> NapCatLoginStatus:
+        self.status_checks += 1
+        return NapCatLoginStatus()
+
+    def get_login_info(self) -> NapCatLoginInfo:
+        return NapCatLoginInfo(uin="3956020260", nick="wiki", online=True)
 
     def get_quick_login_candidates(self):
         return []
@@ -52,6 +60,12 @@ class _QrOnlyService(_QuickLoginService):
     def try_quick_login(self, *, preferred_uin=None, **_kwargs):
         self.quick_calls.append(preferred_uin)
         return None
+
+
+class _AlreadyLoggedInService(_QuickLoginService):
+    def check_status(self) -> NapCatLoginStatus:
+        self.status_checks += 1
+        return NapCatLoginStatus(is_login=True)
 
 
 def _patch_login_stack(monkeypatch, service_cls) -> None:
@@ -85,3 +99,14 @@ def test_cli_login_can_skip_quick_login(monkeypatch, capsys) -> None:
     output = capsys.readouterr().out
     assert "QQ quick login succeeded." not in output
     assert "QQ login succeeded." in output
+
+
+def test_cli_login_reports_existing_session_without_claiming_quick_login(monkeypatch, capsys) -> None:
+    _patch_login_stack(monkeypatch, _AlreadyLoggedInService)
+
+    cli_app.login(timeout=10.0, poll=1.0, refresh=False, no_quick=False, quick_uin=None)
+
+    output = capsys.readouterr().out
+    assert "QQ already logged in." in output
+    assert "QQ quick login succeeded." not in output
+    assert "quick_login_candidate=" not in output

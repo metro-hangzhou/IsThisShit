@@ -203,6 +203,15 @@ def login(
             if status.login_error:
                 typer.echo(f"login_status={status.login_error}")
 
+        initial_status = service.check_status()
+        if initial_status.effectively_logged_in():
+            info = service.get_login_info()
+            typer.echo("QQ already logged in.")
+            typer.echo(f"uin={info.uin or ''}")
+            typer.echo(f"nick={info.nick or ''}")
+            typer.echo(f"online={info.online}")
+            return
+
         quick_candidate_label: str | None = None
         if not refresh and not no_quick:
             try:
