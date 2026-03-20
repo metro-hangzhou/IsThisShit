@@ -356,6 +356,12 @@ Recent field failures showed that the project has two separate but related stabi
 - [ ] Improve completion/operator surfacing when backend lookups degrade
   - current reviewer finding:
     - friend machines can still perceive “补全没反应” without enough prompt-level explanation of whether completion is stale-cache, endpoint-unavailable, or real lookup failure
+- [x] Make quick-login completion candidate sourcing NapCat-first
+  - `/login` / `/login --quick-uin` candidates now prefer:
+    - NapCat quick-login list
+    - current NapCat session login info
+  - empty warmup results no longer get cached as fresh
+  - startup warmup now gets a short head start before REPL is shown
 - [ ] Surface runtime bootstrap drift more explicitly in CLI export entrypoints
   - when `ensure_endpoint(...)` auto-starts or auto-configures the runtime, `export-history` should print the effective runtime note more prominently
 - [ ] Show active runtime session identity even when no fixed `quick_login_uin` is configured

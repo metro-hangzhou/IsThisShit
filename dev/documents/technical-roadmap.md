@@ -943,3 +943,29 @@
   - `startup_cache: 正在后台预加载 quick-login QQ 号补全，/login 会优先走本地缓存。`
 - 当前价值：
   - 不再让 `/login` / `/login --quick-uin` 因 WebUI 查询而把输入体验卡坏
+
+### [2026-03-20][030] quick-login 补全候选必须以 NapCat 返回为主来源，空预热不能被缓存成 fresh
+
+- 新现场反馈：
+  - 发布线 `main` 上：
+    - `/login`
+    - `/login --quick-uin`
+    虽然已经不再硬控热路径，但仍然只弹参数选项，不弹 QQ 号
+- 根因判断：
+  - 之前的后台预热逻辑里：
+    - 如果当时从 NapCat 拉到的是空 quick-login 列表
+  - 系统仍会把“空列表”记成 fresh cache
+  - 于是后续几分钟里补全一直只有参数，没有 QQ 候选
+  - 同时，当前在线账号没有作为 NapCat 侧 fallback 候选并进缓存
+- 修正方向：
+  - quick-login 候选以 NapCat 为主来源：
+    - `GetQuickLoginList*`
+    - 当前在线 `login_info.uin`
+  - 空结果不再记 fresh cache，而是记成 retryable failure
+  - REPL 启动时给 quick-login 预热线一个很短的抢跑窗口，尽量在 `Slash REPL ready` 前把候选装入缓存
+  - 预热结果写入 info 日志，明确区分：
+    - `cache_ready`
+    - `cache_empty`
+    - `prime_failed`
+- 当前价值：
+  - 避免“后台查过一次空结果，然后 /login 长时间只有参数没有 QQ”这一类假死体验
