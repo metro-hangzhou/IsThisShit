@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 > Spec baseline: 2026-03-06. This project targets the current NapCatQQ OneBot 11 HTTP/WS interface, not NapCat internals.
 
@@ -78,6 +78,46 @@ Important memory note:
 - after plugin code changes, a real NapCat restart is still required before newly added plugin routes become live on the maintainer/runtime machine
 - the authoritative explanation and usage notes now live in the NapCat handbook set rooted at [NapCat_AGENTs.md](/d:/Coding_Project/IsThisShit/NapCat_AGENTs.md)
 - for bulk history fetch through the fast plugin, treat `200` as the real per-page ceiling even if higher counts are requested; progress output and adaptive page sizing should reflect the effective page size rather than a theoretical `500`
+
+## Release Branch Sync Caution
+
+Release branches have already hit multiple "half-new half-old" incidents where:
+
+- `main` / `runtime` received a caller-side change
+- but the paired implementation or regression test did not ship with it
+- and local auto-update then pulled a broken release package
+
+Therefore:
+
+- treat `main` / `runtime` sync as **bundle sync**, not file-by-file opportunistic cherry-pick
+- when shipping CLI/repl/login/export/runtime fixes, sync the whole feature family together
+- if a release-line incident happens, record it in:
+  - [dev/documents/branch-sync-incidents.md](/d:/Coding_Project/IsThisShit/dev/documents/branch-sync-incidents.md)
+
+Minimum families that must be considered atomic on release sync:
+
+1. CLI / REPL family
+   - `src/qq_data_cli/app.py`
+   - `src/qq_data_cli/repl.py`
+   - `src/qq_data_cli/completion.py`
+   - related tests
+2. Login / runtime family
+   - `src/qq_data_integrations/napcat/login.py`
+   - `src/qq_data_integrations/napcat/settings.py`
+   - `src/qq_data_integrations/napcat/webui_client.py`
+   - `src/qq_data_integrations/napcat/bootstrap.py`
+   - related tests
+3. Export / downloader family
+   - `src/qq_data_integrations/napcat/media_downloader.py`
+   - `src/qq_data_core/export_selection.py`
+   - `src/qq_data_cli/app.py`
+   - related tests
+4. Start-script family
+   - `start_cli*.bat`
+   - `start_napcat_logged.bat`
+
+Do not assume "starts locally" is enough validation for a release sync.
+Always run the smallest matching regression set for the feature family being shipped.
 
 ## Specialized Planning Docs
 

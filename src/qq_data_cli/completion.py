@@ -370,6 +370,23 @@ class SlashCommandCompleter(Completer):
             yield from self._complete_quick_login_candidates(current_token or None, start_position=start_position)
             return
 
+        if current_token == "--quick-uin":
+            yield from self._complete_quick_login_option_values(
+                option_prefix="--quick-uin ",
+                keyword=None,
+                start_position=start_position,
+            )
+            yield from _complete_words(LOGIN_OPTIONS, current_token, start_position=start_position)
+            return
+
+        if current_token.startswith("--quick-uin="):
+            yield from self._complete_quick_login_option_values(
+                option_prefix="--quick-uin=",
+                keyword=current_token.split("=", 1)[1],
+                start_position=start_position,
+            )
+            return
+
         login_tokens = previous_tokens[1:]
         positionals, _ = _parse_option_like_tokens(
             login_tokens,
@@ -421,6 +438,39 @@ class SlashCommandCompleter(Completer):
                 text=uin,
                 start_position=start_position,
                 display=uin,
+                display_meta=display_meta,
+            )
+
+    def _complete_quick_login_option_values(
+        self,
+        *,
+        option_prefix: str,
+        keyword: str | None,
+        start_position: int,
+    ):
+        if self._quick_login_lookup is None:
+            return
+        try:
+            candidates = list(self._quick_login_lookup(keyword, 6))
+        except Exception as exc:
+            self._report_target_lookup_failure("quick_login", "quick_login", keyword, exc)
+            return
+        seen: set[str] = set()
+        normalized_keyword = str(keyword or "").strip().casefold()
+        for candidate in candidates:
+            uin = str(candidate.uin).strip()
+            if not uin or uin in seen:
+                continue
+            if normalized_keyword:
+                nick = str(candidate.nick_name or "").strip()
+                if normalized_keyword not in uin.casefold() and normalized_keyword not in nick.casefold():
+                    continue
+            seen.add(uin)
+            display_meta = candidate.nick_name or "quick login"
+            yield Completion(
+                text=f"{option_prefix}{uin}",
+                start_position=start_position,
+                display=f"{option_prefix}{uin}",
                 display_meta=display_meta,
             )
 

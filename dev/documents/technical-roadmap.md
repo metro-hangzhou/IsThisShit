@@ -896,3 +896,26 @@
     - REPL 调用侧
     - completer 实现侧
     - 对应回归测试
+
+### [2026-03-20][028] `/login --quick-uin` 补全再做一层兜底，并正式建立分支同步事故记录
+
+- 现场反馈：
+  - 用户在 `main` 本地更新后测试：
+    - `/login --quick-uin`
+  - 仍然认为 QQ 候选补全不可用
+- 当前处理方向：
+  - 不再依赖“必须先敲空格”这一种交互路径
+  - 只要进入：
+    - `/login --quick-uin`
+    上下文，就允许直接给出：
+    - `--quick-uin 3956020260`
+    这类完整候选
+- 同时新增：
+  - [branch-sync-incidents.md](/d:/Coding_Project/IsThisShit/dev/documents/branch-sync-incidents.md)
+  - 用来持续记录：
+    - `main/runtime` 半新半旧
+    - release bundle skew
+    - auto-update 拉到坏包
+    这类事故
+- 主 [AGENTS.md](/d:/Coding_Project/IsThisShit/AGENTS.md) 也已补充：
+  - release sync 必须按 feature family 成套同步
