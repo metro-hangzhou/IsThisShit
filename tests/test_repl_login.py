@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from qq_data_cli.export_commands import ParsedExportCommand
-from qq_data_cli.repl import SlashRepl
+from qq_data_cli.repl import SlashRepl, _should_select_first_completion
 from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
 from qq_data_integrations.napcat.runtime import NapCatStartResult
 
@@ -272,3 +272,11 @@ def test_repl_startup_warm_napcat_service_uses_pinned_quick_login_uin(monkeypatc
     assert captured["endpoint"] == "webui"
     assert captured["kwargs"]["quick_login_uin"] == "3956020260"
     assert "NapCat WebUI ready" in " ".join(printed)
+
+
+def test_login_completion_never_auto_selects_first_candidate() -> None:
+    assert _should_select_first_completion("/login") is False
+    assert _should_select_first_completion("/login ") is False
+    assert _should_select_first_completion("/login 39") is False
+    assert _should_select_first_completion("/login --quick-uin") is False
+    assert _should_select_first_completion("/login --quick-uin ") is False

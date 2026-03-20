@@ -2127,6 +2127,9 @@ def _should_start_completion_on_comma(text: str) -> bool:
 
 def _should_select_first_completion(text: str) -> bool:
     normalized = text.rstrip()
+    tokens = _split_cli_tokens(normalized)
+    if tokens and tokens[0].casefold() == "/login":
+        return False
     if normalized in {"/watch", "/groups", "/friends"} or normalized.casefold() in EXPORT_COMMAND_PROFILES:
         return False
     if normalized in {
@@ -2140,7 +2143,6 @@ def _should_select_first_completion(text: str) -> bool:
         for command in EXPORT_COMMAND_PROFILES
     }:
         return False
-    tokens = _split_cli_tokens(normalized)
     if len(tokens) >= 2 and tokens[0].casefold() in EXPORT_COMMAND_PROFILES and _is_batch_export_token(tokens[1]):
         return False
     if len(tokens) in {3, 4, 5} and tokens[0].casefold() in EXPORT_COMMAND_PROFILES and tokens[1] in {"group", "friend"}:
