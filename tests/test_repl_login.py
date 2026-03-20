@@ -1,0 +1,188 @@
+from __future__ import annotations
+
+from qq_data_cli.export_commands import ParsedExportCommand
+from qq_data_cli.repl import SlashRepl
+from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
+
+
+class _QuickLoginOnlyService:
+    def __init__(self) -> None:
+        self.quick_calls: list[str | None] = []
+
+    def check_status(self) -> NapCatLoginStatus:
+        return NapCatLoginStatus()
+
+    def get_ready_login_info(self):
+        return None
+
+    def get_quick_login_candidates(self):
+        return [NapCatQuickLoginAccount(uin="3956020260", nick_name="wiki")]
+
+    def get_default_quick_login_uin(self):
+        return "3956020260"
+
+    def resolve_desired_quick_login_uin(self, *, preferred_uin: str | None = None):
+        return preferred_uin or self.get_default_quick_login_uin()
+
+    def try_quick_login(self, *, preferred_uin=None, **_kwargs):
+        self.quick_calls.append(preferred_uin)
+        return NapCatLoginInfo(uin="3956020260", nick="wiki", online=True)
+
+
+class _MismatchedLoggedInService(_QuickLoginOnlyService):
+    def check_status(self) -> NapCatLoginStatus:
+        return NapCatLoginStatus(is_login=True)
+
+    def get_ready_login_info(self):
+        return NapCatLoginInfo(uin="1507833383", nick="other", online=True)
+
+
+class _BrokenQuickLookupService(_QuickLoginOnlyService):
+    def resolve_desired_quick_login_uin(self, *, preferred_uin: str | None = None):
+        raise RuntimeError("quick lookup failed")
+
+    def get_quick_login_candidates(self):
+        raise RuntimeError("quick lookup failed")
+
+    def login_until_success(self, **_kwargs):
+        return NapCatLoginInfo(uin="3956020260", nick="wiki", online=True)
+
+
+def test_repl_login_accepts_positional_quick_login_uin(monkeypatch) -> None:
+    repl = SlashRepl()
+    service = _QuickLoginOnlyService()
+
+    monkeypatch.setattr(repl, "_ensure_endpoint_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_refresh_settings", lambda: None)
+    monkeypatch.setattr(repl, "_require_login_service", lambda: service)
+    monkeypatch.setattr(repl, "_print_login_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_prime_target_cache", lambda *_args, **_kwargs: None)
+
+    repl._handle_login(["3956020260"])
+
+    assert service.quick_calls == ["3956020260"]
+
+
+def test_repl_login_reports_session_mismatch_for_requested_quick_uin(monkeypatch) -> None:
+    repl = SlashRepl()
+    service = _MismatchedLoggedInService()
+    messages: list[str] = []
+
+    monkeypatch.setattr(repl, "_ensure_endpoint_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_refresh_settings", lambda: None)
+    monkeypatch.setattr(repl, "_require_login_service", lambda: service)
+    monkeypatch.setattr(repl._console, "print", lambda message, *args, **kwargs: messages.append(str(message)))
+
+    repl._handle_login(["3956020260"])
+
+    assert any("QQ session mismatch." in message for message in messages)
+
+
+def test_repl_login_falls_back_to_qr_when_quick_lookup_errors(monkeypatch) -> None:
+    repl = SlashRepl()
+    service = _BrokenQuickLookupService()
+    printed: list[str] = []
+
+    monkeypatch.setattr(repl, "_ensure_endpoint_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_refresh_settings", lambda: None)
+    monkeypatch.setattr(repl, "_require_login_service", lambda: service)
+    monkeypatch.setattr(repl, "_render_login_qr", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_render_login_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_print_login_info", lambda *_args, **_kwargs: printed.append("printed"))
+    monkeypatch.setattr(repl, "_prime_target_cache", lambda *_args, **_kwargs: None)
+
+    repl._handle_login([])
+
+    assert printed == ["printed"]
+    assert service.quick_calls == []
+
+
+def test_repl_ensure_endpoint_ready_rejects_mismatched_session(monkeypatch) -> None:
+    repl = SlashRepl()
+    repl._settings = repl._settings.model_copy(update={"quick_login_uin": "3956020260"})
+    service = _MismatchedLoggedInService()
+
+    class _ReadyResult:
+        ready = True
+        already_running = False
+        attempted_start = False
+        attempted_configure = False
+        message = ""
+
+    monkeypatch.setattr(repl, "_require_bootstrapper", lambda: type("B", (), {"ensure_endpoint": lambda *_a, **_k: _ReadyResult()})())
+    monkeypatch.setattr(repl, "_require_login_service", lambda: service)
+
+    try:
+        repl._ensure_endpoint_ready("onebot_http")
+    except RuntimeError as exc:
+        assert "QQ session mismatch." in str(exc)
+        assert "requested_uin=3956020260" in str(exc)
+    else:
+        raise AssertionError("expected session mismatch runtime error")
+
+
+def test_repl_export_tail_page_size_matches_cli_cap(monkeypatch) -> None:
+    repl = SlashRepl()
+    captured: dict[str, int] = {}
+
+    class _Gateway:
+        def fetch_snapshot_tail(self, _request, *, data_count, page_size, progress_callback=None):
+            captured["data_count"] = data_count
+            captured["page_size"] = page_size
+            return "snapshot"
+
+    monkeypatch.setattr(repl, "_require_gateway", lambda: _Gateway())
+
+    parsed = ParsedExportCommand(
+        chat_type="group",
+        target_query="922065597",
+        batch_target_queries=(),
+        interval=None,
+        fmt="jsonl",
+        out_path=None,
+        limit=2000,
+        data_count=2000,
+        profile="all",
+        include_raw=False,
+        refresh=False,
+        strict_missing=None,
+    )
+    target = type("Target", (), {"chat_type": "group", "chat_id": "922065597", "display_name": "蕾米二次元萌萌群"})()
+
+    result = repl._build_export_snapshot(parsed, target=target)
+
+    assert result == "snapshot"
+    assert captured == {"data_count": 2000, "page_size": 500}
+
+
+def test_repl_quick_login_completion_returns_pinned_uin_without_blocking_on_service(monkeypatch) -> None:
+    repl = SlashRepl()
+    repl._settings = repl._settings.model_copy(update={"quick_login_uin": "3956020260"})
+
+    def _boom():
+        raise RuntimeError("should not synchronously query quick-login service during completion")
+
+    monkeypatch.setattr(repl, "_require_login_service", _boom)
+
+    results = repl._lookup_quick_login_candidates_for_completion(None, 10)
+
+    assert [item.uin for item in results] == ["3956020260"]
+
+
+def test_repl_quick_login_completion_background_prime_populates_cache(monkeypatch) -> None:
+    repl = SlashRepl()
+
+    class _Service:
+        def get_quick_login_candidates(self):
+            return [NapCatQuickLoginAccount(uin="3956020260", nick_name="wiki")]
+
+    monkeypatch.setattr(repl, "_require_login_service", lambda: _Service())
+
+    repl._kickoff_quick_login_candidates_prime_if_needed(announce=False)
+    thread = repl._quick_login_candidates_prime_thread
+    assert thread is not None
+    thread.join(timeout=2.0)
+
+    results = repl._lookup_quick_login_candidates_for_completion(None, 10)
+
+    assert any(item.uin == "3956020260" for item in results)

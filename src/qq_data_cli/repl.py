@@ -64,6 +64,8 @@ if TYPE_CHECKING:
 class SlashRepl:
     COMPLETION_PRIMED_TTL_S = 120.0
     COMPLETION_PRIME_RETRY_COOLDOWN_S = 20.0
+    QUICK_LOGIN_CACHE_TTL_S = 300.0
+    QUICK_LOGIN_CACHE_RETRY_COOLDOWN_S = 20.0
 
     def __init__(
         self,
@@ -87,6 +89,12 @@ class SlashRepl:
         self._last_qr_url: str | None = None
         self._completion_primed_at: dict[str, float] = {}
         self._completion_prime_failed_at: dict[str, float] = {}
+        self._quick_login_candidates_cache: list[tuple[str, str | None]] = []
+        self._quick_login_candidates_cached_at: float | None = None
+        self._quick_login_candidates_prime_failed_at: float | None = None
+        self._quick_login_candidates_prime_thread: threading.Thread | None = None
+        self._quick_login_candidates_lock = threading.Lock()
+        self._quick_login_cache_notice_shown = False
         self._completer: SlashCommandCompleter | None = None
         self._session: PromptSession | None = None
         self._terminal_probe = terminal_probe or probe_terminal_environment()
@@ -119,6 +127,7 @@ class SlashRepl:
 
     def run(self) -> None:
         self._kickoff_startup_capture_if_needed()
+        self._kickoff_quick_login_candidates_prime_if_needed(announce=True)
         self._console.print("Slash REPL ready. 输入 /help 查看命令；常用有 /friends、/watch、/export。")
         ui_notice = render_cli_ui_mode_notice(self._ui_decision)
         if ui_notice:
@@ -1390,6 +1399,12 @@ class SlashRepl:
         self._login_service = None
         self._completion_primed_at.clear()
         self._completion_prime_failed_at.clear()
+        with self._quick_login_candidates_lock:
+            self._quick_login_candidates_cache.clear()
+            self._quick_login_candidates_cached_at = None
+            self._quick_login_candidates_prime_failed_at = None
+            self._quick_login_candidates_prime_thread = None
+            self._quick_login_cache_notice_shown = False
 
     def _ensure_endpoint_ready(self, endpoint: str, *, quick_login_uin: str | None = None) -> None:
         result = self._require_bootstrapper().ensure_endpoint(
@@ -1557,17 +1572,75 @@ class SlashRepl:
             results.append(NapCatQuickLoginAccount(uin=value, nick_name=nick_name))
 
         _append(self._settings.quick_login_uin)
-        try:
-            service = self._require_login_service()
-            for candidate in service.get_quick_login_candidates():
-                _append(candidate.uin, candidate.nick_name)
-        except Exception as exc:
-            self._logger.debug(
-                "quick_login_completion_lookup_failed keyword=%r error=%s",
-                keyword,
-                exc,
-            )
+        with self._quick_login_candidates_lock:
+            cached_candidates = list(self._quick_login_candidates_cache)
+            cache_fresh = self._quick_login_candidates_cache_is_fresh()
+        for uin, nick_name in cached_candidates:
+            _append(uin, nick_name)
+        if not cache_fresh:
+            self._kickoff_quick_login_candidates_prime_if_needed(announce=False)
         return results[:limit]
+
+    def _quick_login_candidates_cache_is_fresh(self) -> bool:
+        cached_at = self._quick_login_candidates_cached_at
+        if cached_at is None:
+            return False
+        if monotonic() - cached_at <= self.QUICK_LOGIN_CACHE_TTL_S:
+            return True
+        self._quick_login_candidates_cached_at = None
+        self._quick_login_candidates_cache.clear()
+        return False
+
+    def _kickoff_quick_login_candidates_prime_if_needed(self, *, announce: bool) -> None:
+        with self._quick_login_candidates_lock:
+            if self._quick_login_candidates_cache_is_fresh():
+                return
+            failed_at = self._quick_login_candidates_prime_failed_at
+            if (
+                failed_at is not None
+                and monotonic() - failed_at <= self.QUICK_LOGIN_CACHE_RETRY_COOLDOWN_S
+            ):
+                return
+            thread = self._quick_login_candidates_prime_thread
+            if thread is not None and thread.is_alive():
+                return
+            if announce and not self._quick_login_cache_notice_shown:
+                self._quick_login_cache_notice_shown = True
+                self._console.print("startup_cache: 正在后台预加载 quick-login QQ 号补全，/login 会优先走本地缓存。")
+
+            def _worker() -> None:
+                try:
+                    service = self._require_login_service()
+                    candidates = service.get_quick_login_candidates()
+                    normalized: list[tuple[str, str | None]] = []
+                    seen: set[str] = set()
+                    for candidate in candidates:
+                        uin = str(candidate.uin or "").strip()
+                        if not uin or uin in seen:
+                            continue
+                        seen.add(uin)
+                        normalized.append((uin, candidate.nick_name))
+                    with self._quick_login_candidates_lock:
+                        self._quick_login_candidates_cache = normalized
+                        self._quick_login_candidates_cached_at = monotonic()
+                        self._quick_login_candidates_prime_failed_at = None
+                except Exception as exc:
+                    self._logger.debug(
+                        "quick_login_completion_cache_prime_failed error=%s",
+                        exc,
+                    )
+                    with self._quick_login_candidates_lock:
+                        self._quick_login_candidates_prime_failed_at = monotonic()
+                finally:
+                    with self._quick_login_candidates_lock:
+                        self._quick_login_candidates_prime_thread = None
+
+            self._quick_login_candidates_prime_thread = threading.Thread(
+                target=_worker,
+                name="quick-login-completion-prime",
+                daemon=True,
+            )
+            self._quick_login_candidates_prime_thread.start()
 
 
 class _RootExportProgressDisplay:

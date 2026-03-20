@@ -919,3 +919,27 @@
     这类事故
 - 主 [AGENTS.md](/d:/Coding_Project/IsThisShit/AGENTS.md) 也已补充：
   - release sync 必须按 feature family 成套同步
+
+### [2026-03-20][029] quick-login 补全改成“先本地 cache，后后台预热”，不再在补全热路径同步碰 WebUI
+
+- 新现场反馈：
+  - `/login`
+  - `/login --quick-uin`
+  的补全会：
+    - 先硬控约 `1-2s`
+    - 然后还可能什么都不弹
+- 当前判断：
+  - 补全热路径里同步触发 quick-login 候选查询，本身就不是一个稳妥设计
+  - 即便逻辑上最后能拿到候选，也会把 prompt_toolkit 的交互体验拖坏
+- 本轮修正：
+  - REPL 启动后后台预热 quick-login 候选缓存
+  - 补全时只读本地 cache
+  - 若 cache 还没热好，也至少立即返回 pinned 账号：
+    - `3956020260`
+  - 也就是说现在补全策略变成：
+    - first return local-known candidate
+    - then refresh in background
+- startup 提示：
+  - `startup_cache: 正在后台预加载 quick-login QQ 号补全，/login 会优先走本地缓存。`
+- 当前价值：
+  - 不再让 `/login` / `/login --quick-uin` 因 WebUI 查询而把输入体验卡坏
