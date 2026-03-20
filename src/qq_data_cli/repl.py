@@ -39,7 +39,7 @@ from qq_data_cli.export_input import (
     roll_export_date_token,
 )
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
-from qq_data_cli.status_display import build_rich_status_text
+from qq_data_cli.status_display import build_rich_status_text, format_export_result_lines
 from qq_data_cli.target_display import format_target_label, format_target_name, format_target_remark
 from qq_data_cli.terminal_compat import (
     TerminalProbe,
@@ -754,16 +754,12 @@ class SlashRepl:
             build_export_content_summary,
             ExportForensicsCollector,
             ExportPerfTraceWriter,
-            format_export_content_summary,
-            format_export_verdict_compact,
             resolve_strict_missing_policy,
             trim_snapshot_to_last_messages,
         )
 
         gateway = self._require_gateway()
         session_line = _describe_runtime_session(self._settings)
-        if session_line:
-            self._console.print(session_line)
         service = self._require_service()
         out_path = self._resolve_export_output_path(parsed, target=target, output_dir=output_dir)
         trace = ExportPerfTraceWriter(
@@ -890,19 +886,14 @@ class SlashRepl:
             )
             if zero_result_hint:
                 self._console.print(zero_result_hint)
-            self._console.print(format_export_verdict_compact(content_summary))
-            prefix = f"{batch_prefix} " if batch_prefix else ""
-            self._console.print(
-                f"written: {prefix}{bundle.data_path.resolve()} "
-                f"(assets copied={bundle.copied_asset_count} reused={bundle.reused_asset_count} "
-                f"missing={bundle.missing_asset_count} manifest={bundle.manifest_path.resolve()}) "
-                f"(records={len(normalized.messages)} elapsed={summary['elapsed_s']}s "
-                f"pages={summary['pages_scanned']} retries={summary['retry_events']} "
-                f"src={content_summary.get('history_source') or '-'} "
-                f"history_fallback={'partial' if content_summary.get('bulk_partial_fallback') else '-'} "
-                f"fwd_gap={int(content_summary.get('forward_structure_unavailable_count') or 0)} "
-                f"trace={trace.path})"
-            )
+            for line in format_export_result_lines(
+                session_line=session_line,
+                content_summary=content_summary,
+                bundle=bundle,
+                trace_summary=summary,
+                trace_path=trace.path,
+            ):
+                self._console.print(build_rich_status_text(line))
             if int(getattr(bundle, "forensic_incident_count", 0) or 0):
                 self._console.print(
                     f"forensics: incidents={getattr(bundle, 'forensic_incident_count', 0)} "
@@ -915,7 +906,6 @@ class SlashRepl:
                     f"forensic_summary={getattr(bundle, 'forensic_summary_path', None)} "
                     f"log={get_cli_log_path()}"
                 )
-            self._console.print("\n".join(format_export_content_summary(content_summary)))
         except Exception as exc:
             cleanup_stats = cleanup_gateway_media_cache(gateway, trace=trace, logger=self._logger)
             trace.write_event(

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import typer
 
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
-from qq_data_cli.status_display import colorize_status_fields_for_ansi
+from qq_data_cli.status_display import colorize_status_fields_for_ansi, format_export_result_lines
 from qq_data_cli.terminal_compat import (
     apply_cli_ui_mode_override,
     probe_terminal_environment,
@@ -386,11 +386,7 @@ def export_history(
         ExportRequest,
         build_default_output_path,
         build_export_content_summary,
-        format_actionable_missing_breakdown_compact,
-        format_background_missing_breakdown_compact,
         format_missing_retry_hints_compact,
-        format_missing_breakdown_compact,
-        format_export_verdict_compact,
         normalize_export_format,
         resolve_strict_missing_policy,
     )
@@ -575,34 +571,17 @@ def export_history(
         if zero_result_hint:
             typer.echo(zero_result_hint, err=True)
         typer.echo(str(bundle.data_path))
-        typer.echo(format_export_verdict_compact(content_summary), err=True)
-        missing_kinds = format_missing_breakdown_compact(content_summary)
-        actionable_missing_kinds = format_actionable_missing_breakdown_compact(content_summary)
-        background_missing_kinds = format_background_missing_breakdown_compact(content_summary)
-        typer.echo(
-            (
-                f"records={len(normalized.messages)} copied={bundle.copied_asset_count} "
-                f"reused={bundle.reused_asset_count} missing={bundle.missing_asset_count} "
-                f"src={content_summary.get('history_source') or '-'} "
-                f"history_fallback={'partial' if content_summary.get('bulk_partial_fallback') else '-'} "
-                f"fwd_gap={int(content_summary.get('forward_structure_unavailable_count') or 0)} "
-                f"final_missing_reason=[{missing_kinds}] "
-                f"actionable_missing_reason=[{actionable_missing_kinds}] "
-                f"background_missing_reason=[{background_missing_kinds}] "
-                f"pages={summary['pages_scanned']} retries={summary['retry_events']} trace={trace.path}"
-            ),
-            err=True,
-        )
-        actionable_missing_count = int(content_summary.get("actionable_missing_count") or 0)
-        background_missing_count = int(content_summary.get("background_missing_count") or 0)
-        if bundle.missing_asset_count and actionable_missing_count == 0 and background_missing_count > 0:
-            typer.echo(
-                "missing_note: 当前剩余 missing 全是背景缺失（placeholder / expired 类），"
-                "当前导出链没有暴露新的可行动缺口。",
-                err=True,
-            )
+        session_line = _describe_runtime_session(settings)
+        for line in format_export_result_lines(
+            session_line=session_line,
+            content_summary=content_summary,
+            bundle=bundle,
+            trace_summary=summary,
+            trace_path=trace.path,
+        ):
+            typer.echo(colorize_status_fields_for_ansi(line), err=True)
         for retry_hint in format_missing_retry_hints_compact(content_summary, shell="cli"):
-            typer.echo(retry_hint, err=True)
+            typer.echo(colorize_status_fields_for_ansi(retry_hint), err=True)
         if int(getattr(bundle, "forensic_incident_count", 0) or 0):
             typer.echo(
                 f"forensics: incidents={getattr(bundle, 'forensic_incident_count', 0)} "

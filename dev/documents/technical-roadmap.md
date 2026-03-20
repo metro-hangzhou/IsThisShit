@@ -1145,3 +1145,31 @@
       - `10` 行
 - 当前价值：
   - `/login`、`/login --quick-uin` 等菜单在窗口底部不再更容易被挤没
+
+### [2026-03-20][039] 导出完成后的结果展示改成分块结果卡片，并显式输出 `export_status`
+
+- 新现场反馈：
+  - 导出完成后原来的：
+    - `export_verdict`
+    - `written: ...`
+    - `export_summary: ...`
+  - 虽然信息全，但形式又长又乱
+  - `content_export=`、`final_asset_result=` 这种机器向行不适合人眼扫读
+- 本轮修正：
+  - CLI / REPL 共用一套新的 `export_result` 结果块
+  - 按区块输出：
+    - `export_status`
+    - `export_verdict`
+    - `files`
+    - `summary`
+    - `assets`
+    - `note`
+  - `export_status=success|failed` 进入显式状态着色范围
+  - 原先冗长的 `content_export=` / `final_asset_result=` 结果块不再默认直接刷屏
+- 当前价值：
+  - 大群导出结束后，一眼就能看到：
+    - 成功还是失败
+    - 文件写到了哪里
+    - 时间窗和历史源
+    - 资产恢复总体结果
+    - missing 是否只是背景缺失
