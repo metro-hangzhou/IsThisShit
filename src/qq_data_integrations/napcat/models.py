@@ -7,9 +7,22 @@ from pydantic import BaseModel, Field
 
 from qq_data_core.models import EXPORT_TIMEZONE
 
+ChatType = Literal["group", "private"]
+
+
+def normalize_chat_type(value: str, *, allow_friend_alias: bool = True) -> ChatType:
+    normalized = str(value or "").strip().casefold()
+    if normalized == "group":
+        return "group"
+    if normalized == "private":
+        return "private"
+    if allow_friend_alias and normalized == "friend":
+        return "private"
+    raise ValueError("chat type must be one of: group, friend, private")
+
 
 class ChatTarget(BaseModel):
-    chat_type: Literal["group", "private"]
+    chat_type: ChatType
     chat_id: str
     name: str
     remark: str | None = None
@@ -40,7 +53,7 @@ class ChatTarget(BaseModel):
 
 
 class MetadataCache(BaseModel):
-    chat_type: Literal["group", "private"]
+    chat_type: ChatType
     refreshed_at: datetime | None = Field(default_factory=lambda: datetime.now(EXPORT_TIMEZONE))
     targets: list[ChatTarget] = Field(default_factory=list)
 
@@ -73,3 +86,15 @@ class NapCatLoginInfo(BaseModel):
     nick: str | None = None
     online: bool | None = None
     avatar_url: str | None = None
+
+
+class NapCatQuickLoginAccount(BaseModel):
+    uin: str
+    nick_name: str | None = None
+    face_url: str | None = None
+
+    @property
+    def display_label(self) -> str:
+        if self.nick_name:
+            return f"{self.nick_name} ({self.uin})"
+        return self.uin

@@ -1,6 +1,6 @@
 # Technical Roadmap
 
-> Last updated: 2026-03-19
+> Last updated: 2026-03-20
 > Scope: 记录、统筹、规划、指引当前项目的技术路线，并为后续开发、测试、文档与分支操作提供统一入口。
 
 ## 1. 文档目的
@@ -17,7 +17,7 @@
 
 ## 2. 当前总路线
 
-当前主线可以压成 5 层：
+当前主线可以压成 6 层：
 
 1. 上游数据抓手
    - NapCat / OneBot / exporter
@@ -32,17 +32,23 @@
 4. 深度分析 Agent
    - `BenshiMasterAgent`
    - `BenshiMasterLlmAgent`
-5. 后续扩展
+5. 本地史学知识底座
    - `BenshiOntologyPack`
    - `BenshiExampleBank`
    - 成分分布 / 搬运结构分布
-   - 非集中式群聊实战验证
+6. 运行稳定性与发布验证
+   - `main` / `runtime` 发布线
+   - `full-dev` 本地开发线
+   - CLI / NapCat runtime 一致性
 
 ## 3. 当前阶段判断
 
-截至 `2026-03-19`，项目已经越过“只是导出器”的阶段。
+截至 `2026-03-20`，项目已经处于“双主线并进”状态：
 
-当前主线阶段是：
+- 一条主线是 `Benshi` 深度分析能力持续扩写
+- 另一条主线是 exporter / CLI / NapCat runtime 的运行稳定性修复
+
+当前阶段判断：
 
 - exporter 已可作为稳定上游
 - preprocess/runtime 已能围绕 `shi_focus` 产出专项视图
@@ -51,18 +57,12 @@
   - 史成分分析
   - 史描述层
   - 群友口吻渲染
-  - 可选 reply probe
-
-当前最主要的未完成工作是：
-
-- 继续扩写和校准 `BenshiOntologyPack`
-  - 目前已接入第一版程序模型与 prompt payload
-  - 但还需要继续补 hard guidance / soft guidance / anti-patterns 的示例化表达
-- 扩写 `BenshiExampleBank`
-  - 当前已有首批种子例子，但负例和边界例子仍然偏少
-- 扩写集中式样本的成分分布 / 搬运结构分布
-  - 当前已有第一版基线，但还需要更细 family/subtype 归并
-- 再用非集中式群聊窗口做实战校准
+  - reply probe
+- 运行面当前新增重点是：
+  - 分支更新策略固定
+  - release 线导出/补全兼容性回归修复
+  - `full-dev` NapCat vendored runtime 完整性修复
+  - 大群导出前向超时与进度链路稳定性验证
 
 ## 4. 里程碑日志
 
@@ -137,9 +137,6 @@
   - `BenshiAnalysisPack`
   - `BenshiMasterAgent`
   - `Benshi` prompt payload
-- 本地验证完成：
-  - `tests/test_benshi_master_agent.py` 通过
-  - 本地 `run_benshi_local_smoke.py` 已在真实 `shi_focus` 视图上跑通
 
 ### [2026-03-19][009] ExampleBank 种子基线 / 分布基线落地
 
@@ -156,10 +153,6 @@
   - `benshi_example_bank_review.txt`
   - `benshi_distribution_baseline.json`
   - `benshi_distribution_review.txt`
-- 当前集中式基线已经具备：
-  - 例子库种子
-  - 成分/搬运结构基线
-  - 图像簇分布摘要
 
 ### [2026-03-19][010] ExampleBank / Distribution prompt 接入与 live smoke
 
@@ -175,23 +168,52 @@
   - `--dataset-dir`
   - `--example-bank-manifest`
   - `--distribution-baseline`
-  并会在审阅稿中显式写出启用状态
-- 新一轮 live 审阅产物：
-  - `benshi_llm_reply_probe_clusters_examples_dist_medium_review.txt`
-  - `benshi_llm_reply_probe_clusters_examples_dist_medium_shi_review.txt`
+
+### [2026-03-20][011] 分支策略固定与运行稳定性问题显式归档
+
+- 分支更新策略进一步明确：
+  - 仅 `main` 的 `start_cli.bat` 允许自动从 remote fast-forward 更新
+  - `full-dev` / `runtime` 以及其它非 `main` 分支默认不自动更新
+- `full-dev` 曾出现：
+  - 根目录 `start_napcat_logged.bat` 缺失
+  - vendored NapCat runtime 缺 `path-to-regexp/dist/index.js` 与 `qs/dist/qs.js`
+  - 直接导致 `/login` 阶段 NapCat WebUI 未就绪或 Node 模块缺失
+- release 线曾出现导出/补全回归：
+  - `begin_export_download_tracking(...)` 缺失
+  - `settle_export_download_progress(...)` 缺失
+  - 直接导致 `/export group ...` 补全或导出链在 `NapCatMediaDownloader` 处崩溃
+- 朋友机器上的超大群导出又暴露出一条运行面问题：
+  - `forward_context_metadata` 在 `/hydrate-forward-media` 路径上持续 `12s` timeout
+  - 需要继续沿 release/runtime 稳定性线跟进
+- 对应追踪已写入：
+  - [git_branching_plan.md](git_branching_plan.md)
+  - [TODOs.release-runtime-stability.md](../todos/TODOs.release-runtime-stability.md)
+  - [TODOs.export-performance.md](../todos/TODOs.export-performance.md)
+
+### [2026-03-20][012] 导出收尾回归 / forward timeout 短路 / quick login 接入
+
+- 现场新增故障确认：
+  - 大窗导出在收尾阶段因 `NapCatMediaDownloader.settle_export_download_progress(...)` 缺失而崩溃
+  - 超大 forward 内层图片会在 `forward_context_metadata -> /hydrate-forward-media` 上逐 sibling 触发重复 `12s` timeout
+- 当前主线修复：
+  - 为 downloader 补回 `settle_export_download_progress(...)`
+  - 对同一 forward parent 的 metadata timeout 增加本轮进程内短路缓存，避免 sibling 资产线性重复超时
+  - `/login` 增加 quick login 路径，优先尝试 NapCat WebUI 的本机快速登录候选，再回退二维码
+  - export/status 输出增加显式 `status=` 字段，并且仅对 `success / failed / in progress` 做颜色标记
+- 这轮验证重点：
+  - 2000 条级别群导出不再在收尾阶段因 progress helper 缺失崩溃
+  - 大窗 forward metadata timeout 数量下降，不再每个 sibling 都完整吃一次 12 秒
+  - 已登录本机 QQ 的情况下，`/login` 可优先走 quick login
 
 ## 5. 当前主线任务
 
 当前主线开发按优先级排序：
 
 1. `BenshiOntologyPack` 扩写
-   - 从 `Q群群友史.docx` 继续补 hard guidance / soft guidance / anti-patterns
 2. `BenshiExampleBank` 扩写
-   - 在已有种子上继续补负例、边界例子、ontology 映射
 3. `成分分布 / 搬运结构分布` 扩写
-   - 从首版基线继续补 family/subtype 归并和对照口径
-4. `非集中式群聊实战`
-   - 用未来拿到的新窗口做校准和反例验证
+4. release/runtime 稳定性修复与回归
+5. 非集中式群聊实战
 
 ## 6. 当前可用测试/审阅产物
 
@@ -207,16 +229,6 @@
 - `benshi_llm_reply_probe_clusters_medium_cluster_review.txt`
 - `benshi_llm_reply_probe_clusters_medium_shi_review.txt`
 
-### 当前最重要的审阅锚点
-
-如果只看一份，优先看：
-
-- `dev/testdata/local/shi_group_751365230/benshi_llm_reply_probe_clusters_medium_shi_review.txt`
-- `dev/testdata/local/shi_group_751365230/benshi_example_bank_review.txt`
-- `dev/testdata/local/shi_group_751365230/benshi_distribution_review.txt`
-
-它是当前“什么是史 / 史成分 / 怎么描述史”的第一版人工审阅基线。
-
 ## 7. 工作流规则
 
 ### 分支规则
@@ -226,10 +238,13 @@
 - `full-dev`
   - 默认开发分支
   - 只本地提交，不默认推远端
+  - 不自动拉 remote 更新
 - `main`
   - 发布/归档/验证分支
+  - 允许在 `start_cli.bat` 中自动检查并 fast-forward 自身
 - `runtime`
   - 运行面/发布验证分支
+  - 不自动拉 remote 更新
 
 ### 文档规则
 
@@ -248,18 +263,13 @@
   - prompt/pack 有关键变化
   - 或需要人工审阅真实输出时
   才进行
-- 所有关键 live run 都应保留：
-  - output json
-  - human report
-  - review txt
-  - run summary
+- 运行面修复进入 `main` / `runtime` 前，应优先补最小回归测试
 
 ### 默认推进风格
 
 - 除非用户明确要求逐步确认或暂停，大步推进优先于碎步往返
 - 默认先分析“下一阶段的大方向都有哪些可以一起做”
 - 然后把不冲突的任务打包成一轮并发推进
-- 当用户已经授权子代理并发时，优先把探索、实现、脚本升级、测试校准拆成多线程同时做
 
 ## 8. 文档路由总表
 
@@ -275,17 +285,11 @@
 ### 8.2 `dev/agents/` 专项手册
 
 - [INDEX.md](../agents/INDEX.md)
-  - AGENT 手册总索引
 - [major_AGENTs.md](../agents/major_AGENTs.md)
-  - 仓库阶段、权威顺序、总编排
 - [CodeStrict_AGENTs.md](../agents/CodeStrict_AGENTs.md)
-  - 严格生产硬化视角
 - [process_AGENTs.md](../agents/process_AGENTs.md)
-  - preprocess/corpus/chunk/index 规则
 - [llm_AGENTs.md](../agents/llm_AGENTs.md)
-  - LLM/report-first 分析政策
 - [Benshi_AGENTs.md](../agents/Benshi_AGENTs.md)
-  - 搬史/吃史深度分析 Agent 规则
 - [NapCat.docs_AGENTs.md](../agents/NapCat.docs_AGENTs.md)
 - [NapCat.source_AGENTs.md](../agents/NapCat.source_AGENTs.md)
 - [NapCat.community_AGENTs.md](../agents/NapCat.community_AGENTs.md)
@@ -307,9 +311,7 @@
 - [TODOs.benshi-ontology-pack.md](../todos/TODOs.benshi-ontology-pack.md)
 - [TODOs.benshi-example-bank.md](../todos/TODOs.benshi-example-bank.md)
 - [TODOs.benshi-distribution.md](../todos/TODOs.benshi-distribution.md)
-- [TODOs.preprocess.md](../todos/TODOs.preprocess.md)
-- [TODOs.llm-analysis.md](../todos/TODOs.llm-analysis.md)
-- [TODOs.rag.md](../todos/TODOs.rag.md)
+- [TODOs.release-runtime-stability.md](../todos/TODOs.release-runtime-stability.md)
 
 上游与运行侧支撑：
 
@@ -325,15 +327,9 @@
 ### 8.4 `dev/documents/` 参考与归档
 
 - [INDEX.md](INDEX.md)
-- [README.md](README.md)
 - [git_branching_plan.md](git_branching_plan.md)
-- [benshi_calibration_rubric.md](benshi_calibration_rubric.md)
-- [benshi_report_review_20260312.md](benshi_report_review_20260312.md)
-- [benshi_review_checklist.md](benshi_review_checklist.md)
 - [benshi_local_ontology.md](benshi_local_ontology.md)
 - `Q群群友史.docx`
-- `开源项目《QQ群搬史(屎)分析仪》AI 设计与实现深度技术报告.docx`
-- `开源项目《QQ群搬史(屎)分析仪》深度调研与方案报告.pdf`
 
 ## 9. 当前判断：哪些该看，哪些不用反复看
 
@@ -346,7 +342,7 @@
 - `TODOs.benshi-master-agent.md`
 - `Q群群友史.docx`
 - `benshi_calibration_rubric.md`
-- `benshi_llm_reply_probe_clusters_medium_shi_review.txt`
+- `TODOs.release-runtime-stability.md`
 
 ### 当前主要作为归档/中长期参考
 
@@ -357,13 +353,74 @@
 
 最推荐的执行顺序：
 
-1. 扩写 `BenshiOntologyPack`
-2. 扩写 `BenshiExampleBank`
-3. 扩写集中式样本的成分分布/结构分布
+1. 继续扩写 `BenshiOntologyPack`
+2. 继续扩写 `BenshiExampleBank`
+3. 沿 release/runtime 稳定性线补：
+   - forward metadata timeout
+   - 导出进度链路回归
+   - full-dev NapCat runtime 完整性检查
 4. 等非集中式群聊数据到位后，立即做对照验证
 
-这条顺序的意义是：
+## 11. 2026-03-20 Release / Runtime Hotfix Log
 
-- 先把“史是什么”固化
-- 再把“怎么判断/怎么描述/怎么接茬”校准
-- 最后再扩到更脏、更复杂、更真实的窗口
+### [2026-03-20][012] 分支策略与运行面行为复核
+
+- 现场确认：
+  - `full-dev/start_cli*.bat` 不自动拉 remote 更新
+  - `runtime/start_cli*.bat` 不自动拉 remote 更新
+  - `main/start_cli.bat` 仅在当前分支真实为 `main` 时才执行 fetch/pull
+- 运行辅助：
+  - `full-dev/start_napcat_logged.bat` 已恢复，便于本地 NapCat 观察
+
+### [2026-03-20][013] CLI 登录链增加 quick login 分支
+
+- 触发背景：
+  - 纯二维码登录会增加维护/测试摩擦
+  - 用户本地 QQ 往往已经在线，适合优先走 NapCat WebUI quick login
+- 本轮动作：
+  - REPL `/login` 已支持 quick login first
+  - `app.py login` 命令行入口已补齐同样行为
+  - 若 quick login 不可用，仍自动回退到二维码流程
+- 现场验证：
+  - live smoke 输出：
+    - `quick_login_candidate=ㅤㅤㅤㅤㅤㅤㅤㅤ (1507833383)`
+    - `QQ quick login succeeded.`
+    - `uin=3956020260`
+
+### [2026-03-20][014] 导出进度状态显式着色
+
+- 新约束：
+  - 仅对 `status=success|failed|in progress` 本身着色
+  - success=green
+  - failed=red
+  - in progress=yellow
+  - 其余字段保持原样
+- 已落点：
+  - CLI 命令输出
+  - Slash REPL 进度输出
+  - watch 视图
+- 现场验证：
+  - live `export-history` 已出现：
+    - `status=in progress export_progress: ...`
+    - `status=success export_progress: ...`
+    - `status=failed export_progress: asset substep timeout ...`
+
+### [2026-03-20][015] 大窗导出回归：收尾崩溃已修，forward metadata timeout 降噪
+
+- 原现场故障：
+  - 大群导出在收尾阶段抛：
+    - `'NapCatMediaDownloader' object has no attribute 'settle_export_download_progress'`
+  - 同一个 forward parent 下，多个兄弟 asset 会重复打 `forward_context_metadata` 的 12 秒 timeout
+- 本轮动作：
+  - 补回 `NapCatMediaDownloader.settle_export_download_progress(...)`
+  - 为 `forward_context_metadata` 增加同父级 timeout 短路缓存
+- live 验证：
+  - 命令：
+    - `app.py export-history group "蕾米二次元萌萌群" --limit 2000 --format jsonl`
+  - 结果：
+    - `records=2000`
+    - `elapsed_s≈40.2`
+    - 无 `settle_export_download_progress` 崩溃
+    - 只记录到 1 条代表性 `forward_context_metadata` timeout，而非整串兄弟图重复刷屏
+- 当前解释：
+  - 这类超时仍然真实存在，但已从“重复放大故障”收敛成“单点慢点”

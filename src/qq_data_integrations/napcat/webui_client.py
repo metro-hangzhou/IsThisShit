@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import httpx
 import orjson
 
-from .models import NapCatLoginInfo, NapCatLoginStatus
+from .models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
 
 
 class NapCatWebUiError(RuntimeError):
@@ -19,6 +19,14 @@ class NapCatWebUiAuthError(NapCatWebUiError):
 
 
 class NapCatWebUiConnectError(NapCatWebUiError):
+    pass
+
+
+class NapCatWebUiTimeoutError(NapCatWebUiError):
+    pass
+
+
+class NapCatWebUiResponseError(NapCatWebUiError):
     pass
 
 
@@ -89,6 +97,28 @@ class NapCatWebUiClient:
             avatar_url=_as_optional_str(data.get("avatarUrl")),
         )
 
+    def get_quick_login_list(self) -> list[NapCatQuickLoginAccount]:
+        accounts = _normalize_quick_login_accounts(
+            self._request_data("/QQLogin/GetQuickLoginListNew")
+        )
+        if accounts:
+            return accounts
+        return _normalize_quick_login_accounts(
+            self._request_data("/QQLogin/GetQuickLoginList")
+        )
+
+    def get_quick_login_uin(self) -> str | None:
+        payload = self._request_data("/QQLogin/GetQuickLoginQQ")
+        if isinstance(payload, dict):
+            return _as_optional_str(payload.get("uin") or payload.get("qq") or payload.get("account"))
+        return _as_optional_str(payload)
+
+    def set_quick_login_uin(self, uin: str) -> None:
+        self._request_data("/QQLogin/SetQuickLoginQQ", {"uin": str(uin).strip()})
+
+    def request_quick_login(self, uin: str) -> None:
+        self._request_data("/QQLogin/SetQuickLogin", {"uin": str(uin).strip()})
+
     def get_ob11_config(self) -> dict[str, Any]:
         data = self._request("/OB11Config/GetConfig")
         return data if isinstance(data, dict) else {}
@@ -130,20 +160,37 @@ class NapCatWebUiClient:
         return changed
 
     def _request(self, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data = self._request_data(path, payload)
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    def _request_data(self, path: str, payload: dict[str, Any] | None = None) -> Any:
         credential = self.ensure_authenticated()
         response = self._post(
             path,
             json=payload or {},
             headers={"Authorization": f"Bearer {credential}"},
         )
-        data = self._extract_data(response)
-        if not isinstance(data, dict):
-            return {}
-        return data
+        return self._extract_data(response)
 
     def _extract_data(self, response: httpx.Response) -> Any:
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise NapCatWebUiResponseError(
+                f"NapCat WebUI returned HTTP {response.status_code}."
+            ) from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise NapCatWebUiResponseError(
+                "NapCat WebUI returned non-JSON response."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise NapCatWebUiResponseError(
+                "NapCat WebUI returned unexpected JSON payload."
+            )
         if payload.get("code") != 0:
             message = payload.get("message") or "NapCat WebUI request failed"
             if message == "Unauthorized":
@@ -161,6 +208,10 @@ class NapCatWebUiClient:
                 "Start or enable NapCat for your QQNT, or set NAPCAT_WEBUI_URL / NAPCAT_WORKDIR "
                 "to the actual runtime."
             ) from exc
+        except httpx.TimeoutException as exc:
+            raise NapCatWebUiTimeoutError(
+                f"NapCat WebUI timed out waiting for {path} at {self._base_url}"
+            ) from exc
 
 
 def _hash_webui_token(token: str) -> str:
@@ -170,6 +221,29 @@ def _hash_webui_token(token: str) -> str:
 def _as_optional_str(value: Any) -> str | None:
     text = str(value).strip() if value is not None else ""
     return text or None
+
+
+def _normalize_quick_login_accounts(payload: Any) -> list[NapCatQuickLoginAccount]:
+    if not isinstance(payload, list):
+        return []
+    accounts: list[NapCatQuickLoginAccount] = []
+    for item in payload:
+        if isinstance(item, dict):
+            uin = _as_optional_str(item.get("uin") or item.get("qq") or item.get("account"))
+            if not uin:
+                continue
+            accounts.append(
+                NapCatQuickLoginAccount(
+                    uin=uin,
+                    nick_name=_as_optional_str(item.get("nickName") or item.get("nick")),
+                    face_url=_as_optional_str(item.get("faceUrl") or item.get("avatarUrl")),
+                )
+            )
+            continue
+        uin = _as_optional_str(item)
+        if uin:
+            accounts.append(NapCatQuickLoginAccount(uin=uin))
+    return accounts
 
 
 def _ensure_http_server(network: dict[str, Any], *, url: str, token: str) -> bool:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 
-from .models import NapCatLoginInfo, NapCatLoginStatus
+from .models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
 from .webui_client import NapCatWebUiClient
 
 
@@ -28,6 +28,51 @@ class NapCatQrLoginService:
 
     def get_login_info(self) -> NapCatLoginInfo:
         return self._client.get_login_info()
+
+    def get_quick_login_candidates(self) -> list[NapCatQuickLoginAccount]:
+        return self._client.get_quick_login_list()
+
+    def get_default_quick_login_uin(self) -> str | None:
+        return self._client.get_quick_login_uin()
+
+    def try_quick_login(
+        self,
+        *,
+        preferred_uin: str | None = None,
+        timeout_seconds: float = 25.0,
+        poll_interval: float = 1.0,
+        on_status: StatusCallback | None = None,
+    ) -> NapCatLoginInfo | None:
+        status = self._client.check_login_status()
+        if status.effectively_logged_in():
+            return self._client.get_login_info()
+
+        candidates = self.get_quick_login_candidates()
+        if not candidates:
+            return None
+
+        chosen_uin = _choose_quick_login_uin(
+            preferred_uin=preferred_uin,
+            default_uin=self.get_default_quick_login_uin(),
+            candidates=candidates,
+        )
+        if chosen_uin is None:
+            return None
+
+        self._client.set_quick_login_uin(chosen_uin)
+        self._client.request_quick_login(chosen_uin)
+
+        deadline = self._monotonic() + timeout_seconds
+        while self._monotonic() < deadline:
+            self._sleep(poll_interval)
+            status = self._client.check_login_status()
+            if on_status:
+                on_status(status)
+            if status.effectively_logged_in():
+                return self._client.get_login_info()
+            if status.login_error and "快速登录" in status.login_error:
+                return None
+        return None
 
     def login_until_success(
         self,
@@ -79,3 +124,23 @@ class NapCatQrLoginService:
                     on_qrcode(next_qrcode)
 
         raise TimeoutError("Timed out waiting for QQ QR login confirmation")
+
+
+def _choose_quick_login_uin(
+    *,
+    preferred_uin: str | None,
+    default_uin: str | None,
+    candidates: list[NapCatQuickLoginAccount],
+) -> str | None:
+    preferred = str(preferred_uin or "").strip()
+    if preferred:
+        for candidate in candidates:
+            if candidate.uin == preferred:
+                return candidate.uin
+        return None
+    default_value = str(default_uin or "").strip()
+    if default_value:
+        for candidate in candidates:
+            if candidate.uin == default_value:
+                return candidate.uin
+    return candidates[0].uin if candidates else None
