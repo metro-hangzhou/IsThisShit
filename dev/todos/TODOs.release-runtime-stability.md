@@ -297,6 +297,12 @@ Recent field failures showed that the project has two separate but related stabi
   - fixed by syncing:
     - `src/qq_data_cli/completion.py`
     - `tests/test_cli_login_completion.py`
+- [x] Remove synchronous quick-login candidate lookup from the completion hot path
+  - REPL startup now primes quick-login candidates in background
+  - completion now returns:
+    - pinned local account first
+    - cache-backed candidates second
+  - avoids the old `1-2s` interactive stall on `/login` and `/login --quick-uin`
 
 ## Reviewer-Derived Next Hardening Targets
 
