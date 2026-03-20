@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import typer
 
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
+from qq_data_cli.status_display import colorize_status_fields_for_ansi
 from qq_data_cli.terminal_compat import (
     apply_cli_ui_mode_override,
     probe_terminal_environment,
@@ -141,6 +142,8 @@ def login(
     timeout: float = typer.Option(300.0, "--timeout"),
     poll: float = typer.Option(3.0, "--poll"),
     refresh: bool = typer.Option(False, "--refresh"),
+    no_quick: bool = typer.Option(False, "--no-quick"),
+    quick_uin: str | None = typer.Option(None, "--quick-uin"),
     webui_url: str | None = typer.Option(None, "--webui-url"),
     webui_token: str | None = typer.Option(None, "--webui-token"),
 ) -> None:
@@ -199,6 +202,38 @@ def login(
         def on_status(status) -> None:
             if status.login_error:
                 typer.echo(f"login_status={status.login_error}")
+
+        quick_candidate_label: str | None = None
+        if not refresh and not no_quick:
+            try:
+                candidates = service.get_quick_login_candidates()
+            except Exception:
+                candidates = []
+            chosen_uin = quick_uin
+            if chosen_uin is None:
+                chosen_uin = service.get_default_quick_login_uin()
+            if chosen_uin is None and candidates:
+                chosen_uin = candidates[0].uin
+            if chosen_uin:
+                for candidate in candidates:
+                    if candidate.uin == chosen_uin:
+                        quick_candidate_label = candidate.display_label
+                        break
+                if quick_candidate_label is None:
+                    quick_candidate_label = chosen_uin
+                typer.echo(f"quick_login_candidate={quick_candidate_label}")
+                quick_info = service.try_quick_login(
+                    preferred_uin=quick_uin,
+                    timeout_seconds=min(timeout, 25.0),
+                    poll_interval=min(max(poll, 0.5), 2.0),
+                    on_status=on_status,
+                )
+                if quick_info is not None:
+                    typer.echo("QQ quick login succeeded.")
+                    typer.echo(f"uin={quick_info.uin or ''}")
+                    typer.echo(f"nick={quick_info.nick or ''}")
+                    typer.echo(f"online={quick_info.online}")
+                    return
 
         info = service.login_until_success(
             timeout_seconds=timeout,
@@ -554,7 +589,7 @@ def _build_cli_export_progress_callback(trace: "ExportPerfTraceWriter"):
             state["last_download_completed"] = completed
             state["last_download_text"] = text
             state["last_download_emit"] = now
-            typer.echo(text, err=True)
+            typer.echo(colorize_status_fields_for_ansi(text, stream=sys.stderr), err=True)
             return
         if phase == "materialize_assets":
             current = int(update.get("current") or 0)
@@ -578,7 +613,7 @@ def _build_cli_export_progress_callback(trace: "ExportPerfTraceWriter"):
             return
         state["last_text"] = text
         state["last_emit"] = now
-        typer.echo(text, err=True)
+        typer.echo(colorize_status_fields_for_ansi(text, stream=sys.stderr), err=True)
 
     return callback
 
@@ -627,17 +662,18 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
     if phase == "write_data_file":
         stage = str(update.get("stage") or "start")
         record_count = int(update.get("record_count") or 0)
-        status = "wrote" if stage == "done" else "writing"
-        return f"export_progress: {status} data file records={record_count}"
+        status = "success" if stage == "done" else "in progress"
+        action = "wrote" if stage == "done" else "writing"
+        return f"status={status} export_progress: {action} data file records={record_count}"
 
     if phase == "prefetch_media":
         stage = str(update.get("stage") or "start")
         request_count = int(update.get("request_count") or 0)
         if stage == "done":
-            return f"export_progress: prefetched media context requests={request_count} elapsed={elapsed_s:.1f}s"
+            return f"status=success export_progress: prefetched media context requests={request_count} elapsed={elapsed_s:.1f}s"
         if stage == "error":
-            return f"export_progress: media prefetch degraded requests={request_count} elapsed={elapsed_s:.1f}s"
-        return f"export_progress: prefetching media context requests={request_count}"
+            return f"status=failed export_progress: media prefetch degraded requests={request_count} elapsed={elapsed_s:.1f}s"
+        return f"status=in progress export_progress: prefetching media context requests={request_count}"
 
     if phase == "materialize_assets":
         current = int(update.get("current") or 0)
@@ -650,7 +686,7 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
         missing = int(update.get("missing_assets") or 0)
         errors = int(update.get("error_assets") or 0)
         detail = (
-            f"export_progress: materializing assets {current}/{total} "
+            f"status=in progress export_progress: materializing assets {current}/{total} "
             f"{asset_type}{role_suffix} copied={copied} reused={reused} missing={missing} err={errors}"
         )
         if elapsed_s > 0 and current > 0:
@@ -673,7 +709,13 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
         last_status = str(update.get("last_status") or "").strip()
         if stage == "done" and not total:
             return None
-        parts = [f"remote_downloads(subqueue): {stage}"]
+        status = {
+            "start": "in progress",
+            "progress": "in progress",
+            "done": "success",
+            "error": "failed",
+        }.get(stage, "in progress")
+        parts = [f"status={status}", f"remote_downloads(subqueue): {stage}"]
         parts.append(f"candidates={total}")
         parts.append(f"ok={completed}")
         parts.append(f"cached={cached}")
@@ -715,7 +757,7 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
         timeout_s = float(update.get("timeout_s") or 0.0)
         elapsed = float(update.get("elapsed_s") or 0.0)
         detail = (
-            f"export_progress: asset substep {status} substep={substep} "
+            f"status=failed export_progress: asset substep {status} substep={substep} "
             f"asset={asset_type}:{file_name}"
         )
         if timeout_s > 0:

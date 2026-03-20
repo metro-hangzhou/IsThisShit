@@ -86,3 +86,15 @@ class NapCatLoginInfo(BaseModel):
     nick: str | None = None
     online: bool | None = None
     avatar_url: str | None = None
+
+
+class NapCatQuickLoginAccount(BaseModel):
+    uin: str
+    nick_name: str | None = None
+    face_url: str | None = None
+
+    @property
+    def display_label(self) -> str:
+        if self.nick_name:
+            return f"{self.nick_name} ({self.uin})"
+        return self.uin
