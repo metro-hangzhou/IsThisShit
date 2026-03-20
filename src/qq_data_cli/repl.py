@@ -1545,10 +1545,12 @@ class SlashRepl:
             session_kwargs["reserve_space_for_menu"] = 8
         if self._ui_profile.mode == "compat":
             session_kwargs["complete_style"] = CompleteStyle.READLINE_LIKE
-        return PromptSession(
+        session = PromptSession(
             "> ",
             **session_kwargs,
         )
+        session.default_buffer.on_text_changed += self._handle_buffer_text_changed
+        return session
 
     def _collect_debug_preflight_evidence(self) -> dict[str, Any]:
         from qq_data_integrations.napcat.diagnostics import collect_debug_preflight_evidence
@@ -1698,6 +1700,16 @@ class SlashRepl:
         self._console.print(
             f"startup_napcat: {result.message or 'NapCatQQ Service 未就绪，后续可继续用 /login 排查。'}"
         )
+
+    def _handle_buffer_text_changed(self, buffer) -> None:
+        if not _should_auto_refresh_completion(buffer.text):
+            return
+        try:
+            if buffer.complete_state is not None:
+                buffer.cancel_completion()
+            buffer.start_completion(select_first=False)
+        except Exception:
+            self._logger.debug("completion_auto_refresh_failed", exc_info=True)
 
     def _collect_quick_login_candidates_from_service(
         self,
@@ -2112,6 +2124,17 @@ def _completion_followup(text: str, *, accepted_text: str | None = None) -> str 
 def _is_login_completion_context(text: str) -> bool:
     tokens = _split_cli_tokens(text.rstrip())
     return bool(tokens) and tokens[0].casefold() == "/login"
+
+
+def _should_auto_refresh_completion(text: str) -> bool:
+    stripped = text.rstrip()
+    if not stripped.startswith("/"):
+        return False
+    if " " not in stripped:
+        return True
+    if _is_login_completion_context(stripped):
+        return True
+    return False
 
 
 def _navigate_completion_menu_without_inserting(buffer, *, direction: int) -> None:
