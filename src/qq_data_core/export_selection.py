@@ -52,6 +52,10 @@ PROFILE_COMMANDS: dict[ExportProfile, str] = {
 MISSING_RETRY_CLUSTER_GAP = timedelta(minutes=10)
 MISSING_RETRY_WINDOW_PADDING = timedelta(seconds=15)
 MAX_MISSING_RETRY_HINTS = 6
+BACKGROUND_MISSING_KINDS: set[str] = {
+    "qq_not_downloaded_local_placeholder",
+    "qq_expired_after_napcat",
+}
 
 
 def _count_segments_in_messages(messages: list[NormalizedMessage]) -> Counter[str]:
@@ -139,6 +143,8 @@ def build_export_content_summary(
     missing_assets = Counter()
     error_assets = Counter()
     missing_breakdown = Counter()
+    actionable_missing_breakdown = Counter()
+    background_missing_breakdown = Counter()
 
     for message in snapshot.messages:
         for segment in message.segments:
@@ -155,7 +161,12 @@ def build_export_content_summary(
             actual_assets[key] += 1
         elif asset.status == "missing":
             missing_assets[key] += 1
-            missing_breakdown[str(asset.resolver or "missing")] += 1
+            missing_kind = str(asset.missing_kind or asset.resolver or "missing")
+            missing_breakdown[missing_kind] += 1
+            if missing_kind in BACKGROUND_MISSING_KINDS:
+                background_missing_breakdown[missing_kind] += 1
+            else:
+                actionable_missing_breakdown[missing_kind] += 1
         elif asset.status == "error":
             error_assets[key] += 1
 
@@ -190,6 +201,14 @@ def build_export_content_summary(
         "missing_assets": {key: int(missing_assets[key]) for key in ASSET_TYPE_ORDER},
         "error_assets": {key: int(error_assets[key]) for key in ASSET_TYPE_ORDER},
         "missing_breakdown": dict(sorted((str(key), int(value)) for key, value in missing_breakdown.items())),
+        "actionable_missing_breakdown": dict(
+            sorted((str(key), int(value)) for key, value in actionable_missing_breakdown.items())
+        ),
+        "background_missing_breakdown": dict(
+            sorted((str(key), int(value)) for key, value in background_missing_breakdown.items())
+        ),
+        "actionable_missing_count": int(sum(actionable_missing_breakdown.values())),
+        "background_missing_count": int(sum(background_missing_breakdown.values())),
         "missing_retry_plan": _build_missing_retry_plan(
             snapshot=snapshot,
             bundle=bundle,
@@ -208,6 +227,8 @@ def format_export_content_summary(summary: dict[str, object]) -> list[str]:
     missing_assets = summary.get("missing_assets") or {}
     error_assets = summary.get("error_assets") or {}
     missing_breakdown = summary.get("missing_breakdown") or {}
+    actionable_missing_breakdown = summary.get("actionable_missing_breakdown") or {}
+    background_missing_breakdown = summary.get("background_missing_breakdown") or {}
 
     lines = [
         "export_summary:",
@@ -250,11 +271,27 @@ def format_export_content_summary(summary: dict[str, object]) -> list[str]:
     if missing_breakdown:
         lines.append(
             "  final_missing_reason=["
-            + ", ".join(
-                f"{key}:{int(value)}"
-                for key, value in missing_breakdown.items()
-            )
+            + _format_counter_mapping(missing_breakdown)
             + "]"
+        )
+    if actionable_missing_breakdown:
+        lines.append(
+            "  actionable_missing_reason=["
+            + _format_counter_mapping(actionable_missing_breakdown)
+            + "]"
+        )
+    if background_missing_breakdown:
+        lines.append(
+            "  background_missing_reason=["
+            + _format_counter_mapping(background_missing_breakdown)
+            + "]"
+        )
+    actionable_missing_count = int(summary.get("actionable_missing_count") or 0)
+    background_missing_count = int(summary.get("background_missing_count") or 0)
+    if actionable_missing_count == 0 and background_missing_count > 0:
+        lines.append(
+            "  missing_note=当前剩余 missing 均为背景缺失（placeholder / expired 类），"
+            "当前导出链本身未发现新的可行动缺口"
         )
     retry_plan = summary.get("missing_retry_plan") or {}
     clusters = retry_plan.get("clusters") if isinstance(retry_plan, dict) else None
@@ -277,12 +314,17 @@ def format_export_content_summary(summary: dict[str, object]) -> list[str]:
 
 def format_missing_breakdown_compact(summary: dict[str, object]) -> str:
     missing_breakdown = summary.get("missing_breakdown") or {}
-    if not missing_breakdown:
-        return "-"
-    return ", ".join(
-        f"{key}:{int(value)}"
-        for key, value in missing_breakdown.items()
-    )
+    return _format_counter_mapping(missing_breakdown)
+
+
+def format_actionable_missing_breakdown_compact(summary: dict[str, object]) -> str:
+    actionable_missing_breakdown = summary.get("actionable_missing_breakdown") or {}
+    return _format_counter_mapping(actionable_missing_breakdown)
+
+
+def format_background_missing_breakdown_compact(summary: dict[str, object]) -> str:
+    background_missing_breakdown = summary.get("background_missing_breakdown") or {}
+    return _format_counter_mapping(background_missing_breakdown)
 
 
 def format_missing_retry_hints_compact(summary: dict[str, object], *, shell: Literal["repl", "cli"]) -> list[str]:
@@ -300,11 +342,42 @@ def format_missing_retry_hints_compact(summary: dict[str, object], *, shell: Lit
         command = str(cluster.get(key) or "").strip()
         if not command:
             continue
+        missing_kinds = _format_counter_mapping(cluster.get("missing_kinds") or {})
         lines.append(
-            f"retry_hint[{index}] assets={int(cluster.get('asset_count') or 0)} "
+            f"retry_hint[{index}] kinds=[{missing_kinds}] "
+            f"assets={int(cluster.get('asset_count') or 0)} "
             f"messages={int(cluster.get('message_count') or 0)} cmd={command}"
         )
     return lines
+
+
+def format_export_verdict_compact(summary: dict[str, object]) -> str:
+    actionable_missing_count = int(summary.get("actionable_missing_count") or 0)
+    background_missing_count = int(summary.get("background_missing_count") or 0)
+    missing_assets = summary.get("missing_assets") or {}
+    actual_assets = summary.get("actual_assets") or {}
+    expected_assets = summary.get("expected_assets") or {}
+
+    final_missing = sum(int(value) for value in missing_assets.values())
+    actual_total = sum(int(value) for value in actual_assets.values())
+    expected_total = sum(int(value) for value in expected_assets.values())
+
+    if final_missing <= 0:
+        verdict = "success"
+    elif actionable_missing_count > 0:
+        verdict = "success_with_actionable_missing"
+    elif background_missing_count > 0:
+        verdict = "success_with_background_missing"
+    else:
+        verdict = "success_with_unclassified_missing"
+
+    return (
+        f"export_verdict: {verdict} "
+        f"final_assets={actual_total}/{expected_total} "
+        f"final_missing={final_missing} "
+        f"actionable_missing={actionable_missing_count} "
+        f"background_missing={background_missing_count}"
+    )
 
 
 def format_export_content_summary_compact(summary: dict[str, object]) -> str:
@@ -317,6 +390,8 @@ def format_export_content_summary_compact(summary: dict[str, object]) -> str:
     missing_assets = summary.get("missing_assets") or {}
     error_assets = summary.get("error_assets") or {}
     missing_breakdown = summary.get("missing_breakdown") or {}
+    actionable_missing_count = int(summary.get("actionable_missing_count") or 0)
+    background_missing_count = int(summary.get("background_missing_count") or 0)
 
     segment_type_count = len(segment_counts)
     expected_total = sum(int(value) for value in expected_assets.values())
@@ -333,6 +408,8 @@ def format_export_content_summary_compact(summary: dict[str, object]) -> str:
         f"segment_types={segment_type_count} "
         f"final_assets={actual_total}/{expected_total} "
         f"final_missing={missing_total} "
+        f"actionable_missing={actionable_missing_count} "
+        f"background_missing={background_missing_count} "
         f"expired_occurrences={expired_total} "
         f"errors={error_total}"
     )
@@ -346,6 +423,8 @@ def format_watch_export_result_summary(summary: dict[str, object]) -> str:
     actual_assets = summary.get("actual_assets") or {}
     missing_assets = summary.get("missing_assets") or {}
     missing_breakdown = summary.get("missing_breakdown") or {}
+    actionable_missing_count = int(summary.get("actionable_missing_count") or 0)
+    background_missing_count = int(summary.get("background_missing_count") or 0)
 
     expected_total = sum(int(value) for value in expected_assets.values())
     actual_total = sum(int(value) for value in actual_assets.values())
@@ -357,6 +436,8 @@ def format_watch_export_result_summary(summary: dict[str, object]) -> str:
         f"req={requested_data_count} "
         f"final_a={actual_total}/{expected_total} "
         f"final_miss={missing_total} "
+        f"actionable_miss={actionable_missing_count} "
+        f"background_miss={background_missing_count} "
         f"expired_occurrences={expired_total}"
     )
 
@@ -369,7 +450,13 @@ def _build_missing_retry_plan(
     fmt: str,
     strict_missing: str | None,
 ) -> dict[str, object] | None:
-    missing_assets = [asset for asset in bundle.assets if asset.status == "missing" and asset.timestamp_iso]
+    missing_assets = [
+        asset
+        for asset in bundle.assets
+        if asset.status == "missing"
+        and asset.timestamp_iso
+        and str(asset.missing_kind or asset.resolver or "missing") not in BACKGROUND_MISSING_KINDS
+    ]
     if not missing_assets:
         return None
 
@@ -598,3 +685,10 @@ def _format_counter(value: object) -> str:
     if not counter:
         return "-"
     return ", ".join(f"{key}={counter[key]}" for key in sorted(counter))
+
+
+def _format_counter_mapping(value: object) -> str:
+    counter = value if isinstance(value, dict) else {}
+    if not counter:
+        return "-"
+    return ", ".join(f"{key}:{int(counter[key])}" for key in counter)
