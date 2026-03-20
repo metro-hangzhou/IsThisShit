@@ -5,14 +5,17 @@ from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatu
 
 
 class _QuickLoginClient:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, already_logged_in: bool = False) -> None:
         self.fail = fail
+        self.already_logged_in = already_logged_in
         self.selected_uin: str | None = None
         self.requested_uin: str | None = None
         self._checks = 0
 
     def check_login_status(self) -> NapCatLoginStatus:
         self._checks += 1
+        if self.already_logged_in:
+            return NapCatLoginStatus(is_login=True)
         if self.fail and self._checks > 1:
             return NapCatLoginStatus(login_error="快速登录失败")
         if not self.fail and self.requested_uin and self._checks > 1:
@@ -20,7 +23,7 @@ class _QuickLoginClient:
         return NapCatLoginStatus()
 
     def get_login_info(self) -> NapCatLoginInfo:
-        return NapCatLoginInfo(uin=self.requested_uin, nick="wiki", online=True)
+        return NapCatLoginInfo(uin=self.requested_uin or "3956020260", nick="wiki", online=True)
 
     def get_quick_login_list(self) -> list[NapCatQuickLoginAccount]:
         return [
@@ -59,3 +62,15 @@ def test_try_quick_login_returns_none_when_quick_login_fails() -> None:
     assert info is None
     assert client.selected_uin == "111"
     assert client.requested_uin == "111"
+
+
+def test_try_quick_login_returns_existing_session_without_requesting_quick_login() -> None:
+    client = _QuickLoginClient(already_logged_in=True)
+    service = NapCatQrLoginService(client, sleep=lambda _seconds: None)
+
+    info = service.try_quick_login(preferred_uin="111")
+
+    assert info is not None
+    assert info.uin == "3956020260"
+    assert client.selected_uin is None
+    assert client.requested_uin is None

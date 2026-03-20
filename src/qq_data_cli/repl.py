@@ -257,6 +257,28 @@ class SlashRepl:
         self._ensure_endpoint_ready("webui")
         self._refresh_settings()
         login_service = self._require_login_service()
+        initial_status = login_service.check_status()
+        if initial_status.effectively_logged_in():
+            self._console.print("QQ already logged in.")
+            self._print_login_info(login_service.get_login_info())
+            self._refresh_settings()
+            try:
+                self._ensure_endpoint_ready("onebot_http")
+                self._ensure_endpoint_ready("onebot_ws")
+                self._prime_target_cache("group", quiet=True)
+                self._prime_target_cache("private", quiet=True)
+            except Exception as exc:
+                log_path = get_cli_log_path()
+                self._console.print(
+                    "\n".join(
+                        [
+                            f"note: {exc}",
+                            "note: 群/好友补全依赖 onebot_http；当前不可用时，像 /export group ssj 这样的目标补全不会弹出。",
+                            f"note: 如需排查，请把 CLI 日志发回来：{log_path or ''}",
+                        ]
+                    )
+                )
+            return
         if use_quick_login and not refresh:
             quick_candidates = login_service.get_quick_login_candidates()
             if quick_candidates:
