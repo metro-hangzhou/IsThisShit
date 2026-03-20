@@ -39,7 +39,11 @@ from qq_data_cli.export_input import (
     roll_export_date_token,
 )
 from qq_data_cli.logging_utils import get_cli_log_path, get_cli_logger, setup_cli_logging
-from qq_data_cli.status_display import build_rich_status_text, format_export_result_lines
+from qq_data_cli.status_display import (
+    build_rich_status_text,
+    format_export_result_lines,
+    format_prefetch_media_progress_line,
+)
 from qq_data_cli.target_display import format_target_label, format_target_name, format_target_remark
 from qq_data_cli.terminal_compat import (
     TerminalProbe,
@@ -1092,20 +1096,8 @@ class SlashRepl:
             action = "wrote" if stage == "done" else "writing"
             return f"status={status} {prefix}export_progress: {action} data file records={record_count}"
 
-        if phase == "prefetch_media":
-            stage = str(update.get("stage") or "start")
-            request_count = int(update.get("request_count") or 0)
-            if stage == "done":
-                return (
-                    f"status=success {prefix}export_progress: prefetched media context requests={request_count} "
-                    f"elapsed={elapsed_s:.1f}s"
-                )
-            if stage == "error":
-                return (
-                    f"status=failed {prefix}export_progress: media prefetch degraded requests={request_count} "
-                    f"elapsed={elapsed_s:.1f}s"
-                )
-            return f"status=in progress {prefix}export_progress: prefetching media context requests={request_count}"
+        if phase in {"prefetch_media", "prefetch_media_prepare", "prefetch_media_chunk"}:
+            return format_prefetch_media_progress_line(update, prefix=prefix)
 
         if phase == "materialize_assets":
             current = int(update.get("current") or 0)

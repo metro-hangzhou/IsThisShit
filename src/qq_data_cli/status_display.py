@@ -103,6 +103,16 @@ def format_export_result_lines(
         f"forward_detail_count={int(content_summary.get('forward_detail_count') or 0)} "
         f"fwd_gap={int(content_summary.get('forward_structure_unavailable_count') or 0)}"
     )
+    prefetch_chunk_count = int(trace_summary.get("prefetch_chunk_count") or 0)
+    if prefetch_chunk_count > 0:
+        lines.append(
+            "    "
+            f"prefetch_chunks={prefetch_chunk_count} "
+            f"avg_prefetch_chunk={float(trace_summary.get('average_prefetch_chunk_s') or 0.0):.1f}s "
+            f"slowest_prefetch_chunk={float(trace_summary.get('slowest_prefetch_chunk_s') or 0.0):.1f}s "
+            f"prefetch_timeout_count={int(trace_summary.get('prefetch_timeout_count') or 0)} "
+            f"prefetch_degraded={'yes' if bool(trace_summary.get('prefetch_degraded')) else 'no'}"
+        )
 
     expected_assets = content_summary.get("expected_assets") or {}
     actual_assets = content_summary.get("actual_assets") or {}
@@ -140,12 +150,143 @@ def format_export_result_lines(
     if background_breakdown:
         lines.append(f"    background_missing_reason=[{background_breakdown}]")
 
-    if final_missing and actionable_missing_count == 0 and background_missing_count > 0:
+    if actionable_missing_count > 0:
+        lines.append(
+            "  note: 当前导出已完成，但仍有可行动 missing；请优先查看 "
+            "actionable_missing_reason 和 trace。"
+        )
+    elif final_missing and background_missing_count > 0:
         lines.append(
             "  note: 当前剩余 missing 均为背景缺失（placeholder / expired 类），"
             "当前导出链本身未发现新的可行动缺口。"
         )
     return lines
+
+
+def format_prefetch_media_progress_line(
+    update: dict[str, object],
+    *,
+    prefix: str = "",
+) -> str | None:
+    phase = str(update.get("phase") or "")
+    elapsed_s = float(update.get("elapsed_s") or 0.0)
+
+    if phase == "prefetch_media":
+        stage = str(update.get("stage") or "start")
+        request_count = int(update.get("request_count") or 0)
+        if stage == "done":
+            rate = f" rate={request_count / elapsed_s:.1f}/s" if elapsed_s > 0 and request_count > 0 else ""
+            return (
+                f"status=success {prefix}export_progress: prefetched media context "
+                f"requests={request_count} elapsed={elapsed_s:.1f}s{rate}"
+            ).strip()
+        if stage == "error":
+            reason = str(update.get("reason") or "").strip()
+            error = str(update.get("error") or "").strip()
+            timeout_s = float(update.get("timeout_s") or 0.0)
+            budget_s = float(update.get("budget_s") or 0.0)
+            suffix_parts: list[str] = []
+            if reason:
+                suffix_parts.append(f"reason={reason}")
+            if timeout_s > 0:
+                suffix_parts.append(f"timeout={timeout_s:.1f}s")
+            if budget_s > 0:
+                suffix_parts.append(f"budget={budget_s:.1f}s")
+            if error and not reason:
+                suffix_parts.append(f"detail={error}")
+            suffix = f" {' '.join(suffix_parts)}" if suffix_parts else ""
+            return (
+                f"status=failed {prefix}export_progress: media prefetch degraded "
+                f"requests={request_count} elapsed={elapsed_s:.1f}s{suffix}"
+            ).strip()
+        return (
+            f"status=in progress {prefix}export_progress: prefetching media context "
+            f"requests={request_count}"
+        ).strip()
+
+    if phase == "prefetch_media_prepare":
+        stage = str(update.get("stage") or "start")
+        overall_request_count = int(update.get("overall_request_count") or 0)
+        scanned_request_count = int(update.get("scanned_request_count") or 0)
+        context_request_count = int(update.get("context_request_count") or 0)
+        prefetched_local_count = int(update.get("prefetched_local_count") or 0)
+        skipped_old_bucket_count = int(update.get("skipped_old_bucket_count") or 0)
+        prepare_elapsed_s = float(update.get("elapsed_s") or 0.0)
+        scanned_label = (
+            f"{scanned_request_count}/{overall_request_count}"
+            if overall_request_count > 0
+            else str(scanned_request_count)
+        )
+        detail = (
+            f"context={context_request_count} local={prefetched_local_count} "
+            f"skip_old={skipped_old_bucket_count}"
+        )
+        rate = (
+            f" rate={scanned_request_count / prepare_elapsed_s:.1f}/s elapsed={prepare_elapsed_s:.1f}s"
+            if prepare_elapsed_s > 0 and scanned_request_count > 0
+            else ""
+        )
+        if stage == "done":
+            return (
+                f"status=success {prefix}export_progress: planned media prefetch "
+                f"scanned={scanned_label} {detail}{rate}"
+            ).strip()
+        if stage == "progress":
+            return (
+                f"status=in progress {prefix}export_progress: planning media prefetch "
+                f"scanned={scanned_label} {detail}{rate}"
+            ).strip()
+        return (
+            f"status=in progress {prefix}export_progress: planning media prefetch "
+            f"scanned={scanned_label} {detail}{rate}"
+        ).strip()
+
+    if phase != "prefetch_media_chunk":
+        return None
+
+    stage = str(update.get("stage") or "start")
+    chunk_index = int(update.get("chunk_index") or 0)
+    chunk_count = int(update.get("chunk_count") or 0)
+    chunk_size = int(update.get("request_count") or 0)
+    total_request_count = int(update.get("total_request_count") or 0)
+    overall_request_count = int(update.get("overall_request_count") or 0)
+    processed_request_count = int(update.get("processed_request_count") or 0)
+    hydrated_count = int(update.get("hydrated_count") or 0)
+    reason = str(update.get("reason") or "").strip()
+
+    if total_request_count <= 0:
+        total_request_count = max(processed_request_count, chunk_size)
+    progress_label = f"{processed_request_count}/{total_request_count}" if total_request_count > 0 else str(processed_request_count)
+    chunk_label = f"{chunk_index}/{chunk_count}" if chunk_count > 0 else str(chunk_index)
+    chunk_elapsed = elapsed_s if elapsed_s > 0 else 0.0
+    rate = (
+        f" rate={chunk_size / chunk_elapsed:.1f}/s"
+        if chunk_elapsed > 0 and chunk_size > 0 and stage in {"done", "error"}
+        else ""
+    )
+
+    if stage == "done":
+        total_suffix = f" total={overall_request_count}" if overall_request_count > total_request_count > 0 else ""
+        return (
+            f"status=in progress {prefix}export_progress: prefetch chunk={chunk_label} "
+            f"context={progress_label}{total_suffix} batch={chunk_size} hydrated={hydrated_count} "
+            f"chunk_elapsed={chunk_elapsed:.1f}s{rate}"
+        ).strip()
+    if stage == "error":
+        reason_suffix = f" reason={reason}" if reason else ""
+        timeout_s = float(update.get("timeout_s") or 0.0)
+        timeout_suffix = f" timeout={timeout_s:.1f}s" if timeout_s > 0 else ""
+        total_suffix = f" total={overall_request_count}" if overall_request_count > total_request_count > 0 else ""
+        return (
+            f"status=failed {prefix}export_progress: prefetch chunk={chunk_label} "
+            f"context={progress_label}{total_suffix} batch={chunk_size} "
+            f"chunk_elapsed={chunk_elapsed:.1f}s{reason_suffix}{timeout_suffix}"
+        ).strip()
+    total_suffix = f" total={overall_request_count}" if overall_request_count > total_request_count > 0 else ""
+    return (
+        f"status=in progress {prefix}export_progress: prefetch chunk={chunk_label} "
+        f"context={progress_label}{total_suffix} batch={chunk_size}"
+    ).strip()
 
 
 def _ansi_status_replacement(match: re.Match[str]) -> str:
@@ -172,8 +313,8 @@ def _derive_export_verdict(summary: dict[str, object]) -> str:
 
 
 def _derive_export_status(summary: dict[str, object]) -> str:
-    actionable_missing_count = int(summary.get("actionable_missing_count") or 0)
-    return "failed" if actionable_missing_count > 0 else "success"
+    _ = summary
+    return "success"
 
 
 def _format_counter_mapping(value: object) -> str:
