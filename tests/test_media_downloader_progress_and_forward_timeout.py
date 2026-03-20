@@ -8,6 +8,7 @@ import uuid
 from concurrent.futures import Future
 
 from qq_data_integrations.napcat.fast_history_client import NapCatFastHistoryTimeoutError
+from qq_data_integrations.napcat.fast_history_client import NapCatFastHistoryUnavailable
 from qq_data_integrations.napcat.media_downloader import NapCatMediaDownloader
 
 
@@ -30,6 +31,11 @@ class _CleanupProbeDownloader(NapCatMediaDownloader):
 
     def _rebuild_prefetch_executors(self, *, wait: bool, recreate: bool) -> None:  # type: ignore[override]
         self.rebuild_calls.append((wait, recreate))
+
+
+class _BrokenRemoteRuntimeDownloader(NapCatMediaDownloader):
+    def _start_remote_download_runtime(self) -> None:  # type: ignore[override]
+        raise RuntimeError("remote media async runtime failed to start")
 
 
 def _workspace_temp_dir() -> Path:
@@ -68,6 +74,43 @@ class _ErrorForwardClient:
     def hydrate_forward_media(self, **kwargs):
         self.calls.append(kwargs)
         raise RuntimeError("forward route exploded")
+
+
+class _UnavailableForwardClient:
+    def __init__(self) -> None:
+        self.forward_calls: list[dict[str, object]] = []
+        self.media_calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.forward_calls.append(kwargs)
+        raise NapCatFastHistoryUnavailable("forward route missing")
+
+    def hydrate_media(self, **kwargs):
+        self.media_calls.append(kwargs)
+        return {"file": str(Path(__file__).resolve())}
+
+
+class _UnavailableContextClient:
+    def __init__(self) -> None:
+        self.forward_calls: list[dict[str, object]] = []
+        self.media_calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.forward_calls.append(kwargs)
+        return {
+            "assets": [
+                {
+                    "asset_type": "image",
+                    "asset_role": "forward_media",
+                    "file_name": "forward-ok.jpg",
+                    "file": str(Path(__file__).resolve()),
+                }
+            ]
+        }
+
+    def hydrate_media(self, **kwargs):
+        self.media_calls.append(kwargs)
+        raise NapCatFastHistoryUnavailable("context route missing")
 
 
 class _SuccessForwardClient:
@@ -112,6 +155,20 @@ def _build_forward_request(file_name: str) -> dict[str, object]:
     }
 
 
+def _build_context_hint_request(file_name: str) -> dict[str, object]:
+    return {
+        "asset_type": "image",
+        "asset_role": "",
+        "file_name": file_name,
+        "download_hint": {
+            "message_id_raw": "7610000000000000001",
+            "element_id": "7610000000000000000",
+            "peer_uid": "u_example",
+            "chat_type_raw": "2",
+        },
+    }
+
+
 def test_settle_export_download_progress_clears_pending_counts() -> None:
     downloader = NapCatMediaDownloader(_DummyClient())
     downloader.begin_export_download_tracking([{"asset_type": "image", "download_hint": {}}])
@@ -125,6 +182,25 @@ def test_settle_export_download_progress_clears_pending_counts() -> None:
 
     assert settled["queued"] == 0
     assert settled["active"] == 0
+
+
+def test_remote_prefetch_runtime_startup_failure_degrades_without_breaking_downloader() -> None:
+    downloader = _BrokenRemoteRuntimeDownloader(_DummyClient())
+
+    assert downloader._remote_prefetch_runtime_disabled is True
+    assert downloader._remote_prefetch_runtime_disable_reason == "remote media async runtime failed to start"
+    assert downloader._public_token_executor is not None
+    assert downloader._remote_loop is None
+    assert downloader._remote_async_client is None
+
+
+def test_remote_prefetch_runtime_disabled_process_still_rebuilds_safely() -> None:
+    downloader = _BrokenRemoteRuntimeDownloader(_DummyClient())
+
+    downloader._rebuild_prefetch_executors(wait=False, recreate=True)
+
+    assert downloader._remote_prefetch_runtime_disabled is True
+    assert downloader._public_token_executor is not None
 
 
 def test_forward_metadata_timeout_is_short_circuited_for_sibling_assets() -> None:
@@ -183,6 +259,52 @@ def test_forward_metadata_error_is_short_circuited_for_sibling_assets() -> None:
     assert len(fast_client.calls) == 1
     snapshot = downloader.export_download_progress_snapshot()
     assert snapshot["forward_context_error_count"] == 1
+
+
+def test_forward_route_unavailable_does_not_disable_regular_context_hydration() -> None:
+    fast_client = _UnavailableForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    forward_result = downloader._download_via_forward_context(
+        _build_forward_request("forward-a.jpg"),
+        materialize=False,
+    )
+    context_payload = downloader._download_via_context(
+        _build_context_hint_request("context-a.jpg")["download_hint"],
+        asset_type="image",
+        asset_role=None,
+        request=_build_context_hint_request("context-a.jpg"),
+    )
+
+    assert forward_result is None
+    assert len(fast_client.forward_calls) == 1
+    assert len(fast_client.media_calls) == 1
+    assert context_payload is not None
+    assert downloader._fast_context_route_disabled is False
+    assert downloader._fast_forward_context_route_disabled is True
+
+
+def test_regular_context_unavailable_does_not_disable_forward_hydration() -> None:
+    fast_client = _UnavailableContextClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    context_payload = downloader._download_via_context(
+        _build_context_hint_request("context-b.jpg")["download_hint"],
+        asset_type="image",
+        asset_role=None,
+        request=_build_context_hint_request("context-b.jpg"),
+    )
+    forward_result = downloader._download_via_forward_context(
+        _build_forward_request("forward-ok.jpg"),
+        materialize=False,
+    )
+
+    assert context_payload is None
+    assert len(fast_client.media_calls) == 1
+    assert len(fast_client.forward_calls) == 1
+    assert forward_result == (Path(__file__).resolve(), "napcat_forward_hydrated")
+    assert downloader._fast_context_route_disabled is True
+    assert downloader._fast_forward_context_route_disabled is False
 
 
 def test_forward_metadata_success_payload_is_reused_for_sibling_assets() -> None:

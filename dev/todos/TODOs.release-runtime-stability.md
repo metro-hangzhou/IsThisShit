@@ -280,6 +280,17 @@ Recent field failures showed that the project has two separate but related stabi
     - `src=...`
     - `history_fallback=...`
     - `fwd_gap=...`
+- [x] Split forward-route health from ordinary context-route health
+  - `/hydrate-forward-media` unavailability no longer disables ordinary `/hydrate-media`
+  - ordinary `/hydrate-media` unavailability no longer disables deep-forward hydration
+  - reduces false whole-process downgrade after one route-specific wobble
+- [x] Downgrade remote-prefetch async runtime startup failure from fatal constructor error to controlled optimization disable
+  - if the async remote prefetch loop does not come up cleanly, exporter construction now continues
+  - current behavior keeps:
+    - formal export
+    - public-token prefetch
+  - and only disables:
+    - remote media prefetch optimization
 
 ## Reviewer-Derived Next Hardening Targets
 
