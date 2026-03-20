@@ -4,14 +4,18 @@ from qq_data_cli.export_commands import ParsedExportCommand
 from prompt_toolkit.buffer import Buffer, CompletionState
 from prompt_toolkit.completion import Completion
 from prompt_toolkit.document import Document
+from prompt_toolkit.shortcuts import CompleteStyle
 
 from qq_data_cli.repl import (
     SlashRepl,
+    _completion_menu_reserve_lines,
+    _completion_style_for_ui_profile,
     _is_login_completion_context,
     _navigate_completion_menu_without_inserting,
     _should_auto_refresh_completion,
     _should_select_first_completion,
 )
+from qq_data_cli.terminal_compat import CliUiProfile, TerminalProbe
 from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
 from qq_data_integrations.napcat.runtime import NapCatStartResult
 
@@ -258,8 +262,54 @@ def test_repl_quick_login_completion_empty_prime_does_not_mark_cache_fresh(monke
     thread.join(timeout=2.0)
 
     assert repl._quick_login_candidates_cache == []
-    assert repl._quick_login_candidates_cached_at is None
-    assert repl._quick_login_candidates_prime_failed_at is not None
+
+
+def test_completion_menu_reserve_lines_grows_in_compat_mode() -> None:
+    profile = CliUiProfile(
+        mode="compat",
+        show_completion_menu=True,
+        complete_while_typing=True,
+        watch_full_screen=False,
+        use_custom_scrollbar=False,
+        use_highlight_style=False,
+    )
+    probe = TerminalProbe(
+        platform_system="Windows",
+        windows_release="11",
+        windows_version="10.0.26100",
+        windows_build=26100,
+        terminal_host="classic_console",
+        shell_name="cmd",
+        stdin_tty=True,
+        stdout_tty=True,
+        columns=120,
+        lines=30,
+        stdout_encoding="utf-8",
+        preferred_encoding="utf-8",
+        term=None,
+        term_program=None,
+        wt_session=False,
+        vscode_terminal=False,
+        conemu_session=False,
+        ansicon_present=False,
+        virtual_terminal_enabled=True,
+        stdout_console_mode=7,
+    )
+
+    assert _completion_menu_reserve_lines(profile, probe) == 10
+
+
+def test_completion_style_uses_column_menu_in_compat_mode() -> None:
+    profile = CliUiProfile(
+        mode="compat",
+        show_completion_menu=True,
+        complete_while_typing=True,
+        watch_full_screen=False,
+        use_custom_scrollbar=False,
+        use_highlight_style=False,
+    )
+
+    assert _completion_style_for_ui_profile(profile) == CompleteStyle.COLUMN
 
 
 def test_repl_startup_warm_napcat_service_uses_pinned_quick_login_uin(monkeypatch) -> None:

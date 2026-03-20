@@ -406,6 +406,9 @@ Recent field failures showed that the project has two separate but related stabi
     - `/login `
     - `/login 3`
     - `/login --quick-uin`
+- [x] Make classic-console completion menus reserve more bottom space
+  - compat mode now uses a true column menu instead of `READLINE_LIKE`
+  - menu reserve grows with terminal height, so `/login` candidates are less likely to disappear at the bottom edge
 - [ ] Surface runtime bootstrap drift more explicitly in CLI export entrypoints
   - when `ensure_endpoint(...)` auto-starts or auto-configures the runtime, `export-history` should print the effective runtime note more prominently
 - [ ] Show active runtime session identity even when no fixed `quick_login_uin` is configured
