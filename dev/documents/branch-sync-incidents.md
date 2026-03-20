@@ -102,6 +102,29 @@ Focus on incidents where:
     - startup banner-only
   - it must ship with the runtime bootstrap family as one bundle
 
+### [2026-03-20][005] Release line missed runtime starter family while bootstrap family had already advanced
+
+- Symptom:
+  - after syncing `bootstrap.py`, `main` startup no longer failed in the same place
+  - but startup warmup immediately failed one layer deeper with:
+    - `NapCatRuntimeStarter.ensure_endpoint() got an unexpected keyword argument 'quick_login_uin'`
+- Root cause:
+  - release line had already received:
+    - `repl.py` startup warmup
+    - `bootstrap.py` quick-login-aware endpoint plumbing
+  - but release `src/qq_data_integrations/napcat/runtime.py` was still on the old launcher/ensure signature
+  - related runtime launch diagnostics tests were also absent on the release line
+- Fix:
+  - sync the runtime starter family into `main` / `runtime`:
+    - `src/qq_data_integrations/napcat/runtime.py`
+    - `tests/test_napcat_runtime_diagnostics.py`
+- Lesson:
+  - startup/login release bundles must include the full chain:
+    - `repl/app`
+    - `bootstrap`
+    - `runtime starter`
+    - launch/diagnostic regression tests
+
 ## Required Release Sync Checklist
 
 When syncing a feature from `full-dev` into `main` / `runtime`, check whether the change touches any of these families and ship the whole family together:
