@@ -122,6 +122,74 @@ Recent field failures showed that the project has two separate but related stabi
   - repeated sibling timeout amplification is reduced
   - deep forward metadata hydration still needs targeted performance/fidelity follow-up
 
+### [2026-03-20][010] Local account policy for live runtime validation
+
+- Policy:
+  - local live runtime tests default to QQ account `3956020260`
+  - do not attempt alternate quick-login candidates unless the user explicitly asks
+- Why:
+  - reduces account confusion on operator machines
+  - avoids treating another persisted QQ session as an acceptable test target
+  - keeps login/export validation reproducible across turns
+
+### [2026-03-20][011] quick login must be hardened across both startup and WebUI paths
+
+- Symptom:
+  - field logs can still show:
+    - `没有 -q 指令指定快速登录`
+    - then NapCat auto-tries a stale historical account like `1507833383`
+- Root-cause shape:
+  - NapCat quick login is not one path; it splits into:
+    1. startup arg path: `-q <uin>`
+    2. WebUI/auto-login path:
+       - `NAPCAT_QUICK_ACCOUNT`
+       - `WebUiConfig.autoLoginAccount`
+       - `SetQuickLoginQQ`
+       - `SetQuickLogin`
+- Guardrail:
+  - when the operator explicitly requests a fixed quick-login account, runtime startup should drive both paths toward the same `uin`
+  - the runtime wrapper should emit enough diagnostic context to prove which account it tried to launch with
+- Current fix direction:
+  - wrapper adds `-q <uin>`
+  - wrapper also exports `NAPCAT_QUICK_ACCOUNT=<uin>`
+  - login/UI side keeps preferring the explicitly requested `uin` over WebUI default candidates
+
+### [2026-03-20][012] Local test-account override must beat stale `webui.json` auto-login state
+
+- Field finding:
+  - local `NapCat/napcat/config/webui.json` can retain stale:
+    - `autoLoginAccount = 1507833383`
+  - manual launcher runs without explicit `-q` can therefore still drift to the wrong QQ
+- Current fix direction:
+  - introduce a local-only override file:
+    - `state/config/napcat_quick_login_uin.txt`
+  - `NapCatSettings.from_env()` should read it when env is absent
+  - `start_napcat_logged.bat` should read it too, so manual logged startup and CLI startup use the same pinned account
+- Guardrail:
+  - keep the local account pin outside tracked runtime config files
+  - do not rely on `webui.json autoLoginAccount` as the authoritative local test-account source
+
+### [2026-03-20][013] deep-forward remote URL recovery was wired but effectively dormant
+
+- Field finding:
+  - the residual `7 missing_after_napcat` case in:
+    - `message_id_raw=7617760641125573795`
+  - was not purely a plugin-side mystery
+  - Python-side `NapCatMediaDownloader` had:
+    - `_prepare_remote_cache_dir()`
+    - but did not actually call it before first remote URL media download
+- Impact:
+  - forward remote URL recovery paths could remain effectively inert
+  - especially for deep-forward image bundles that only survived through `hint_url`
+- Fix direction:
+  - prepare the remote cache dir on first real remote URL use
+  - cover both:
+    - `_download_remote_media_async(...)`
+    - `_download_remote_sticker(...)`
+- Validation target:
+  - narrow window around `2026-03-16T13:12:57+08:00`
+  - full `2000`-message rerun on group `922065597`
+
 ## Current Fix / Guardrail Tasks
 
 - [ ] Keep CLI launcher policy explicit in regression review:
@@ -132,10 +200,95 @@ Recent field failures showed that the project has two separate but related stabi
   - `begin_export_download_tracking(...)`
   - `settle_export_download_progress(...)`
 - [ ] Add a runtime integrity checklist for vendored NapCat dependencies on `full-dev`
-- [ ] Investigate and reduce residual `forward_context_metadata` timeout cost on large exports
+- [x] Investigate and reduce residual `forward_context_metadata` timeout cost on large exports
+  - same-sibling timeout amplification is already fixed
+  - the remaining `7 missing_after_napcat` case was further reduced by enabling actual forward remote URL recovery
+- [x] Distinguish operator-facing “true actionable misses” from placeholder-heavy historical misses in export summary
+  - summary now emits:
+    - `final_missing_reason`
+    - `actionable_missing_reason`
+    - `background_missing_reason`
+  - retry hints now ignore background-only missing clusters
+  - current 2000-message baseline:
+    - `missing=129`
+    - `actionable_missing_reason=[-]`
+    - `background_missing_reason=[qq_expired_after_napcat:5, qq_not_downloaded_local_placeholder:124]`
+- [x] Decide whether deep-forward image hydration should get one more low-risk optimization pass
+  - implemented low-risk pass by activating the already-designed forward remote URL recovery path
+  - targeted forward `message_id_raw=7617760641125573795` now recovers `7/7` images in narrow-window retest
 - [ ] Record friend-machine failures into perf/forensics docs when new logs arrive
 - [ ] Keep quick-login path covered by regression tests so QR fallback remains intact
 - [ ] Keep `app.py login` and REPL `/login` behavior-compatible in regression coverage
+- [ ] Keep local live validation scripts/operator notes aligned with the fixed local account `3956020260`
+- [ ] Keep local live/export validation matrix aligned with the fixed test targets:
+  - `group 922065597` `蕾米二次元萌萌群`
+  - `private 1507833383`
+- [ ] Re-verify on a fresh NapCat restart that the operator console no longer falls through to stale auto-login account `1507833383` when `3956020260` is explicitly requested
+- [ ] Re-verify that `start_napcat_logged.bat` without explicit args now auto-pins `3956020260` via `state/config/napcat_quick_login_uin.txt`
+- [x] Guard against ghost logged-in sessions and wrong-account “already logged in” false success
+  - `/login` now reports `QQ session mismatch` when current session `uin` differs from requested/pinned quick-login `uin`
+  - bootstrap now rejects “logged in” states that do not return usable `QQ session info`
+- [x] Align REPL quick-login lookup failure behavior with CLI fallback behavior
+  - quick-login candidate lookup errors no longer hard-fail REPL `/login`
+  - current fallback path is QR/normal login instead of command abort
+- [x] Preserve quick-login injection across `start_napcat_logged.bat` admin relaunch path
+  - elevated relaunch now carries the computed quick-login account instead of risking a drift back to stale local defaults
+- [x] Route runtime auto-start through the project logged launcher helper instead of directly relying on `launcher-win10.bat`
+  - `app.py /login --refresh` now enters the same admin-elevating / quick-login-preserving path as manual logged startup
+- [x] Fix `start_napcat_logged.bat` admin relaunch parse-time variable expansion bug
+  - the prior batch block effectively executed `Start-Process '' -Verb RunAs`
+  - the helper now uses delayed expansion for the elevated wrapper path and no longer drops the FilePath argument
+- [x] Reorder placeholder-heavy image missing classification ahead of public-token remote URL retry
+  - latest `group 922065597 limit=2000` trace now shows:
+    - `public_token_get_image_remote_url cached_error = 0`
+    - instead of the prior `124`
+  - background image misses now go straight to:
+    - `public_token_get_image_classification classified_missing`
+- [x] Add operator-facing note when remaining missing are background-only
+  - current CLI/export summary now prints:
+    - `missing_note: 当前剩余 missing 全是背景缺失（placeholder / expired 类）`
+- [x] Guard non-login export flows against wrong-account runtime reuse when a fixed quick-login account is configured
+  - `app.py export-history`
+  - REPL `/export`
+  now both reject:
+    - `QQ session mismatch`
+  when current online `uin` differs from the pinned/requested account
+- [x] Remove hot-loop blocking waits when consuming remote media prefetch futures
+  - hot-path prefetch consumption now uses a short peek instead of immediately full-waiting on `future.result(timeout=...)`
+  - full waits now happen only in the final asset path that truly needs the remote download result
+  - current `group 922065597 limit=2000` baseline improved from:
+    - `42.48s`
+    - to `36.914s`
+- [x] Reorder eager remote prefetch scheduling behind the cheapest local recovery checks
+  - `prepare_for_export(...)` now delays eager request remote prefetch until after:
+    - forward-parent skip
+    - stale-local recovery
+    - hinted-local recovery
+    - old placeholder eager-prefetch skip
+- [x] Improve operator surfacing for large export runs
+  - CLI `export-history` now prints:
+    - `export_session`
+    - `export_verdict`
+  - REPL `/export` now also prints:
+    - `export_session`
+    - `zero_result_hint`
+    - `export_verdict`
+  - compact retry hints now include:
+    - `kinds=[...]`
+
+## Next Reviewer-Driven Hardening Candidates
+
+- [ ] Add a coarser negative-outcome cache above message-scoped asset resolution
+  - current reviewer finding:
+    - repeated bad URLs / repeated placeholder assets can still churn through per-message resolution paths even after downloader-level caches help
+- [ ] Improve completion/operator surfacing when backend lookups degrade
+  - current reviewer finding:
+    - friend machines can still perceive “补全没反应” without enough prompt-level explanation of whether completion is stale-cache, endpoint-unavailable, or real lookup failure
+- [ ] Surface runtime bootstrap drift more explicitly in CLI export entrypoints
+  - when `ensure_endpoint(...)` auto-starts or auto-configures the runtime, `export-history` should print the effective runtime note more prominently
+- [ ] Show active runtime session identity even when no fixed `quick_login_uin` is configured
+  - current guards reject wrong-account reuse when the pinned account exists
+  - reviewer still wants the active account identity to stay operator-visible in every export flow
 
 ## Related Files
 

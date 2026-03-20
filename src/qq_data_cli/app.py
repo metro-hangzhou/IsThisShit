@@ -79,6 +79,57 @@ def _build_settings_loader(
     return _loader
 
 
+def _detect_expected_runtime_session_mismatch(settings: NapCatSettings) -> str | None:
+    expected_uin = str(settings.quick_login_uin or "").strip()
+    if not expected_uin:
+        return None
+    try:
+        from qq_data_integrations.napcat.login import NapCatQrLoginService, detect_session_mismatch
+        from qq_data_integrations.napcat.webui_client import NapCatWebUiClient
+
+        client = NapCatWebUiClient(
+            settings.webui_url,
+            raw_token=settings.webui_token,
+            use_system_proxy=settings.use_system_proxy,
+        )
+    except Exception:
+        return None
+    try:
+        service = NapCatQrLoginService(client)
+        return detect_session_mismatch(service, expected_uin=expected_uin)
+    except Exception:
+        return None
+    finally:
+        client.close()
+
+
+def _describe_runtime_session(settings: NapCatSettings) -> str | None:
+    try:
+        from qq_data_integrations.napcat.login import NapCatQrLoginService
+        from qq_data_integrations.napcat.webui_client import NapCatWebUiClient
+
+        client = NapCatWebUiClient(
+            settings.webui_url,
+            raw_token=settings.webui_token,
+            use_system_proxy=settings.use_system_proxy,
+        )
+    except Exception:
+        return None
+    try:
+        service = NapCatQrLoginService(client)
+        info = service.get_login_info()
+    except Exception:
+        return None
+    finally:
+        client.close()
+    current_uin = str(getattr(info, "uin", "") or "").strip()
+    nick = str(getattr(info, "nick", "") or "").strip() or "-"
+    online = bool(getattr(info, "online", False))
+    if not current_uin and not online:
+        return "export_session: unavailable"
+    return f"export_session: uin={current_uin or '-'} nick={nick} online={online}"
+
+
 @app.callback(invoke_without_command=True)
 def cli(
     ctx: typer.Context,
@@ -148,12 +199,16 @@ def login(
     webui_token: str | None = typer.Option(None, "--webui-token"),
 ) -> None:
     from qq_data_integrations.napcat.bootstrap import NapCatBootstrapper
-    from qq_data_integrations.napcat.login import NapCatQrLoginService
+    from qq_data_integrations.napcat.login import (
+        NapCatQrLoginService,
+        build_session_mismatch_message,
+    )
     from qq_data_integrations.napcat.webui_client import NapCatWebUiClient
 
     base_settings = NapCatSettings.from_env()
     settings = base_settings.model_copy(
         update={
+            "quick_login_uin": quick_uin or base_settings.quick_login_uin,
             "webui_url": webui_url or base_settings.webui_url,
             "webui_token": webui_token if webui_token is not None else base_settings.webui_token,
         }
@@ -163,12 +218,14 @@ def login(
         settings_loader=_build_settings_loader(
             settings,
             pinned_updates={
+                "quick_login_uin": settings.quick_login_uin,
                 "webui_url": settings.webui_url,
                 "webui_token": settings.webui_token,
                 "state_dir": settings.state_dir,
             },
         ),
-    ).ensure_endpoint("webui")
+    ).ensure_endpoint("webui", quick_login_uin=settings.quick_login_uin)
+
     if not start_result.ready:
         raise typer.BadParameter(start_result.message)
     if (start_result.attempted_start or start_result.attempted_configure) and start_result.message:
@@ -176,6 +233,7 @@ def login(
         refreshed_settings = NapCatSettings.from_env()
         settings = refreshed_settings.model_copy(
             update={
+                "quick_login_uin": quick_uin or refreshed_settings.quick_login_uin,
                 "webui_url": webui_url or refreshed_settings.webui_url,
                 "webui_token": webui_token if webui_token is not None else refreshed_settings.webui_token,
             }
@@ -204,13 +262,28 @@ def login(
                 typer.echo(f"login_status={status.login_error}")
 
         initial_status = service.check_status()
+        desired_quick_uin = None
+        if not refresh and not no_quick:
+            try:
+                desired_quick_uin = service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
+            except Exception:
+                desired_quick_uin = None
         if initial_status.effectively_logged_in():
-            info = service.get_login_info()
-            typer.echo("QQ already logged in.")
-            typer.echo(f"uin={info.uin or ''}")
-            typer.echo(f"nick={info.nick or ''}")
-            typer.echo(f"online={info.online}")
-            return
+            info = service.get_ready_login_info()
+            if info is not None:
+                if desired_quick_uin and info.uin and info.uin != desired_quick_uin:
+                    typer.echo(
+                        build_session_mismatch_message(
+                            current_uin=info.uin,
+                            requested_uin=desired_quick_uin,
+                        )
+                    )
+                    return
+                typer.echo("QQ already logged in.")
+                typer.echo(f"uin={info.uin or ''}")
+                typer.echo(f"nick={info.nick or ''}")
+                typer.echo(f"online={info.online}")
+                return
 
         quick_candidate_label: str | None = None
         if not refresh and not no_quick:
@@ -218,9 +291,7 @@ def login(
                 candidates = service.get_quick_login_candidates()
             except Exception:
                 candidates = []
-            chosen_uin = quick_uin
-            if chosen_uin is None:
-                chosen_uin = service.get_default_quick_login_uin()
+            chosen_uin = desired_quick_uin or quick_uin
             if chosen_uin is None and candidates:
                 chosen_uin = candidates[0].uin
             if chosen_uin:
@@ -232,7 +303,7 @@ def login(
                     quick_candidate_label = chosen_uin
                 typer.echo(f"quick_login_candidate={quick_candidate_label}")
                 quick_info = service.try_quick_login(
-                    preferred_uin=quick_uin,
+                    preferred_uin=chosen_uin,
                     timeout_seconds=min(timeout, 25.0),
                     poll_interval=min(max(poll, 0.5), 2.0),
                     on_status=on_status,
@@ -315,8 +386,11 @@ def export_history(
         ExportRequest,
         build_default_output_path,
         build_export_content_summary,
+        format_actionable_missing_breakdown_compact,
+        format_background_missing_breakdown_compact,
         format_missing_retry_hints_compact,
         format_missing_breakdown_compact,
+        format_export_verdict_compact,
         normalize_export_format,
         resolve_strict_missing_policy,
     )
@@ -357,6 +431,8 @@ def export_history(
     ).ensure_endpoint("onebot_http")
     if not start_result.ready:
         raise typer.BadParameter(start_result.message)
+    if start_result.message and (start_result.attempted_start or start_result.attempted_configure):
+        typer.echo(f"runtime_note: {start_result.message}", err=True)
     if start_result.attempted_start or start_result.attempted_configure:
         refreshed_settings = NapCatSettings.from_env()
         settings = refreshed_settings.model_copy(
@@ -367,6 +443,12 @@ def export_history(
                 "state_dir": state_dir or refreshed_settings.state_dir,
             }
         )
+    mismatch_message = _detect_expected_runtime_session_mismatch(settings)
+    if mismatch_message:
+        raise typer.BadParameter(mismatch_message)
+    session_line = _describe_runtime_session(settings)
+    if session_line:
+        typer.echo(session_line, err=True)
     gateway = NapCatGateway(settings)
     trace = None
     forensics = None
@@ -489,17 +571,33 @@ def export_history(
             bundle.forensic_run_dir = forensic_summary_path.parent
             bundle.forensic_incident_count = forensics.incident_count
         trace.close()
+        zero_result_hint = _build_zero_result_hint(gateway, target=target, record_count=len(normalized.messages))
+        if zero_result_hint:
+            typer.echo(zero_result_hint, err=True)
         typer.echo(str(bundle.data_path))
+        typer.echo(format_export_verdict_compact(content_summary), err=True)
         missing_kinds = format_missing_breakdown_compact(content_summary)
+        actionable_missing_kinds = format_actionable_missing_breakdown_compact(content_summary)
+        background_missing_kinds = format_background_missing_breakdown_compact(content_summary)
         typer.echo(
             (
                 f"records={len(normalized.messages)} copied={bundle.copied_asset_count} "
                 f"reused={bundle.reused_asset_count} missing={bundle.missing_asset_count} "
                 f"final_missing_reason=[{missing_kinds}] "
+                f"actionable_missing_reason=[{actionable_missing_kinds}] "
+                f"background_missing_reason=[{background_missing_kinds}] "
                 f"pages={summary['pages_scanned']} retries={summary['retry_events']} trace={trace.path}"
             ),
             err=True,
         )
+        actionable_missing_count = int(content_summary.get("actionable_missing_count") or 0)
+        background_missing_count = int(content_summary.get("background_missing_count") or 0)
+        if bundle.missing_asset_count and actionable_missing_count == 0 and background_missing_count > 0:
+            typer.echo(
+                "missing_note: 当前剩余 missing 全是背景缺失（placeholder / expired 类），"
+                "当前导出链没有暴露新的可行动缺口。",
+                err=True,
+            )
         for retry_hint in format_missing_retry_hints_compact(content_summary, shell="cli"):
             typer.echo(retry_hint, err=True)
         if int(getattr(bundle, "forensic_incident_count", 0) or 0):
@@ -557,6 +655,37 @@ def _resolve_target(
         except NapCatTargetLookupError:
             return ChatTarget(chat_type=chat_type, chat_id=query, name=chat_name or query)
     return gateway.resolve_target(chat_type, query, refresh_if_missing=True)
+
+
+def _build_zero_result_hint(
+    gateway: "NapCatGateway",
+    *,
+    target: "ChatTarget",
+    record_count: int,
+) -> str | None:
+    if record_count > 0:
+        return None
+    from qq_data_integrations.napcat.directory import NapCatTargetLookupError
+
+    chat_id = str(target.chat_id or "").strip()
+    if not chat_id:
+        return None
+    try:
+        gateway.resolve_target(target.chat_type, chat_id, refresh_if_missing=True)
+    except NapCatTargetLookupError:
+        if target.chat_type == "group":
+            return (
+                "zero_result_hint: 当前在线账号的 NapCat 群列表里解析不到这个群。"
+                " 这通常意味着你不在该群、当前登录的 QQ 不是预期账号，或元数据缓存/会话视角不一致。"
+            )
+        return (
+            "zero_result_hint: 当前在线账号的 NapCat 好友列表里解析不到这个好友目标。"
+            " 这通常意味着当前登录的 QQ 不是预期账号，或好友元数据/会话视角不一致。"
+        )
+    return (
+        "zero_result_hint: 目标在当前账号视角下可解析，但本次请求切片返回了 0 条消息。"
+        " 这更像是当前窗口本来就没有近期消息，而不是 exporter 自身崩溃。"
+    )
 
 
 def _build_cli_export_progress_callback(trace: "ExportPerfTraceWriter"):
