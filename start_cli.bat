@@ -4,10 +4,12 @@ cd /d "%~dp0"
 set "_CLI_ARGS=%*"
 set "_WT_EXE="
 set "_POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+set "_NAPCAT_RESTART_SCRIPT=%~dp0restart_napcat_service.ps1"
 set "_CLI_GIT_REMOTE=origin"
 set "_CLI_GIT_BRANCH=main"
 
 if /I "%~1"=="--launched-in-modern-host" goto strip_modern_host
+if /I "%~1"=="--post-update-handoff" goto strip_post_update_handoff
 
 if exist "%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe" (
   set "_WT_EXE=%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe"
@@ -35,6 +37,8 @@ if "%~1"=="" (
 :run_cli
 call :close_existing_cli
 call :update_main_branch
+call :handoff_after_update
+call :restart_napcat_if_needed
 echo Starting CLI...
 if exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" app.py %_CLI_ARGS%
@@ -87,7 +91,13 @@ exit /b 1
 
 :strip_modern_host
 shift
-call set "_CLI_ARGS=%%1 %%2 %%3 %%4 %%5 %%6 %%7 %%8 %%9"
+set "_CLI_ARGS=%*"
+goto run_cli
+
+:strip_post_update_handoff
+set "CLI_POST_UPDATE_HANDOFF=1"
+shift
+set "_CLI_ARGS=%*"
 goto run_cli
 
 :close_existing_cli
@@ -98,6 +108,8 @@ if not exist "%~dp0close_existing_cli.ps1" goto :eof
 goto :eof
 
 :update_main_branch
+set "_CLI_UPDATED="
+set "_NAPCAT_DIFF_CHANGED="
 if /I "%CLI_SKIP_GIT_UPDATE%"=="1" goto :eof
 if not exist ".git" goto :eof
 where git >nul 2>nul
@@ -121,11 +133,56 @@ if /I "!_LOCAL_HEAD!"=="!_REMOTE_HEAD!" (
   echo Already up to date.
   goto :eof
 )
+call :collect_update_flags
 echo Update found. Fast-forwarding %_CLI_GIT_BRANCH%...
 git pull --ff-only --no-rebase %_CLI_GIT_REMOTE% %_CLI_GIT_BRANCH%
 if errorlevel 1 (
   echo Git update failed. Continuing with local files.
+  set "_NAPCAT_DIFF_CHANGED="
 ) else (
+  set "_CLI_UPDATED=1"
   echo Updated to latest %_CLI_GIT_BRANCH%.
+)
+goto :eof
+
+:collect_update_flags
+set "_NAPCAT_DIFF_CHANGED="
+for /f "usebackq delims=" %%I in (`git diff --name-only --no-renames HEAD FETCH_HEAD 2^>nul`) do (
+  call :record_update_path "%%~I"
+)
+goto :eof
+
+:record_update_path
+set "_UPDATED_PATH=%~1"
+if /I "!_UPDATED_PATH!"=="start_napcat_logged.bat" set "_NAPCAT_DIFF_CHANGED=1"
+if /I "!_UPDATED_PATH!"=="restart_napcat_service.ps1" set "_NAPCAT_DIFF_CHANGED=1"
+if /I "!_UPDATED_PATH:~0,7!"=="NapCat/" set "_NAPCAT_DIFF_CHANGED=1"
+if /I "!_UPDATED_PATH:~0,32!"=="src/qq_data_integrations/napcat/" set "_NAPCAT_DIFF_CHANGED=1"
+goto :eof
+
+:handoff_after_update
+if not defined _CLI_UPDATED goto :eof
+if /I "%CLI_POST_UPDATE_HANDOFF%"=="1" goto :eof
+if defined _NAPCAT_DIFF_CHANGED set "CLI_NAPCAT_RESTART_REQUIRED=1"
+echo Restarting start_cli to apply updated launcher logic...
+set "CLI_POST_UPDATE_HANDOFF=1"
+call "%~f0" --post-update-handoff %_CLI_ARGS%
+exit /b %ERRORLEVEL%
+
+:restart_napcat_if_needed
+if /I not "%CLI_NAPCAT_RESTART_REQUIRED%"=="1" goto :eof
+set "CLI_NAPCAT_RESTART_REQUIRED="
+if not exist "%_POWERSHELL%" goto :eof
+if not exist "%_NAPCAT_RESTART_SCRIPT%" goto :eof
+set "_NAPCAT_QUICK_UIN="
+if exist "%~dp0state\config\napcat_quick_login_uin.txt" (
+  set /p _NAPCAT_QUICK_UIN=<"%~dp0state\config\napcat_quick_login_uin.txt"
+)
+if defined NAPCAT_QUICK_LOGIN_UIN set "_NAPCAT_QUICK_UIN=%NAPCAT_QUICK_LOGIN_UIN%"
+if defined NAPCAT_QUICK_ACCOUNT set "_NAPCAT_QUICK_UIN=%NAPCAT_QUICK_ACCOUNT%"
+echo NapCat update detected. Restarting NapCatQQ Service...
+"%_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%_NAPCAT_RESTART_SCRIPT%" -RepoPath "%cd%" -LauncherPath "%~dp0start_napcat_logged.bat" -QuickLoginUin "%_NAPCAT_QUICK_UIN%"
+if errorlevel 1 (
+  echo NapCat restart helper reported an error. Continuing with current runtime.
 )
 goto :eof

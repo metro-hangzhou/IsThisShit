@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 from qq_data_cli.export_commands import ParsedExportCommand
-from qq_data_cli.repl import SlashRepl, _should_select_first_completion
+from prompt_toolkit.buffer import Buffer, CompletionState
+from prompt_toolkit.completion import Completion
+from prompt_toolkit.document import Document
+
+from qq_data_cli.repl import (
+    SlashRepl,
+    _is_login_completion_context,
+    _navigate_completion_menu_without_inserting,
+    _should_select_first_completion,
+)
 from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
 from qq_data_integrations.napcat.runtime import NapCatStartResult
 
@@ -280,3 +289,35 @@ def test_login_completion_never_auto_selects_first_candidate() -> None:
     assert _should_select_first_completion("/login 39") is False
     assert _should_select_first_completion("/login --quick-uin") is False
     assert _should_select_first_completion("/login --quick-uin ") is False
+
+
+def test_login_completion_context_detection_is_login_only() -> None:
+    assert _is_login_completion_context("/login")
+    assert _is_login_completion_context("/login ")
+    assert _is_login_completion_context("/login --quick-uin ")
+    assert not _is_login_completion_context("/watch group")
+
+
+def test_login_completion_navigation_keeps_buffer_text_unchanged() -> None:
+    buffer = Buffer(document=Document("/login ", cursor_position=len("/login ")))
+    completions = [
+        Completion(text="3956020260", start_position=0),
+        Completion(text="1507833383", start_position=0),
+        Completion(text="498603055", start_position=0),
+    ]
+    buffer.complete_state = CompletionState(buffer.document, completions, None)
+
+    _navigate_completion_menu_without_inserting(buffer, direction=1)
+    assert buffer.text == "/login "
+    assert buffer.complete_state is not None
+    assert buffer.complete_state.complete_index == 0
+
+    _navigate_completion_menu_without_inserting(buffer, direction=1)
+    assert buffer.text == "/login "
+    assert buffer.complete_state is not None
+    assert buffer.complete_state.complete_index == 1
+
+    _navigate_completion_menu_without_inserting(buffer, direction=-1)
+    assert buffer.text == "/login "
+    assert buffer.complete_state is not None
+    assert buffer.complete_state.complete_index == 0
