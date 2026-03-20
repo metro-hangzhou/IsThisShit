@@ -9,6 +9,7 @@ from qq_data_cli.repl import (
     SlashRepl,
     _is_login_completion_context,
     _navigate_completion_menu_without_inserting,
+    _should_auto_refresh_completion,
     _should_select_first_completion,
 )
 from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
@@ -321,3 +322,12 @@ def test_login_completion_navigation_keeps_buffer_text_unchanged() -> None:
     assert buffer.text == "/login "
     assert buffer.complete_state is not None
     assert buffer.complete_state.complete_index == 0
+
+
+def test_auto_refresh_completion_covers_root_commands_and_login_inputs() -> None:
+    assert _should_auto_refresh_completion("/")
+    assert _should_auto_refresh_completion("/l")
+    assert _should_auto_refresh_completion("/login ")
+    assert _should_auto_refresh_completion("/login 3")
+    assert _should_auto_refresh_completion("/login --quick-uin")
+    assert not _should_auto_refresh_completion("/watch group")
