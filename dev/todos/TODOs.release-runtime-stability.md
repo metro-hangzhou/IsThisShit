@@ -381,6 +381,10 @@ Recent field failures showed that the project has two separate but related stabi
 - [x] Remove internal launcher-only CLI sentinels from `start_cli.bat` handoff
   - `--post-update-handoff` leaked into `app.py` on a real `main` clone after auto-update
   - launcher now keeps post-update handoff state in environment only
+- [x] Stop running post-update launcher labels in the same mutated batch process
+  - `git pull`-updated `start_cli.bat` could still emit broken fragment commands such as:
+    - `'T_BRANCH.' is not recognized`
+  - launcher now re-execs through a new `cmd /c` process and the old process exits immediately
 - [x] Add a best-effort NapCat service restart helper for update runs that touch NapCat runtime/launcher paths
   - implemented via:
     - [restart_napcat_service.ps1](../../restart_napcat_service.ps1)

@@ -1119,6 +1119,7 @@
   - handoff 状态只放在环境变量里：
     - `CLI_POST_UPDATE_HANDOFF=1`
   - 更新后重新调用 launcher 时，只传原始 operator 参数
+  - 并改成新 `cmd /c` 进程重启新的 launcher，旧批处理不再继续跑后续 label
 - 当前价值：
   - 避免内部标记再漏进 `app.py`
   - 也避免后续把这类 launcher 设计问题误判成“又一次 branch sync 故障”

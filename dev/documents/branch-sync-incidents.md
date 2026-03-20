@@ -146,11 +146,13 @@ Focus on incidents where:
   - remove the internal CLI sentinel entirely
   - keep handoff state in environment only:
     - `CLI_POST_UPDATE_HANDOFF=1`
-  - restart the freshly updated launcher with the original operator args only
+  - restart the freshly updated launcher in a new `cmd /c` process with the original operator args only
+  - stop the old launcher process immediately after the re-exec instead of continuing into later batch labels
   - tighten start-script regression coverage so the sentinel string must stay absent
 - Lesson:
   - launcher self-restart state should never travel through public CLI argv
   - internal handoff markers belong in environment/process state, not user-visible argument lists
+  - a batch file that just `git pull`-updated itself should not keep traversing later labels in the same process
 
 ## Required Release Sync Checklist
 
