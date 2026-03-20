@@ -20,6 +20,8 @@ Specialized TODO logs now live here:
 - [TODOs.benshi-ontology-pack.md](TODOs.benshi-ontology-pack.md)
 - [TODOs.benshi-example-bank.md](TODOs.benshi-example-bank.md)
 - [TODOs.benshi-distribution.md](TODOs.benshi-distribution.md)
+- [TODOs.release-runtime-stability.md](TODOs.release-runtime-stability.md)
+- [TODOs.git-branch-governance.md](TODOs.git-branch-governance.md)
 - [TODOs.cli-product-review.md](TODOs.cli-product-review.md)
 - [TODOs.cli-ux.md](TODOs.cli-ux.md)
 - [TODOs.export-optimization.md](TODOs.export-optimization.md)

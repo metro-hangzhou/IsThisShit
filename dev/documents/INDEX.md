@@ -1,12 +1,9 @@
 # Documents Index
 
-Longer reference materials, exported reports, and review notes live here.
+Longer reference materials, exported reports, branch/runtime notes, and review logs live here.
 
 ## Benshi review materials
 
-- [benshi_report_review_20260312.md](benshi_report_review_20260312.md)
-- [benshi_calibration_rubric.md](benshi_calibration_rubric.md)
-- [benshi_review_checklist.md](benshi_review_checklist.md)
 - [benshi_local_ontology.md](benshi_local_ontology.md)
 
 ## Route / orchestration
@@ -16,6 +13,16 @@ Longer reference materials, exported reports, and review notes live here.
 ## Repository maintenance
 
 - [git_branching_plan.md](git_branching_plan.md)
+- [branch-sync-incidents.md](branch-sync-incidents.md)
+- [GitBranch_AGENTs.md](../agents/GitBranch_AGENTs.md)
+
+## Current runtime / branch stability notes
+
+See:
+
+- [technical-roadmap.md](technical-roadmap.md)
+- [git_branching_plan.md](git_branching_plan.md)
+- [TODOs.release-runtime-stability.md](../todos/TODOs.release-runtime-stability.md)
 
 ## Archived exported documents
 

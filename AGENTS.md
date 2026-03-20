@@ -93,6 +93,8 @@ Therefore:
 - when shipping CLI/repl/login/export/runtime fixes, sync the whole feature family together
 - if a release-line incident happens, record it in:
   - [dev/documents/branch-sync-incidents.md](/d:/Coding_Project/IsThisShit/dev/documents/branch-sync-incidents.md)
+- branch governance itself now has a dedicated handbook:
+  - [dev/agents/GitBranch_AGENTs.md](/d:/Coding_Project/IsThisShit/dev/agents/GitBranch_AGENTs.md)
 
 Minimum families that must be considered atomic on release sync:
 
@@ -124,6 +126,8 @@ Always run the smallest matching regression set for the feature family being shi
 Repository work is now split across specialized AGENT documents:
 
 - index: [dev/agents/INDEX.md](/d:/Coding_Project/IsThisShit/dev/agents/INDEX.md)
+- [GitBranch_AGENTs.md](/d:/Coding_Project/IsThisShit/dev/agents/GitBranch_AGENTs.md)
+  - branch roles, release sync discipline, staging hygiene, and branch-incident response
 
 - [major_AGENTs.md](/d:/Coding_Project/IsThisShit/dev/agents/major_AGENTs.md)
   - repository-wide phase coordination and document routing

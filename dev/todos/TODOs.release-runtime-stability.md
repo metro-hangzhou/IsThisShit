@@ -400,5 +400,6 @@ Recent field failures showed that the project has two separate but related stabi
 - [technical-roadmap.md](../documents/technical-roadmap.md)
 - [branch-sync-incidents.md](../documents/branch-sync-incidents.md)
 - [git_branching_plan.md](../documents/git_branching_plan.md)
+- [GitBranch_AGENTs.md](../agents/GitBranch_AGENTs.md)
 - [TODOs.export-performance.md](TODOs.export-performance.md)
 - [TODOs.export-optimization.md](TODOs.export-optimization.md)

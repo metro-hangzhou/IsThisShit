@@ -1046,3 +1046,27 @@
     - 默认就是“按 QQ 号作为输入”
   - `/watch` / `/export`
     - 行为保持不变
+
+### [2026-03-20][035] Git branch governance 从事故笔记升级为独立 handbook
+
+- 背景：
+  - 近几轮现场问题里，多次出现：
+    - 程序症状看起来像运行时 bug
+    - 实际根因却是 `main/runtime` bundle skew
+    - 或 release worktree 同步半套
+- 本轮处理：
+  - 新增独立分支治理手册：
+    - [GitBranch_AGENTs.md](../agents/GitBranch_AGENTs.md)
+  - 同时补齐：
+    - [dev/agents/INDEX.md](../agents/INDEX.md)
+    - [TODOs.git-branch-governance.md](../todos/TODOs.git-branch-governance.md)
+  - 顶层 [AGENTS.md](../../AGENTS.md) 也新增路由，明确：
+    - branch governance
+    - release sync discipline
+    - staging hygiene
+    - branch incident response
+- 目标：
+  - 后续先判断：
+    - 是真实程序问题
+    - 还是 release sync 问题
+  - 减少“查半天代码，最后发现是分支问题”的时间浪费
