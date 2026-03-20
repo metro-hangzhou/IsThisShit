@@ -9,7 +9,6 @@ set "_CLI_GIT_REMOTE=origin"
 set "_CLI_GIT_BRANCH=main"
 
 if /I "%~1"=="--launched-in-modern-host" goto strip_modern_host
-if /I "%~1"=="--post-update-handoff" goto strip_post_update_handoff
 
 if exist "%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe" (
   set "_WT_EXE=%LOCALAPPDATA%\Microsoft\WindowsApps\wt.exe"
@@ -94,12 +93,6 @@ shift
 set "_CLI_ARGS=%*"
 goto run_cli
 
-:strip_post_update_handoff
-set "CLI_POST_UPDATE_HANDOFF=1"
-shift
-set "_CLI_ARGS=%*"
-goto run_cli
-
 :close_existing_cli
 if /I "%CLI_KILL_EXISTING%"=="0" goto :eof
 if not exist "%_POWERSHELL%" goto :eof
@@ -166,7 +159,7 @@ if /I "%CLI_POST_UPDATE_HANDOFF%"=="1" goto :eof
 if defined _NAPCAT_DIFF_CHANGED set "CLI_NAPCAT_RESTART_REQUIRED=1"
 echo Restarting start_cli to apply updated launcher logic...
 set "CLI_POST_UPDATE_HANDOFF=1"
-call "%~f0" --post-update-handoff %_CLI_ARGS%
+call "%~f0" %_CLI_ARGS%
 exit /b %ERRORLEVEL%
 
 :restart_napcat_if_needed
