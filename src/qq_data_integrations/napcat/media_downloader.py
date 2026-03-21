@@ -1400,6 +1400,14 @@ class NapCatMediaDownloader:
         ):
             return prefetched
         if (
+            materialize
+            and timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_timeout_cache
+        ):
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return None
+        if (
             not materialize
             and timeout_cache_key is not None
             and timeout_cache_key in self._forward_context_timeout_cache
@@ -3909,6 +3917,9 @@ class NapCatMediaDownloader:
         )
         if not materialize:
             return ("metadata", *key)
+        asset_type = str(request.get("asset_type") or "").strip()
+        if asset_type in {"file", "video"}:
+            return ("materialize", *key)
         return (
             "materialize",
             *key,
@@ -3932,8 +3943,18 @@ class NapCatMediaDownloader:
             return None
         if action != "get_file":
             return None
-        request_key = NapCatMediaDownloader._request_key(request)
-        return ("forward_public_timeout", action, *(str(part) for part in request_key))
+        parent = hint.get("_forward_parent")
+        assert isinstance(parent, dict)
+        return (
+            "forward_public_timeout",
+            action,
+            str(parent.get("message_id_raw") or "").strip(),
+            str(parent.get("element_id") or "").strip(),
+            str(parent.get("peer_uid") or "").strip(),
+            str(parent.get("chat_type_raw") or "").strip(),
+            asset_type,
+            str(request.get("asset_role") or "").strip(),
+        )
 
     @staticmethod
     def _request_hint(request: dict[str, Any]) -> dict[str, Any]:
