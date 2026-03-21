@@ -471,6 +471,26 @@ Recent field failures showed that the project has two separate but related stabi
     - `records=10000`
     - `actionable_missing=0`
     - `background_missing=900`
+- [x] Add old-forward timeout storm breaker and a local asset simulator for `video/file/speech`
+  - current exporter hardening now caps repeated timeout damage for:
+    - `forward_context_metadata`
+    - `forward_context_materialize`
+    - `public_token_get_file`
+    - `public_token_get_record`
+    - `direct_file_id_get_file`
+  - scope is intentionally narrow:
+    - only old assets
+    - only assets with `forward_parent` hint
+    - only `video/file/speech`
+  - local simulator now exists for development-phase reproduction of:
+    - sibling short-circuit
+    - distinct-parent timeout storms
+    - route-specific timeout behavior
+- [ ] Decide whether old forward `video` should get an even earlier downgrade path after timeout storm opens
+  - current breaker prevents the export from spending endless time on repeated old-forward timeout clusters
+  - remaining question is whether some of these should go directly to:
+    - `qq_expired_after_napcat`
+  - instead of staying as ordinary unresolved misses after the breaker trips
 
 ## Related Files
 

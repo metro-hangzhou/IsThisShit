@@ -1306,3 +1306,35 @@
     - `export_verdict=success_with_background_missing`
     - `actionable_missing=0`
     - `background_missing=900`
+
+### [2026-03-22][044] `forward video` timeout storm 已增加旧资产断路器，避免整窗被大量不同 parent 的 12s 超时拖死
+
+- 朋友新现场截图暴露的真实问题不是“导出 failed 后又复活”，而是两层叠加：
+  - UI 把单个 asset 子步骤超时渲染成了 `status=failed`
+  - 实际主导出循环仍在继续，因此后面又回到 `status=in progress`
+- maintainer 侧新增了本地模拟器，用来专门复现：
+  - 同一 `forward_parent` 下兄弟 `video/file/speech`
+  - 大量不同 `forward_parent` 的老 `video`
+  - `forward_context_metadata`
+  - `forward_context_materialize`
+  - `public_token_get_file / get_record`
+  - `direct_file_id_get_file`
+- 当前新增的导出器硬化：
+  - old forward `video/file/speech` 一旦在某条恢复路线上累计达到 timeout storm 阈值，就对同月同路由同 asset-role 的后续资产直接短路
+  - 当前覆盖的 storm route：
+    - `forward_context_metadata`
+    - `forward_context_materialize`
+    - `public_token_get_file`
+    - `public_token_get_record`
+    - `direct_file_id_get_file`
+  - 仅对：
+    - 有 `forward_parent` hint
+    - 且时间足够老的资产
+    生效，避免误伤近期懒加载媒体
+- UI 侧修正：
+  - asset 子步骤 `timeout / unavailable / storm_skip` 现在统一显示为：
+    - `status=in progress ... continuing=1`
+  - 避免把“单个 asset 恢复失败”误读成“整次导出终止”
+- 新诊断信号：
+  - `diag=... forward_timeout_breaker=<n>`
+  - 便于从现场直接判断是不是 old-forward timeout storm 被断路器接管
