@@ -34,7 +34,9 @@ class NapCatMediaDownloader:
     OLD_CONTEXT_BUCKET_FAILURE_LIMIT = 5
     SHARED_MISS_CACHE_MIN_AGE_DAYS = 30
     FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS = 45
+    FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS = 180
     FORWARD_TIMEOUT_STORM_LIMIT = 6
+    FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S = 10.0
     PREFETCH_BATCH_SIZE = 200
     PREFETCH_LARGE_REQUEST_THRESHOLD = 1000
     PREFETCH_LARGE_BATCH_SIZE = 50
@@ -1635,10 +1637,6 @@ class NapCatMediaDownloader:
             timeout_s=timeout_s,
             elapsed_s=elapsed_s,
         )
-        self._note_forward_timeout_storm_success(
-            request,
-            route=substep,
-        )
         if timeout_cache_key is not None:
             self._forward_context_timeout_cache.discard(timeout_cache_key)
             self._forward_context_empty_cache.discard(timeout_cache_key)
@@ -1648,6 +1646,16 @@ class NapCatMediaDownloader:
         assets = payload.get("assets") if isinstance(payload, dict) else None
         assets_list = assets if isinstance(assets, list) else []
         if not assets_list:
+            if materialize and elapsed_s >= self.FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S:
+                self._note_forward_timeout_storm(
+                    request,
+                    route=substep,
+                )
+            elif not materialize:
+                self._note_forward_timeout_storm_success(
+                    request,
+                    route=substep,
+                )
             if timeout_cache_key is not None and not materialize:
                 self._forward_context_empty_cache.add(timeout_cache_key)
                 self._forward_context_payload_cache.pop(timeout_cache_key, None)
@@ -1676,6 +1684,22 @@ class NapCatMediaDownloader:
                 request=request,
                 request_data=request,
                 payload=matched_payload,
+            )
+        if materialize:
+            if matched not in {None, (None, None)}:
+                self._note_forward_timeout_storm_success(
+                    request,
+                    route=substep,
+                )
+            elif elapsed_s >= self.FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S:
+                self._note_forward_timeout_storm(
+                    request,
+                    route=substep,
+                )
+        else:
+            self._note_forward_timeout_storm_success(
+                request,
+                route=substep,
             )
         return matched
 
@@ -3950,16 +3974,43 @@ class NapCatMediaDownloader:
             asset_dt = datetime.fromtimestamp(float(raw_timestamp) / 1000.0, tz=timezone.utc)
         except (OverflowError, OSError, ValueError):
             return None
-        if datetime.now(timezone.utc) - asset_dt < timedelta(days=self.FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS):
+        asset_age = datetime.now(timezone.utc) - asset_dt
+        if asset_age < timedelta(days=self.FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS):
             return None
-        month_bucket = asset_dt.strftime("%Y-%m")
+        normalized_route = self._forward_timeout_storm_route_group(
+            route=route,
+            asset_age=asset_age,
+        )
+        if asset_age >= timedelta(days=self.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS):
+            age_bucket = f"{self.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS}d_plus"
+        else:
+            age_bucket = asset_dt.strftime("%Y-%m")
         return (
             "forward_timeout_storm",
-            str(route or "").strip().lower(),
+            normalized_route,
             asset_type,
             str(request.get("asset_role") or "").strip().lower(),
-            month_bucket,
+            age_bucket,
         )
+
+    @staticmethod
+    def _forward_timeout_storm_route_group(
+        *,
+        route: str,
+        asset_age: timedelta,
+    ) -> str:
+        normalized = str(route or "").strip().lower()
+        if asset_age >= timedelta(days=NapCatMediaDownloader.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS):
+            if normalized in {
+                "public_token_get_file",
+                "public_token_get_record",
+                "forward_context_materialize",
+                "direct_file_id_get_file",
+            }:
+                return "forward_expensive"
+            if normalized == "forward_context_metadata":
+                return "forward_meta"
+        return normalized
 
     def _classify_forward_missing(self, request: dict[str, Any]) -> str | None:
         if str(request.get("asset_type") or "").strip() != "image":

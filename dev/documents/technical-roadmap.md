@@ -1338,3 +1338,20 @@
 - 新诊断信号：
   - `diag=... forward_timeout_breaker=<n>`
   - 便于从现场直接判断是不是 old-forward timeout storm 被断路器接管
+
+### [2026-03-22][045] 朋友侧全群 trace 进一步确认：真正拖慢的是“分散月份 old forward video”与“慢 ok 无收益的 targeted materialize”
+
+- 现场 trace `root_export_group_763328502_20260322_025728_383377_29356...tmp` 当前已确认：
+  - 不是“导出 failed 后又复活”
+  - 而是：
+    - `public_token_get_file` 对 old forward `video` 连续 `12s timeout`
+    - 紧接着 `forward_context_materialize` 常常 `~20s ok`
+    - 但最终仍然 `missing_after_napcat`
+  - 典型单资产耗时：
+    - `~32s`
+- 新发现的两个漏口：
+  - 旧版 breaker 以月份分桶，`2025-05/06/07` 的 timeout 被分散掉，阈值迟迟打不满
+  - `forward_context_materialize` 的“慢 ok 但最终没命中”之前不会计入 breaker
+- 当前修正：
+  - 对 `>=180d` 的 old forward `video/file/speech`，expensive route breaker 现在改为跨月共享
+  - `forward_context_materialize` 若耗时足够长且最终没命中，也会被算进 breaker
