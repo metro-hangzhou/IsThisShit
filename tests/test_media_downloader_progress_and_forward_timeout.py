@@ -390,6 +390,44 @@ def test_forward_video_public_token_timeout_skips_later_retry_even_with_new_toke
     assert client.get_file_calls == 1
 
 
+def test_forward_video_materialize_timeout_skips_later_retry_for_sibling_assets() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    first = downloader._download_via_forward_context(
+        _build_forward_video_request("slow-forward-video-a.mp4"),
+        materialize=True,
+    )
+    second = downloader._download_via_forward_context(
+        _build_forward_video_request("slow-forward-video-b.mp4"),
+        materialize=True,
+    )
+
+    assert first is None
+    assert second is None
+    assert len(fast_client.calls) == 1
+
+
+def test_forward_video_public_token_timeout_skips_later_retry_for_sibling_assets() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+
+    first = downloader._call_public_action_with_token(
+        "get_file",
+        "first-token",
+        request=_build_forward_video_request("slow-forward-video-a.mp4"),
+    )
+    second = downloader._call_public_action_with_token(
+        "get_file",
+        "second-token",
+        request=_build_forward_video_request("slow-forward-video-b.mp4"),
+    )
+
+    assert first is None
+    assert second is None
+    assert client.get_file_calls == 1
+
+
 def test_prefetched_forward_remote_payload_is_used_before_metadata_requery() -> None:
     temp_root = _workspace_temp_dir()
     downloader = _RemoteMediaDownloader(temp_root / "remote_cache")
