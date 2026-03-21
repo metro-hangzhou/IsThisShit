@@ -491,6 +491,13 @@ Recent field failures showed that the project has two separate but related stabi
   - remaining question is whether some of these should go directly to:
     - `qq_expired_after_napcat`
   - instead of staying as ordinary unresolved misses after the breaker trips
+- [x] Broaden the old-forward timeout breaker for `>=180d` assets and count slow no-op materialize attempts
+  - friend trace on `group 763328502` showed the previous breaker was still too weak because:
+    - timeout clusters were split across `2025-05/06/07`
+    - `forward_context_materialize` often took `~20s` and still ended in `missing_after_napcat`
+  - current fix:
+    - very old forward `video/file/speech` now share one expensive-route breaker bucket across months
+    - slow `forward_context_materialize` attempts that still miss now count toward the breaker
 
 ## Related Files
 

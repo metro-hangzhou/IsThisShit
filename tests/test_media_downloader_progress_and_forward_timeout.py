@@ -185,6 +185,27 @@ class _SuccessForwardClient:
         }
 
 
+class _SlowMismatchedForwardClient:
+    def __init__(self, delay_s: float = 0.02) -> None:
+        self.delay_s = delay_s
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        time.sleep(self.delay_s)
+        return {
+            "targeted_mode": "single_target_download",
+            "assets": [
+                {
+                    "asset_type": "video",
+                    "asset_role": "forward_media",
+                    "file_name": "not-the-requested-video.mp4",
+                    "file": str(Path(__file__).resolve()),
+                }
+            ],
+        }
+
+
 def _build_forward_request(file_name: str) -> dict[str, object]:
     return {
         "asset_type": "image",
@@ -217,6 +238,22 @@ def _build_forward_speech_request(file_name: str) -> dict[str, object]:
 def _mark_request_old(request: dict[str, object], *, days: int = 90) -> dict[str, object]:
     updated = dict(request)
     updated["timestamp_ms"] = int((time.time() - (days * 24 * 60 * 60)) * 1000)
+    return updated
+
+
+def _set_forward_parent_identity(
+    request: dict[str, object],
+    *,
+    message_id_raw: str,
+    element_id: str,
+) -> dict[str, object]:
+    updated = dict(request)
+    hint = dict(updated.get("download_hint") or {})
+    parent = dict(hint.get("_forward_parent") or {})
+    parent["message_id_raw"] = message_id_raw
+    parent["element_id"] = element_id
+    hint["_forward_parent"] = parent
+    updated["download_hint"] = hint
     return updated
 
 
@@ -583,6 +620,67 @@ def test_forward_video_direct_file_id_timeout_breaker_skips_distinct_old_parents
     assert downloader._resolve_via_direct_file_id(skipped_request) is None
 
     assert client.get_file_calls == downloader.FORWARD_TIMEOUT_STORM_LIMIT
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
+
+
+def test_forward_video_public_token_timeout_breaker_groups_very_old_months_together() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    downloader.FORWARD_TIMEOUT_STORM_LIMIT = 2
+
+    first = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("old-1.mp4"), days=240),
+        message_id_raw="8618000000000001",
+        element_id="8618000000000001",
+    )
+    second = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("old-2.mp4"), days=300),
+        message_id_raw="8618000000000002",
+        element_id="8618000000000002",
+    )
+    third = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("old-3.mp4"), days=330),
+        message_id_raw="8618000000000003",
+        element_id="8618000000000003",
+    )
+
+    assert downloader._call_public_action_with_token("get_file", "old-token-1", request=first) is None
+    assert downloader._call_public_action_with_token("get_file", "old-token-2", request=second) is None
+    assert downloader._call_public_action_with_token("get_file", "old-token-3", request=third) is None
+
+    assert client.get_file_calls == 2
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
+
+
+def test_forward_video_materialize_slow_noop_contributes_to_breaker_for_very_old_assets() -> None:
+    fast_client = _SlowMismatchedForwardClient(delay_s=0.02)
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader.FORWARD_TIMEOUT_STORM_LIMIT = 2
+    downloader.FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S = 0.01
+
+    first = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("noop-1.mp4"), days=240),
+        message_id_raw="8718000000000001",
+        element_id="8718000000000001",
+    )
+    second = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("noop-2.mp4"), days=300),
+        message_id_raw="8718000000000002",
+        element_id="8718000000000002",
+    )
+    third = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("noop-3.mp4"), days=330),
+        message_id_raw="8718000000000003",
+        element_id="8718000000000003",
+    )
+
+    assert downloader._download_via_forward_context(first, materialize=True) in {None, (None, None)}
+    assert downloader._download_via_forward_context(second, materialize=True) in {None, (None, None)}
+    assert downloader._download_via_forward_context(third, materialize=True) in {None, (None, None)}
+
+    assert len(fast_client.calls) == 2
     snapshot = downloader.export_download_progress_snapshot()
     assert snapshot["forward_timeout_storm_skip_count"] == 1
 
