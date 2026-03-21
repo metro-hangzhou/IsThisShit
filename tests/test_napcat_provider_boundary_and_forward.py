@@ -148,6 +148,63 @@ def test_collect_fast_history_tail_bulk_boundary_bridge_keeps_fallback_when_no_p
     assert [item["message_id"] for item in state["messages"]] == ["m1", "m2"]
 
 
+def test_collect_fast_history_tail_bulk_boundary_bridge_uses_current_next_anchor() -> None:
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=object())
+    payloads = iter(
+        [
+            {
+                "messages": [_message("m1", "1"), _message("m2", "2")],
+                "pages_scanned": 1,
+                "next_anchor": "anchor-1",
+                "page_size": 200,
+                "exhausted": False,
+            },
+            {
+                "messages": [_message("m2", "2")],
+                "pages_scanned": 1,
+                "next_anchor": "anchor-2",
+                "page_size": 200,
+                "exhausted": False,
+            },
+        ]
+    )
+    bridge_anchors: list[str | None] = []
+
+    def fake_fetch_fast_history_tail_bulk(*args, **kwargs):
+        try:
+            return next(payloads)
+        except StopIteration:
+            return None
+
+    def fake_fetch_history_page(request, *, before_message_seq: str | None, **kwargs):
+        bridge_anchors.append(before_message_seq)
+        return (
+            _snapshot([_message("m3", "3")]),
+            {
+                "history_source": "napcat_fast_history",
+                "page_duration_s": 0.01,
+                "page_size": 1,
+                "page_message_count": 1,
+                "retry_count": 0,
+            },
+        )
+
+    provider._fetch_fast_history_tail_bulk = fake_fetch_fast_history_tail_bulk  # type: ignore[method-assign]
+    provider._fetch_history_page = fake_fetch_history_page  # type: ignore[method-assign]
+
+    state = provider._collect_fast_history_tail_bulk(
+        _request(),
+        data_count=3,
+        page_size=200,
+        progress_callback=None,
+    )
+
+    assert state is not None
+    assert state["completed"] is True
+    assert bridge_anchors == ["anchor-2"]
+    assert [item["message_id"] for item in state["messages"]] == ["m1", "m2", "m3"]
+
+
 def test_enrich_forward_details_uses_history_as_last_chance_after_get_forward_msg_failure() -> None:
     class _ForwardFailClient:
         def get_forward_msg(self, message_id: str):
@@ -223,3 +280,67 @@ def test_enrich_forward_details_marks_unavailable_when_forward_and_history_both_
         target_message["message"][0]["data"]["_qq_data_forward_unavailable_reason"]  # type: ignore[index]
         == "forward_structure_unavailable_via_history"
     )
+
+
+def test_enrich_forward_details_does_not_poison_later_forward_after_single_known_failure() -> None:
+    class _MixedForwardClient:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_forward_msg(self, message_id: str):
+            self.calls.append(message_id)
+            if message_id == "bad-forward":
+                raise NapCatApiError("找不到相关的聊天记录")
+            return {"messages": [{"message_id": "resolved-good"}]}
+
+    client = _MixedForwardClient()
+    provider = NapCatHistoryProvider(client)
+    messages = [
+        {
+            "message_id": "msg-1",
+            "message_seq": "1001",
+            "message": [
+                {
+                    "type": "forward",
+                    "data": {"id": "bad-forward"},
+                    "extra": {"forward_messages": [], "detailed_text": None},
+                }
+            ],
+        },
+        {
+            "message_id": "msg-2",
+            "message_seq": "1002",
+            "message": [
+                {
+                    "type": "forward",
+                    "data": {"id": "good-forward"},
+                    "extra": {"forward_messages": [], "detailed_text": None},
+                }
+            ],
+        },
+    ]
+
+    def fake_hydrate_forward_message_via_history(message: dict[str, object], *, chat_type: str, chat_id: str):
+        return False, True
+
+    provider._hydrate_forward_message_via_history = fake_hydrate_forward_message_via_history  # type: ignore[method-assign]
+
+    enriched, unavailable = provider._enrich_forward_details(
+        messages,
+        chat_type="group",
+        chat_id="922065597",
+        skip_history_retry=True,
+        progress_callback=None,
+    )
+
+    assert client.calls == ["bad-forward", "good-forward"]
+    assert enriched == 1
+    assert unavailable == 1
+    assert messages[1]["message"][0]["data"]["content"] == [{"message_id": "resolved-good"}]  # type: ignore[index]
+
+
+def test_match_message_by_seq_does_not_accept_single_mismatched_message_with_seq() -> None:
+    provider = NapCatHistoryProvider(_DummyClient())
+    payload = [{"message_seq": "9999", "message": [{"type": "forward", "data": {"content": "x"}}]}]
+
+    assert provider._match_message_by_seq(payload, "1000") is None
