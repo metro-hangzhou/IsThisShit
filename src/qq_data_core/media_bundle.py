@@ -788,6 +788,10 @@ def _emit_download_queue_progress(
         "completed": int(snapshot.get("completed") or 0),
         "failed": int(snapshot.get("failed") or 0),
         "cached": int(snapshot.get("cached") or 0),
+        "timeout_count": int(snapshot.get("timeout_count") or 0),
+        "forward_context_timeout_count": int(snapshot.get("forward_context_timeout_count") or 0),
+        "forward_context_empty_count": int(snapshot.get("forward_context_empty_count") or 0),
+        "forward_context_error_count": int(snapshot.get("forward_context_error_count") or 0),
         "last_asset_type": snapshot.get("last_asset_type"),
         "last_file_name": snapshot.get("last_file_name"),
         "last_status": snapshot.get("last_status"),
@@ -937,6 +941,8 @@ def _iter_asset_candidates_from_segment(
     if segment_type == "sticker":
         static_path = _string_or_none(extra.get("static_path"))
         dynamic_path = _string_or_none(extra.get("dynamic_path"))
+        remote_url = _string_or_none(extra.get("remote_url"))
+        remote_file_name = _string_or_none(extra.get("remote_file_name"))
         if static_path:
             yield _AssetCandidate(
                 "sticker",
@@ -963,6 +969,16 @@ def _iter_asset_candidates_from_segment(
                 None,
                 file_name,
                 path,
+                md5,
+                timestamp_ms,
+                download_hint=extra,
+            )
+        if not static_path and not dynamic_path and not path and remote_url:
+            yield _AssetCandidate(
+                "sticker",
+                None,
+                remote_file_name or file_name,
+                None,
                 md5,
                 timestamp_ms,
                 download_hint=extra,
