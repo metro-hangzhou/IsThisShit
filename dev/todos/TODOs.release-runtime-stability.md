@@ -448,6 +448,29 @@ Recent field failures showed that the project has two separate but related stabi
     - `qq_expired_after_napcat`
   - is semantically specific enough for:
     - old uploaded files with empty `get_file` payloads and `file not found` on direct `file_id`
+- [ ] Add a bounded probe for large-window actionable `video` misses
+  - friend-provided copied state on `group 763328502` still shows:
+    - `missing_after_napcat=18`
+    - all on `video`
+    - slowest single materialize step `~44.1s`
+  - next step should not be another blind full rerun
+  - instead:
+    - extract the retry clusters
+    - probe the specific video assets with strict per-asset timing
+    - determine whether they are:
+      - recoverable via a better NapCat route
+      - or should be downgraded into a background class like the old uploaded-file case
+- [x] Fix `10000` tail export overshoot and the old-video actionable-missing leak on maintainer baseline
+  - `2026-03-21` live regression on `group 922065597` exposed:
+    - `records=10047` on a `--limit 10000` export
+    - `missing_after_napcat=4` on old `2025-09` video assets
+  - current fix set:
+    - cap `tail boundary bridge` append count to the requested `data_count`
+    - classify old `video/file` public-token `get_file` blank-payload / stale-local-url returns as `qq_expired_after_napcat`
+  - post-fix maintainer live rerun:
+    - `records=10000`
+    - `actionable_missing=0`
+    - `background_missing=900`
 
 ## Related Files
 

@@ -1865,10 +1865,16 @@ class NapCatMediaDownloader:
             return None
         known_bad_token = self._known_bad_public_tokens.get((normalized_action, token))
         if known_bad_token:
-            return {
+            return self._annotate_public_token_payload(
+                {
                 "_known_missing_classification": known_bad_token,
                 "_known_missing_detail": "cached_known_bad_token",
-            }
+                },
+                action=normalized_action,
+                token=token,
+                file_name=file_name,
+                request=request,
+            )
         timeout_s = self.PUBLIC_TOKEN_ACTION_TIMEOUT_S
         cache_key = (normalized_action, token)
 
@@ -1950,10 +1956,16 @@ class NapCatMediaDownloader:
                 )
             if known_missing is not None:
                 self._known_bad_public_tokens[(normalized_action, token)] = known_missing
-                payload = {
+                payload = self._annotate_public_token_payload(
+                    {
                     "_known_missing_classification": known_missing,
                     "_known_missing_detail": str(exc),
-                }
+                    },
+                    action=normalized_action,
+                    token=token,
+                    file_name=file_name,
+                    request=request,
+                )
                 self._public_token_action_outcomes[cache_key] = payload
                 return payload
             payload = None
@@ -1976,6 +1988,13 @@ class NapCatMediaDownloader:
                     timeout_s=timeout_s,
                     elapsed_s=elapsed_s,
                 )
+            payload = self._annotate_public_token_payload(
+                payload,
+                action=normalized_action,
+                token=token,
+                file_name=file_name,
+                request=request,
+            )
             self._public_token_action_outcomes[cache_key] = payload
             return payload
 
@@ -2040,10 +2059,16 @@ class NapCatMediaDownloader:
                 )
             if known_missing is not None:
                 self._known_bad_public_tokens[(normalized_action, token)] = known_missing
-                payload = {
+                payload = self._annotate_public_token_payload(
+                    {
                     "_known_missing_classification": known_missing,
                     "_known_missing_detail": str(exc),
-                }
+                    },
+                    action=normalized_action,
+                    token=token,
+                    file_name=file_name,
+                    request=request,
+                )
                 self._public_token_action_outcomes[cache_key] = payload
                 return payload
             self._public_token_action_outcomes[cache_key] = None
@@ -2066,8 +2091,42 @@ class NapCatMediaDownloader:
                 timeout_s=timeout_s,
                 elapsed_s=elapsed_s,
             )
+        payload = self._annotate_public_token_payload(
+            payload,
+            action=normalized_action,
+            token=token,
+            file_name=file_name,
+            request=request,
+        )
         self._public_token_action_outcomes[cache_key] = payload
         return payload
+
+    @staticmethod
+    def _annotate_public_token_payload(
+        payload: dict[str, Any] | None,
+        *,
+        action: str,
+        token: str,
+        file_name: str | None,
+        request: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return payload
+        annotated = dict(payload)
+        annotated.setdefault("public_action", action)
+        annotated.setdefault("public_file_token", token)
+        if file_name:
+            annotated.setdefault("file_name", file_name)
+        if isinstance(request, dict):
+            asset_type = str(request.get("asset_type") or "").strip()
+            if asset_type:
+                annotated.setdefault("asset_type", asset_type)
+            hint = request.get("download_hint")
+            if isinstance(hint, dict):
+                file_id = str(hint.get("file_id") or "").strip()
+                if file_id:
+                    annotated.setdefault("file_id", file_id)
+        return annotated
 
     @staticmethod
     def _classify_known_public_action_error(action: str, exc: Exception) -> str | None:
@@ -3701,8 +3760,14 @@ class NapCatMediaDownloader:
             return None
         payload_file = str(data.get("file") or "").strip()
         remote_url = str(data.get("url") or data.get("remote_url") or "").strip()
-        if payload_file or remote_url:
+        if payload_file:
             return None
+        if remote_url:
+            parsed = urlparse(remote_url)
+            if parsed.scheme.lower() in {"http", "https"}:
+                return None
+            if Path(remote_url).exists():
+                return None
         file_name = str(
             data.get("file_name")
             or ((request or {}).get("file_name") if isinstance(request, dict) else "")
