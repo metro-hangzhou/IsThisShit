@@ -890,6 +890,23 @@ class NapCatMediaDownloader:
                 )
                 if targeted_forward_download not in {None, (None, None)}:
                     return self._remember_shared_outcome(shared_key, request, targeted_forward_download)
+                classified_old_forward_missing = self._classify_old_forward_expensive_missing(
+                    request,
+                    payload=forward_payload if isinstance(forward_payload, dict) else None,
+                    require_timeout_signal=True,
+                )
+                if classified_old_forward_missing is not None:
+                    self._emit_missing_classification_trace(
+                        trace_callback,
+                        request,
+                        substep="forward_missing_classification",
+                        classification=classified_old_forward_missing,
+                    )
+                    return self._remember_shared_outcome(
+                        shared_key,
+                        request,
+                        (None, classified_old_forward_missing),
+                    )
             direct_forward_file_id = self._resolve_via_direct_file_id(
                 request,
                 trace_callback=trace_callback,
@@ -2643,7 +2660,7 @@ class NapCatMediaDownloader:
     def _resolved_path_from_payload(data: dict[str, Any] | None) -> Path | None:
         if not isinstance(data, dict):
             return None
-        value = data.get("file") or data.get("url")
+        value = data.get("file") or data.get("path") or data.get("url")
         if not value:
             return None
         path = Path(str(value))
@@ -4096,6 +4113,8 @@ class NapCatMediaDownloader:
             return False
         if self._forward_context_timed_out(request, materialize=False):
             return True
+        if self._forward_context_timed_out(request, materialize=True):
+            return True
         asset_type = str(request.get("asset_type") or "").strip().lower()
         action = "get_record" if asset_type == "speech" else "get_file"
         if self._public_action_timed_out(request, action=action):
@@ -4106,6 +4125,9 @@ class NapCatMediaDownloader:
         ) or self._should_skip_forward_timeout_storm(
             request,
             route="forward_context_materialize",
+        ) or self._should_skip_forward_timeout_storm(
+            request,
+            route="direct_file_id_get_file",
         )
 
     def _public_action_timeout_s(
