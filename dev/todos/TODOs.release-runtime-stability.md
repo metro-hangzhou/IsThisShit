@@ -190,6 +190,27 @@ Recent field failures showed that the project has two separate but related stabi
   - narrow window around `2026-03-16T13:12:57+08:00`
   - full `2000`-message rerun on group `922065597`
 
+### [2026-03-22][014] Asset-state simulator is now required for exporter hardening
+
+- Motivation:
+  - friend-machine field reports keep surfacing asset combinations that are expensive to reproduce live
+  - waiting for a full `10k+` export to fail is too slow for development
+- Guardrail:
+  - new exporter fixes for media resolution should add or update local simulator cases first
+- Current simulator scope:
+  - direct local hints
+  - old image placeholder classification
+  - top-level public-token local/remote recovery
+  - direct `file_id` local/remote recovery
+  - sticker remote GIF recovery
+  - forward remote URL recovery
+  - old forward `video/file/speech` timeout-to-expired classification
+  - known NapCat media-url errors (`video/file/record`)
+- Remaining gaps still worth encoding later:
+  - malformed nested-forward parent chains
+  - route-unavailable / mixed-route deployment states
+  - batch-prefetch pressure and executor-level behavior
+
 ## Current Fix / Guardrail Tasks
 
 - [ ] Keep CLI launcher policy explicit in regression review:
@@ -218,6 +239,7 @@ Recent field failures showed that the project has two separate but related stabi
   - targeted forward `message_id_raw=7617760641125573795` now recovers `7/7` images in narrow-window retest
 - [ ] Record friend-machine failures into perf/forensics docs when new logs arrive
 - [ ] Keep quick-login path covered by regression tests so QR fallback remains intact
+- [ ] Keep the asset-state simulator matrix in sync with any new asset family or recovery heuristic
 - [ ] Keep `app.py login` and REPL `/login` behavior-compatible in regression coverage
 - [ ] Keep local live validation scripts/operator notes aligned with the fixed local account `3956020260`
 - [ ] Keep local live/export validation matrix aligned with the fixed test targets:
@@ -448,6 +470,56 @@ Recent field failures showed that the project has two separate but related stabi
     - `qq_expired_after_napcat`
   - is semantically specific enough for:
     - old uploaded files with empty `get_file` payloads and `file not found` on direct `file_id`
+- [ ] Add a bounded probe for large-window actionable `video` misses
+  - friend-provided copied state on `group 763328502` still shows:
+    - `missing_after_napcat=18`
+    - all on `video`
+    - slowest single materialize step `~44.1s`
+  - next step should not be another blind full rerun
+  - instead:
+    - extract the retry clusters
+    - probe the specific video assets with strict per-asset timing
+    - determine whether they are:
+      - recoverable via a better NapCat route
+      - or should be downgraded into a background class like the old uploaded-file case
+- [x] Fix `10000` tail export overshoot and the old-video actionable-missing leak on maintainer baseline
+  - `2026-03-21` live regression on `group 922065597` exposed:
+    - `records=10047` on a `--limit 10000` export
+    - `missing_after_napcat=4` on old `2025-09` video assets
+  - current fix set:
+    - cap `tail boundary bridge` append count to the requested `data_count`
+    - classify old `video/file` public-token `get_file` blank-payload / stale-local-url returns as `qq_expired_after_napcat`
+  - post-fix maintainer live rerun:
+    - `records=10000`
+    - `actionable_missing=0`
+    - `background_missing=900`
+- [x] Add old-forward timeout storm breaker and a local asset simulator for `video/file/speech`
+  - current exporter hardening now caps repeated timeout damage for:
+    - `forward_context_metadata`
+    - `forward_context_materialize`
+    - `public_token_get_file`
+    - `public_token_get_record`
+    - `direct_file_id_get_file`
+  - scope is intentionally narrow:
+    - only old assets
+    - only assets with `forward_parent` hint
+    - only `video/file/speech`
+  - local simulator now exists for development-phase reproduction of:
+    - sibling short-circuit
+    - distinct-parent timeout storms
+    - route-specific timeout behavior
+- [ ] Decide whether old forward `video` should get an even earlier downgrade path after timeout storm opens
+  - current breaker prevents the export from spending endless time on repeated old-forward timeout clusters
+  - remaining question is whether some of these should go directly to:
+    - `qq_expired_after_napcat`
+  - instead of staying as ordinary unresolved misses after the breaker trips
+- [x] Broaden the old-forward timeout breaker for `>=180d` assets and count slow no-op materialize attempts
+  - friend trace on `group 763328502` showed the previous breaker was still too weak because:
+    - timeout clusters were split across `2025-05/06/07`
+    - `forward_context_materialize` often took `~20s` and still ended in `missing_after_napcat`
+  - current fix:
+    - very old forward `video/file/speech` now share one expensive-route breaker bucket across months
+    - slow `forward_context_materialize` attempts that still miss now count toward the breaker
 
 ## Related Files
 
