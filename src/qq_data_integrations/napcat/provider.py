@@ -847,12 +847,30 @@ class NapCatHistoryProvider:
             forward_id = target["forward_id"]
             if forward_id in self._known_unavailable_forward_ids:
                 cache[forward_id] = None
-                if self._mark_forward_target_unavailable(
+                recovered_via_history = False
+                if message_key and not self._disable_parse_mult_forward_hydration:
+                    hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
+                        target["message"],
+                        chat_type=chat_type,
+                        chat_id=chat_id,
+                    )
+                    parse_mult_cache[message_key] = hydrated_via_history
+                    if hydrated_via_history:
+                        enriched += 1
+                        cache[forward_id] = []
+                        recovered_via_history = True
+                    elif known_history_unavailable and self._mark_forward_target_unavailable(
+                        target,
+                        reason="forward_structure_unavailable_via_history",
+                    ):
+                        structure_unavailable += 1
+                elif self._mark_forward_target_unavailable(
                     target,
                     reason="forward_structure_unavailable_via_get_forward_msg",
                 ):
                     structure_unavailable += 1
-                skip_forward_msg_fallback = True
+                if not recovered_via_history:
+                    skip_forward_msg_fallback = True
             if skip_forward_msg_fallback and forward_id not in cache:
                 cache[forward_id] = None
             if forward_id not in cache:
@@ -862,12 +880,33 @@ class NapCatHistoryProvider:
                     cache[forward_id] = None
                     if self._is_known_forward_detail_unavailable(exc):
                         self._known_unavailable_forward_ids.add(forward_id)
-                        if self._mark_forward_target_unavailable(
+                        recovered_via_history = False
+                        if (
+                            message_key
+                            and not self._disable_parse_mult_forward_hydration
+                        ):
+                            hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
+                                target["message"],
+                                chat_type=chat_type,
+                                chat_id=chat_id,
+                            )
+                            parse_mult_cache[message_key] = hydrated_via_history
+                            if hydrated_via_history:
+                                enriched += 1
+                                cache[forward_id] = []
+                                recovered_via_history = True
+                            elif known_history_unavailable and self._mark_forward_target_unavailable(
+                                target,
+                                reason="forward_structure_unavailable_via_history",
+                            ):
+                                structure_unavailable += 1
+                        elif self._mark_forward_target_unavailable(
                             target,
                             reason="forward_structure_unavailable_via_get_forward_msg",
                         ):
                             structure_unavailable += 1
-                        skip_forward_msg_fallback = True
+                        if not recovered_via_history:
+                            skip_forward_msg_fallback = True
                 else:
                     payload = (
                         response
@@ -1374,6 +1413,42 @@ class NapCatHistoryProvider:
                     "page_size": int(payload.get("page_size") or page_size),
                 }
             if not next_anchor or next_anchor in seen_anchors or added <= 0:
+                remaining = data_count - len(collected_messages)
+                bridged = self._try_fast_history_tail_boundary_bridge(
+                    request,
+                    anchor=anchor,
+                    data_count=data_count,
+                    remaining=remaining,
+                    page_size=page_size,
+                    seen_keys=seen_keys,
+                    collected_messages=collected_messages,
+                    pages_scanned=pages_scanned,
+                    progress_callback=progress_callback,
+                )
+                if bridged is not None:
+                    pages_scanned = int(bridged["pages_scanned"])
+                    if bridged["completed"]:
+                        return {
+                            "messages": collected_messages,
+                            "seen_keys": seen_keys,
+                            "next_anchor": bridged["next_anchor"],
+                            "pages_scanned": pages_scanned,
+                            "completed": True,
+                            "history_source": _merge_history_source(
+                                "napcat_fast_history_bulk",
+                                str(bridged["history_source"] or ""),
+                            ),
+                            "bulk_duration_s": round(perf_counter() - total_started, 4),
+                            "bulk_chunks": chunk_count,
+                            "bulk_chunk_limit": chunk_limit,
+                            "partial_fallback": False,
+                            "page_size": int(bridged["page_size"] or page_size),
+                        }
+                    bridge_next_anchor = str(bridged["next_anchor"] or "").strip() or None
+                    if bridge_next_anchor and bridge_next_anchor not in seen_anchors:
+                        seen_anchors.add(bridge_next_anchor)
+                        anchor = bridge_next_anchor
+                        continue
                 return {
                     "messages": collected_messages,
                     "seen_keys": seen_keys,
@@ -1402,6 +1477,70 @@ class NapCatHistoryProvider:
             "bulk_chunk_limit": chunk_limit,
             "partial_fallback": False,
             "page_size": page_size,
+        }
+
+    def _try_fast_history_tail_boundary_bridge(
+        self,
+        request: ExportRequest,
+        *,
+        anchor: str | None,
+        data_count: int,
+        remaining: int,
+        page_size: int,
+        seen_keys: set[str],
+        collected_messages: list[dict[str, Any]],
+        pages_scanned: int,
+        progress_callback: HistoryProgressCallback | None,
+    ) -> dict[str, Any] | None:
+        if not anchor or remaining <= 0:
+            return None
+        bridge_count = max(1, min(page_size, remaining))
+        snapshot, page_metrics = self._fetch_history_page(
+            request,
+            before_message_seq=anchor,
+            count=bridge_count,
+            progress_callback=progress_callback,
+            phase="page_retry",
+            mode="tail_boundary_bridge",
+        )
+        page_messages = self._extract_messages(snapshot.messages)
+        if not page_messages:
+            return None
+        pages_scanned += 1
+        oldest_dt = _message_datetime(page_messages[0])
+        newest_dt = _message_datetime(page_messages[-1])
+        added = 0
+        for message in reversed(page_messages):
+            dedupe_key = _message_key(message)
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            collected_messages.append(message)
+            added += 1
+        next_anchor = _history_anchor(page_messages[0])
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "tail_scan",
+                    "mode": "tail_boundary_bridge",
+                    "pages_scanned": pages_scanned,
+                    "matched_messages": len(collected_messages),
+                    "requested_data_count": data_count,
+                    "oldest_content_at": oldest_dt,
+                    "newest_content_at": newest_dt,
+                    "anchor": next_anchor,
+                    **page_metrics,
+                }
+            )
+        if added <= 0:
+            return None
+        return {
+            "added": added,
+            "pages_scanned": pages_scanned,
+            "next_anchor": next_anchor,
+            "history_source": snapshot.metadata.get("source"),
+            "page_size": page_metrics.get("page_size"),
+            "completed": len(collected_messages) >= data_count,
         }
 
     def _adapt_page_size(
