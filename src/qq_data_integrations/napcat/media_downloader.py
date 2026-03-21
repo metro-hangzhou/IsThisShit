@@ -37,6 +37,10 @@ class NapCatMediaDownloader:
     FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS = 180
     FORWARD_TIMEOUT_STORM_LIMIT = 6
     FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S = 10.0
+    OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S = 4.0
+    OLD_FORWARD_EXPENSIVE_DIRECT_FILE_ID_TIMEOUT_S = 4.0
+    OLD_FORWARD_EXPENSIVE_METADATA_TIMEOUT_S = 6.0
+    OLD_FORWARD_EXPENSIVE_MATERIALIZE_TIMEOUT_S = 8.0
     PREFETCH_BATCH_SIZE = 200
     PREFETCH_LARGE_REQUEST_THRESHOLD = 1000
     PREFETCH_LARGE_BATCH_SIZE = 50
@@ -805,6 +809,23 @@ class NapCatMediaDownloader:
                 fast_resolved = self._resolve_from_fast_payload(forward_payload)
                 if fast_resolved != (None, None):
                     return self._remember_shared_outcome(shared_key, request, fast_resolved)
+                classified_old_forward_missing = self._classify_old_forward_expensive_missing(
+                    request,
+                    payload=forward_payload,
+                    require_timeout_signal=True,
+                )
+                if classified_old_forward_missing is not None:
+                    self._emit_missing_classification_trace(
+                        trace_callback,
+                        request,
+                        substep="forward_missing_classification",
+                        classification=classified_old_forward_missing,
+                    )
+                    return self._remember_shared_outcome(
+                        shared_key,
+                        request,
+                        (None, classified_old_forward_missing),
+                    )
             if asset_type == "image":
                 has_forward_payload = isinstance(forward_payload, dict)
                 has_hint_file_id = bool(str(hint.get("file_id") or "").strip())
@@ -844,6 +865,23 @@ class NapCatMediaDownloader:
                 fast_resolved = self._resolve_from_fast_payload(forward_payload)
                 if fast_resolved != (None, None):
                     return self._remember_shared_outcome(shared_key, request, fast_resolved)
+            classified_old_forward_missing = self._classify_old_forward_expensive_missing(
+                request,
+                payload=forward_payload if isinstance(forward_payload, dict) else None,
+                require_timeout_signal=True,
+            )
+            if classified_old_forward_missing is not None:
+                self._emit_missing_classification_trace(
+                    trace_callback,
+                    request,
+                    substep="forward_missing_classification",
+                    classification=classified_old_forward_missing,
+                )
+                return self._remember_shared_outcome(
+                    shared_key,
+                    request,
+                    (None, classified_old_forward_missing),
+                )
             if asset_type in {"video", "file", "speech"}:
                 targeted_forward_download = self._download_via_forward_context(
                     request,
@@ -1281,7 +1319,7 @@ class NapCatMediaDownloader:
         file_id = str(hint.get("file_id") or "").strip()
         if not file_id or not file_id.startswith("/"):
             return None
-        timeout_s = self.DIRECT_FILE_ID_TIMEOUT_S
+        timeout_s = self._direct_file_id_timeout_s(request)
         if self._should_skip_forward_timeout_storm(
             request,
             route="direct_file_id_get_file",
@@ -1503,8 +1541,9 @@ class NapCatMediaDownloader:
                 self._prefetched_forward_media[key] = matched
                 self._prefetched_forward_media_payloads[key] = matched_payload
                 return matched
-        timeout_s = (
-            self.FORWARD_TARGET_HTTP_TIMEOUT_S if materialize else self.FORWARD_CONTEXT_TIMEOUT_S
+        timeout_s = self._forward_context_timeout_s(
+            request,
+            materialize=materialize,
         )
         substep = "forward_context_materialize" if materialize else "forward_context_metadata"
         if self._should_skip_forward_timeout_storm(
@@ -1975,7 +2014,10 @@ class NapCatMediaDownloader:
                 file_name=file_name,
                 request=request,
             )
-        timeout_s = self.PUBLIC_TOKEN_ACTION_TIMEOUT_S
+        timeout_s = self._public_action_timeout_s(
+            normalized_action,
+            request=request,
+        )
         if self._should_skip_forward_timeout_storm(
             request,
             route=f"public_token_{normalized_action}",
@@ -4024,6 +4066,220 @@ class NapCatMediaDownloader:
         if not self._should_share_missing_outcome(request):
             return None
         return "qq_expired_after_napcat"
+
+    def _classify_old_forward_expensive_missing(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+        require_timeout_signal: bool = False,
+    ) -> str | None:
+        if not self._is_very_old_forward_expensive_asset(request):
+            return None
+        if self._has_live_http_media_url(request, payload=payload):
+            return None
+        if self._has_direct_forward_file_identifier(request, payload=payload):
+            return None
+        if not self._has_stale_forward_local_media_hint(request, payload=payload):
+            return None
+        if require_timeout_signal and not self._has_old_forward_timeout_signal(request, payload=payload):
+            return None
+        return "qq_expired_after_napcat"
+
+    def _has_old_forward_timeout_signal(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        if self._forward_context_timed_out(request, materialize=False):
+            return True
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        action = "get_record" if asset_type == "speech" else "get_file"
+        if self._public_action_timed_out(request, action=action):
+            return True
+        return self._should_skip_forward_timeout_storm(
+            request,
+            route=f"public_token_{action}",
+        ) or self._should_skip_forward_timeout_storm(
+            request,
+            route="forward_context_materialize",
+        )
+
+    def _public_action_timeout_s(
+        self,
+        action: str,
+        *,
+        request: dict[str, Any] | None = None,
+    ) -> float:
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action in {"get_file", "get_record"} and self._is_very_old_forward_expensive_asset(request):
+            return float(self.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S)
+        return float(self.PUBLIC_TOKEN_ACTION_TIMEOUT_S)
+
+    def _direct_file_id_timeout_s(self, request: dict[str, Any] | None) -> float:
+        if self._is_very_old_forward_expensive_asset(request):
+            return float(self.OLD_FORWARD_EXPENSIVE_DIRECT_FILE_ID_TIMEOUT_S)
+        return float(self.DIRECT_FILE_ID_TIMEOUT_S)
+
+    def _forward_context_timeout_s(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        materialize: bool,
+    ) -> float:
+        if self._is_very_old_forward_expensive_asset(request):
+            return float(
+                self.OLD_FORWARD_EXPENSIVE_MATERIALIZE_TIMEOUT_S
+                if materialize
+                else self.OLD_FORWARD_EXPENSIVE_METADATA_TIMEOUT_S
+            )
+        return float(
+            self.FORWARD_TARGET_HTTP_TIMEOUT_S if materialize else self.FORWARD_CONTEXT_TIMEOUT_S
+        )
+
+    def _is_very_old_forward_expensive_asset(self, request: dict[str, Any] | None) -> bool:
+        if not isinstance(request, dict):
+            return False
+        hint = self._request_hint(request)
+        if not self._has_forward_parent_hint(hint):
+            return False
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type not in {"file", "video", "speech"}:
+            return False
+        asset_age = self._request_asset_age(request)
+        if asset_age is None:
+            return False
+        return asset_age >= timedelta(days=self.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS)
+
+    def _has_live_http_media_url(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        for value in self._iter_request_media_locations(request, payload=payload):
+            resolved_url = self._resolve_remote_url(value)
+            if not resolved_url:
+                continue
+            parsed = urlparse(resolved_url)
+            if parsed.scheme.lower() in {"http", "https"}:
+                return True
+        return False
+
+    def _has_direct_forward_file_identifier(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        hint = self._request_hint(request) if isinstance(request, dict) else {}
+        for value in (
+            hint.get("file_id"),
+            (payload or {}).get("file_id") if isinstance(payload, dict) else None,
+        ):
+            candidate = str(value or "").strip()
+            if candidate:
+                return True
+        return False
+
+    def _has_stale_forward_local_media_hint(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        for value in self._iter_request_media_locations(request, payload=payload):
+            if self._looks_like_stale_local_media_path(value):
+                return True
+        return False
+
+    def _iter_request_media_locations(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[str, ...]:
+        values: list[str] = []
+        if isinstance(request, dict):
+            values.extend([str(request.get("source_path") or "").strip()])
+            hint = self._request_hint(request)
+            values.extend(
+                [
+                    str(hint.get("url") or "").strip(),
+                    str(hint.get("remote_url") or "").strip(),
+                    str(hint.get("file") or "").strip(),
+                    str(hint.get("path") or "").strip(),
+                ]
+            )
+        if isinstance(payload, dict):
+            values.extend(
+                [
+                    str(payload.get("file") or "").strip(),
+                    str(payload.get("url") or "").strip(),
+                    str(payload.get("remote_url") or "").strip(),
+                    str(payload.get("path") or "").strip(),
+                ]
+            )
+        return tuple(value for value in values if value)
+
+    @staticmethod
+    def _looks_like_stale_local_media_path(value: object) -> bool:
+        candidate = str(value or "").strip()
+        if not candidate:
+            return False
+        if candidate.lower().startswith("file://"):
+            candidate = candidate[7:]
+        if not (re.match(r"^[a-zA-Z]:[\\/]", candidate) or candidate.startswith("\\\\")):
+            return False
+        return not Path(candidate).exists()
+
+    def _public_action_timed_out(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        action: str,
+    ) -> bool:
+        request_timeout_scope_key = self._request_scoped_public_action_timeout_key(
+            request,
+            action=action,
+        )
+        return (
+            request_timeout_scope_key is not None
+            and request_timeout_scope_key in self._request_scoped_public_action_timeout_cache
+        )
+
+    def _forward_context_timed_out(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        materialize: bool,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        timeout_cache_key = self._forward_context_timeout_key(
+            request,
+            materialize=materialize,
+        )
+        return (
+            timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_timeout_cache
+        )
+
+    @staticmethod
+    def _request_asset_age(request: dict[str, Any] | None) -> timedelta | None:
+        if not isinstance(request, dict):
+            return None
+        raw_timestamp = request.get("timestamp_ms")
+        if not isinstance(raw_timestamp, (int, float)):
+            return None
+        try:
+            asset_dt = datetime.fromtimestamp(float(raw_timestamp) / 1000.0, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return datetime.now(timezone.utc) - asset_dt
 
     def _classify_image_local_placeholder_missing(
         self,
