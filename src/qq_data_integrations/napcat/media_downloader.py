@@ -835,7 +835,7 @@ class NapCatMediaDownloader:
                 fast_resolved = self._resolve_from_fast_payload(forward_payload)
                 if fast_resolved != (None, None):
                     return self._remember_shared_outcome(shared_key, request, fast_resolved)
-            if asset_type in {"video", "file"}:
+            if asset_type in {"video", "file", "speech"}:
                 targeted_forward_download = self._download_via_forward_context(
                     request,
                     materialize=True,
@@ -3918,7 +3918,7 @@ class NapCatMediaDownloader:
         if not materialize:
             return ("metadata", *key)
         asset_type = str(request.get("asset_type") or "").strip()
-        if asset_type in {"file", "video"}:
+        if asset_type in {"file", "video", "speech"}:
             return ("materialize", *key)
         return (
             "materialize",
@@ -3936,12 +3936,14 @@ class NapCatMediaDownloader:
         if not isinstance(request, dict):
             return None
         asset_type = str(request.get("asset_type") or "").strip()
-        if asset_type not in {"file", "video"}:
+        if asset_type not in {"file", "video", "speech"}:
             return None
         hint = NapCatMediaDownloader._request_hint(request)
         if not NapCatMediaDownloader._has_forward_parent_hint(hint):
             return None
-        if action != "get_file":
+        if asset_type in {"file", "video"} and action != "get_file":
+            return None
+        if asset_type == "speech" and action != "get_record":
             return None
         parent = hint.get("_forward_parent")
         assert isinstance(parent, dict)

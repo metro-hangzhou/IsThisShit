@@ -992,9 +992,11 @@ def _normalize_onebot_segments(
                     token=token,
                     file_name=file_name,
                     path=data.get("path"),
+                    md5=_infer_md5(data.get("md5"), data.get("file"), file_name),
                     extra={
                         "url": data.get("url"),
                         "file_id": data.get("file_id"),
+                        "file_biz_id": data.get("file_biz_id") or data.get("fileBizId"),
                         "message_id_raw": parent_message_id_raw,
                         "element_id": parent_forward_element_id,
                         "peer_uid": parent_peer_uid,
@@ -1194,16 +1196,24 @@ def _normalize_onebot_segments(
             summary = _safe_summary(data.get("summary")) or "sticker"
             emoji_id = str(data.get("emoji_id") or "")
             package_id = data.get("emoji_package_id")
+            remote_url, remote_file_name = _build_marketface_remote(emoji_id)
             token = f"[sticker:summary={summary},emoji_id={emoji_id},package_id={package_id}]"
             emoji_tokens.append(token)
             segments.append(
                 NormalizedSegment(
                     type="sticker",
                     token=token,
+                    path=data.get("path") or data.get("file"),
                     emoji_id=emoji_id,
                     emoji_package_id=package_id,
                     summary=summary,
-                    extra={"key": data.get("key")},
+                    extra={
+                        "key": data.get("key"),
+                        "static_path": data.get("static_path"),
+                        "dynamic_path": data.get("dynamic_path"),
+                        "remote_url": data.get("remote_url") or remote_url,
+                        "remote_file_name": data.get("remote_file_name") or remote_file_name,
+                    },
                 )
             )
             content_parts.append(token)

@@ -27,6 +27,15 @@ class _TimeoutPublicFileClient:
         raise NapCatApiTimeoutError("NapCat action timed out: get_file")
 
 
+class _TimeoutPublicRecordClient:
+    def __init__(self) -> None:
+        self.get_record_calls = 0
+
+    def get_record(self, *args, **kwargs):
+        self.get_record_calls += 1
+        raise NapCatApiTimeoutError("NapCat action timed out: get_record")
+
+
 class _MissingDirectFileClient:
     def __init__(self) -> None:
         self.get_file_calls = 0
@@ -196,6 +205,12 @@ def _build_forward_request(file_name: str) -> dict[str, object]:
 def _build_forward_video_request(file_name: str) -> dict[str, object]:
     request = _build_forward_request(file_name)
     request["asset_type"] = "video"
+    return request
+
+
+def _build_forward_speech_request(file_name: str) -> dict[str, object]:
+    request = _build_forward_request(file_name)
+    request["asset_type"] = "speech"
     return request
 
 
@@ -426,6 +441,44 @@ def test_forward_video_public_token_timeout_skips_later_retry_for_sibling_assets
     assert first is None
     assert second is None
     assert client.get_file_calls == 1
+
+
+def test_forward_speech_materialize_timeout_skips_later_retry_for_sibling_assets() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    first = downloader._download_via_forward_context(
+        _build_forward_speech_request("slow-forward-audio-a.amr"),
+        materialize=True,
+    )
+    second = downloader._download_via_forward_context(
+        _build_forward_speech_request("slow-forward-audio-b.amr"),
+        materialize=True,
+    )
+
+    assert first is None
+    assert second is None
+    assert len(fast_client.calls) == 1
+
+
+def test_forward_speech_public_token_timeout_skips_later_retry_for_sibling_assets() -> None:
+    client = _TimeoutPublicRecordClient()
+    downloader = NapCatMediaDownloader(client)
+
+    first = downloader._call_public_action_with_token(
+        "get_record",
+        "first-token",
+        request=_build_forward_speech_request("slow-forward-audio-a.amr"),
+    )
+    second = downloader._call_public_action_with_token(
+        "get_record",
+        "second-token",
+        request=_build_forward_speech_request("slow-forward-audio-b.amr"),
+    )
+
+    assert first is None
+    assert second is None
+    assert client.get_record_calls == 1
 
 
 def test_prefetched_forward_remote_payload_is_used_before_metadata_requery() -> None:
