@@ -214,6 +214,12 @@ def _build_forward_speech_request(file_name: str) -> dict[str, object]:
     return request
 
 
+def _mark_request_old(request: dict[str, object], *, days: int = 90) -> dict[str, object]:
+    updated = dict(request)
+    updated["timestamp_ms"] = int((time.time() - (days * 24 * 60 * 60)) * 1000)
+    return updated
+
+
 def _build_context_hint_request(file_name: str) -> dict[str, object]:
     return {
         "asset_type": "image",
@@ -479,6 +485,106 @@ def test_forward_speech_public_token_timeout_skips_later_retry_for_sibling_asset
     assert first is None
     assert second is None
     assert client.get_record_calls == 1
+
+
+def test_forward_video_public_token_timeout_breaker_skips_distinct_old_parents_after_limit() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+
+    for index in range(downloader.FORWARD_TIMEOUT_STORM_LIMIT):
+        request = _mark_request_old(
+            _build_forward_video_request(f"storm-video-{index}.mp4"),
+            days=90,
+        )
+        parent = request["download_hint"]["_forward_parent"]  # type: ignore[index]
+        parent["message_id_raw"] = f"7618{index:012d}"  # type: ignore[index]
+        parent["element_id"] = f"7618{index:012d}"  # type: ignore[index]
+        assert downloader._call_public_action_with_token(
+            "get_file",
+            f"storm-token-{index}",
+            request=request,
+        ) is None
+
+    skipped_request = _mark_request_old(
+        _build_forward_video_request("storm-video-skip.mp4"),
+        days=90,
+    )
+    skipped_parent = skipped_request["download_hint"]["_forward_parent"]  # type: ignore[index]
+    skipped_parent["message_id_raw"] = "7618999999999999"  # type: ignore[index]
+    skipped_parent["element_id"] = "7618999999999999"  # type: ignore[index]
+    assert downloader._call_public_action_with_token(
+        "get_file",
+        "storm-token-skip",
+        request=skipped_request,
+    ) is None
+
+    assert client.get_file_calls == downloader.FORWARD_TIMEOUT_STORM_LIMIT
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
+
+
+def test_forward_video_materialize_timeout_breaker_skips_distinct_old_parents_after_limit() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    for index in range(downloader.FORWARD_TIMEOUT_STORM_LIMIT):
+        request = _mark_request_old(
+            _build_forward_video_request(f"storm-mat-{index}.mp4"),
+            days=90,
+        )
+        parent = request["download_hint"]["_forward_parent"]  # type: ignore[index]
+        parent["message_id_raw"] = f"7628{index:012d}"  # type: ignore[index]
+        parent["element_id"] = f"7628{index:012d}"  # type: ignore[index]
+        assert downloader._download_via_forward_context(
+            request,
+            materialize=True,
+        ) is None
+
+    skipped_request = _mark_request_old(
+        _build_forward_video_request("storm-mat-skip.mp4"),
+        days=90,
+    )
+    skipped_parent = skipped_request["download_hint"]["_forward_parent"]  # type: ignore[index]
+    skipped_parent["message_id_raw"] = "7628999999999999"  # type: ignore[index]
+    skipped_parent["element_id"] = "7628999999999999"  # type: ignore[index]
+    assert downloader._download_via_forward_context(
+        skipped_request,
+        materialize=True,
+    ) is None
+
+    assert len(fast_client.calls) == downloader.FORWARD_TIMEOUT_STORM_LIMIT
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
+
+
+def test_forward_video_direct_file_id_timeout_breaker_skips_distinct_old_parents_after_limit() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+
+    for index in range(downloader.FORWARD_TIMEOUT_STORM_LIMIT):
+        request = _mark_request_old(
+            _build_forward_video_request(f"storm-direct-{index}.mp4"),
+            days=90,
+        )
+        request["download_hint"]["file_id"] = f"/storm/{index}"  # type: ignore[index]
+        parent = request["download_hint"]["_forward_parent"]  # type: ignore[index]
+        parent["message_id_raw"] = f"7638{index:012d}"  # type: ignore[index]
+        parent["element_id"] = f"7638{index:012d}"  # type: ignore[index]
+        assert downloader._resolve_via_direct_file_id(request) is None
+
+    skipped_request = _mark_request_old(
+        _build_forward_video_request("storm-direct-skip.mp4"),
+        days=90,
+    )
+    skipped_request["download_hint"]["file_id"] = "/storm/skip"  # type: ignore[index]
+    skipped_parent = skipped_request["download_hint"]["_forward_parent"]  # type: ignore[index]
+    skipped_parent["message_id_raw"] = "7638999999999999"  # type: ignore[index]
+    skipped_parent["element_id"] = "7638999999999999"  # type: ignore[index]
+    assert downloader._resolve_via_direct_file_id(skipped_request) is None
+
+    assert client.get_file_calls == downloader.FORWARD_TIMEOUT_STORM_LIMIT
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
 
 
 def test_prefetched_forward_remote_payload_is_used_before_metadata_requery() -> None:

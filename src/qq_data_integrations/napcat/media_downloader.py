@@ -33,6 +33,8 @@ class NapCatMediaDownloader:
     OLD_CONTEXT_BUCKET_MIN_AGE_DAYS = 120
     OLD_CONTEXT_BUCKET_FAILURE_LIMIT = 5
     SHARED_MISS_CACHE_MIN_AGE_DAYS = 30
+    FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS = 45
+    FORWARD_TIMEOUT_STORM_LIMIT = 6
     PREFETCH_BATCH_SIZE = 200
     PREFETCH_LARGE_REQUEST_THRESHOLD = 1000
     PREFETCH_LARGE_BATCH_SIZE = 50
@@ -77,6 +79,8 @@ class NapCatMediaDownloader:
         self._forward_context_error_cache: set[tuple[str, ...]] = set()
         self._forward_context_payload_cache: dict[tuple[str, ...], dict[str, Any]] = {}
         self._request_scoped_public_action_timeout_cache: set[tuple[str, ...]] = set()
+        self._forward_timeout_storm_counts: dict[tuple[str, ...], int] = {}
+        self._forward_timeout_storm_open: set[tuple[str, ...]] = set()
         self._remote_cache_root = remote_cache_dir
         self._remote_process_cache_dir = (
             remote_cache_dir / f"pid_{os.getpid()}"
@@ -229,6 +233,8 @@ class NapCatMediaDownloader:
             self._forward_context_error_cache.clear()
             self._forward_context_payload_cache.clear()
             self._request_scoped_public_action_timeout_cache.clear()
+            self._forward_timeout_storm_counts.clear()
+            self._forward_timeout_storm_open.clear()
             self._image_placeholder_missing_cache.clear()
         with self._download_progress_lock:
             self._download_progress = self._new_download_progress_state()
@@ -259,6 +265,7 @@ class NapCatMediaDownloader:
             "forward_context_timeout_count": 0,
             "forward_context_empty_count": 0,
             "forward_context_error_count": 0,
+            "forward_timeout_storm_skip_count": 0,
             "last_asset_type": None,
             "last_file_name": None,
             "last_status": None,
@@ -1130,6 +1137,10 @@ class NapCatMediaDownloader:
                 self._download_progress["forward_context_error_count"] = (
                     int(self._download_progress.get("forward_context_error_count") or 0) + 1
                 )
+            elif normalized_status == "storm_skip":
+                self._download_progress["forward_timeout_storm_skip_count"] = (
+                    int(self._download_progress.get("forward_timeout_storm_skip_count") or 0) + 1
+                )
 
     def _resolve_via_context_only(
         self,
@@ -1269,6 +1280,25 @@ class NapCatMediaDownloader:
         if not file_id or not file_id.startswith("/"):
             return None
         timeout_s = self.DIRECT_FILE_ID_TIMEOUT_S
+        if self._should_skip_forward_timeout_storm(
+            request,
+            route="direct_file_id_get_file",
+        ):
+            self._emit_asset_substep_trace(
+                trace_callback,
+                request,
+                stage="done",
+                substep="direct_file_id_get_file",
+                timeout_s=timeout_s,
+                status="storm_skip",
+                elapsed_s=0.0,
+                detail="skipped old forward route after repeated timeouts",
+            )
+            self._note_remote_substep_progress(
+                substep="direct_file_id_get_file",
+                status="storm_skip",
+            )
+            return None
         self._emit_asset_substep_trace(
             trace_callback,
             request,
@@ -1302,6 +1332,10 @@ class NapCatMediaDownloader:
                 elapsed_s=elapsed_s,
                 detail=str(exc),
             )
+            self._note_forward_timeout_storm(
+                request,
+                route="direct_file_id_get_file",
+            )
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
@@ -1328,6 +1362,10 @@ class NapCatMediaDownloader:
                         classification="qq_expired_after_napcat",
                     )
                 return None, "qq_expired_after_napcat"
+            self._note_forward_timeout_storm_success(
+                request,
+                route="direct_file_id_get_file",
+            )
             return None
         elapsed_s = monotonic() - started
         self._emit_asset_substep_trace(
@@ -1345,6 +1383,10 @@ class NapCatMediaDownloader:
             status="ok",
             timeout_s=timeout_s,
             elapsed_s=elapsed_s,
+        )
+        self._note_forward_timeout_storm_success(
+            request,
+            route="direct_file_id_get_file",
         )
         resolved = self._resolved_path_from_payload(payload if isinstance(payload, dict) else None)
         if resolved is not None:
@@ -1463,6 +1505,24 @@ class NapCatMediaDownloader:
             self.FORWARD_TARGET_HTTP_TIMEOUT_S if materialize else self.FORWARD_CONTEXT_TIMEOUT_S
         )
         substep = "forward_context_materialize" if materialize else "forward_context_metadata"
+        if self._should_skip_forward_timeout_storm(
+            request,
+            route=substep,
+        ):
+            self._emit_asset_substep_trace(
+                trace_callback,
+                request,
+                stage="done",
+                substep=substep,
+                timeout_s=timeout_s,
+                status="storm_skip",
+                elapsed_s=0.0,
+                detail="skipped old forward route after repeated timeouts",
+            )
+            self._note_remote_substep_progress(substep=substep, status="storm_skip")
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return None
         self._emit_asset_substep_trace(
             trace_callback,
             request,
@@ -1533,6 +1593,10 @@ class NapCatMediaDownloader:
             if timeout_cache_key is not None:
                 self._forward_context_timeout_cache.add(timeout_cache_key)
                 self._forward_context_payload_cache.pop(timeout_cache_key, None)
+            self._note_forward_timeout_storm(
+                request,
+                route=substep,
+            )
             self._prefetched_forward_media[key] = (None, None)
             self._prefetched_forward_media_payloads[key] = None
             return None
@@ -1570,6 +1634,10 @@ class NapCatMediaDownloader:
             status="ok",
             timeout_s=timeout_s,
             elapsed_s=elapsed_s,
+        )
+        self._note_forward_timeout_storm_success(
+            request,
+            route=substep,
         )
         if timeout_cache_key is not None:
             self._forward_context_timeout_cache.discard(timeout_cache_key)
@@ -1884,6 +1952,26 @@ class NapCatMediaDownloader:
                 request=request,
             )
         timeout_s = self.PUBLIC_TOKEN_ACTION_TIMEOUT_S
+        if self._should_skip_forward_timeout_storm(
+            request,
+            route=f"public_token_{normalized_action}",
+        ):
+            if request is not None:
+                self._emit_asset_substep_trace(
+                    trace_callback,
+                    request,
+                    stage="done",
+                    substep=f"public_token_{normalized_action}",
+                    timeout_s=timeout_s,
+                    status="storm_skip",
+                    elapsed_s=0.0,
+                    detail="skipped old forward route after repeated timeouts",
+                )
+                self._note_remote_substep_progress(
+                    substep=f"public_token_{normalized_action}",
+                    status="storm_skip",
+                )
+            return None
         cache_key = (normalized_action, token)
 
         primary_substep = f"public_token_{normalized_action}"
@@ -1947,6 +2035,10 @@ class NapCatMediaDownloader:
             if request_timeout_scope_key is not None:
                 self._request_scoped_public_action_timeout_cache.add(request_timeout_scope_key)
             self._public_token_action_outcomes[cache_key] = None
+            self._note_forward_timeout_storm(
+                request,
+                route=primary_substep,
+            )
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
@@ -2078,8 +2170,16 @@ class NapCatMediaDownloader:
                     request=request,
                 )
                 self._public_token_action_outcomes[cache_key] = payload
+                self._note_forward_timeout_storm_success(
+                    request,
+                    route=primary_substep,
+                )
                 return payload
             self._public_token_action_outcomes[cache_key] = None
+            self._note_forward_timeout_storm_success(
+                request,
+                route=primary_substep,
+            )
             return None
         elapsed_s = monotonic() - started
         if request is not None:
@@ -2107,6 +2207,10 @@ class NapCatMediaDownloader:
             request=request,
         )
         self._public_token_action_outcomes[cache_key] = payload
+        self._note_forward_timeout_storm_success(
+            request,
+            route=primary_substep,
+        )
         return payload
 
     @staticmethod
@@ -3787,6 +3891,75 @@ class NapCatMediaDownloader:
         if not any([file_name, file_size, file_id, token]):
             return None
         return "qq_expired_after_napcat"
+
+    def _should_skip_forward_timeout_storm(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> bool:
+        storm_key = self._forward_timeout_storm_key(request, route=route)
+        if storm_key is None:
+            return False
+        return storm_key in self._forward_timeout_storm_open
+
+    def _note_forward_timeout_storm(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> None:
+        storm_key = self._forward_timeout_storm_key(request, route=route)
+        if storm_key is None:
+            return
+        failures = self._forward_timeout_storm_counts.get(storm_key, 0) + 1
+        self._forward_timeout_storm_counts[storm_key] = failures
+        if failures >= self.FORWARD_TIMEOUT_STORM_LIMIT:
+            self._forward_timeout_storm_open.add(storm_key)
+
+    def _note_forward_timeout_storm_success(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> None:
+        storm_key = self._forward_timeout_storm_key(request, route=route)
+        if storm_key is None:
+            return
+        self._forward_timeout_storm_counts.pop(storm_key, None)
+        self._forward_timeout_storm_open.discard(storm_key)
+
+    def _forward_timeout_storm_key(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> tuple[str, ...] | None:
+        if not isinstance(request, dict):
+            return None
+        hint = self._request_hint(request)
+        if not self._has_forward_parent_hint(hint):
+            return None
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type not in {"file", "video", "speech"}:
+            return None
+        raw_timestamp = request.get("timestamp_ms")
+        if not isinstance(raw_timestamp, (int, float)):
+            return None
+        try:
+            asset_dt = datetime.fromtimestamp(float(raw_timestamp) / 1000.0, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        if datetime.now(timezone.utc) - asset_dt < timedelta(days=self.FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS):
+            return None
+        month_bucket = asset_dt.strftime("%Y-%m")
+        return (
+            "forward_timeout_storm",
+            str(route or "").strip().lower(),
+            asset_type,
+            str(request.get("asset_role") or "").strip().lower(),
+            month_bucket,
+        )
 
     def _classify_forward_missing(self, request: dict[str, Any]) -> str | None:
         if str(request.get("asset_type") or "").strip() != "image":

@@ -1136,7 +1136,7 @@ class SlashRepl:
 
         if phase == "materialize_asset_substep" and str(update.get("stage") or "") == "done":
             status = str(update.get("status") or "")
-            if status not in {"timeout", "unavailable"}:
+            if status not in {"timeout", "unavailable", "storm_skip"}:
                 return None
             substep = str(update.get("substep") or "-")
             asset_type = str(update.get("asset_type") or "-")
@@ -1144,13 +1144,14 @@ class SlashRepl:
             timeout_s = float(update.get("timeout_s") or 0.0)
             elapsed = float(update.get("elapsed_s") or 0.0)
             detail = (
-                f"status=failed {prefix}export_progress: asset substep {status} substep={substep} "
+                f"status=in progress {prefix}export_progress: asset substep {status} substep={substep} "
                 f"asset={asset_type}:{file_name}"
             )
             if timeout_s > 0:
                 detail += f" timeout={timeout_s:.1f}s"
             if elapsed > 0:
                 detail += f" elapsed={elapsed:.1f}s"
+            detail += " continuing=1"
             return detail
         return None
 
@@ -1174,6 +1175,7 @@ class SlashRepl:
         forward_context_timeouts = int(update.get("forward_context_timeout_count") or 0)
         forward_context_empty = int(update.get("forward_context_empty_count") or 0)
         forward_context_errors = int(update.get("forward_context_error_count") or 0)
+        forward_timeout_storm_skips = int(update.get("forward_timeout_storm_skip_count") or 0)
         last_asset_type = str(update.get("last_asset_type") or "").strip()
         last_file_name = str(update.get("last_file_name") or "").strip()
         last_status = str(update.get("last_status") or "").strip()
@@ -1208,6 +1210,8 @@ class SlashRepl:
             diag_parts.append(f"forward_meta_empty={forward_context_empty}")
         if forward_context_errors > 0:
             diag_parts.append(f"forward_meta_error={forward_context_errors}")
+        if forward_timeout_storm_skips > 0:
+            diag_parts.append(f"forward_timeout_breaker={forward_timeout_storm_skips}")
         if diag_parts:
             parts.append("diag=" + ",".join(diag_parts))
         return " ".join(parts)

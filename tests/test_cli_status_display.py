@@ -274,3 +274,89 @@ def test_repl_export_progress_routes_prefetch_prepare_phase() -> None:
         "status=success export_progress: planned media prefetch "
         "scanned=3150/3150 context=1180 local=64 skip_old=1906 rate=150.0/s elapsed=21.0s"
     )
+
+
+def test_cli_export_progress_keeps_asset_substep_timeout_as_in_progress_warning() -> None:
+    rendered = _format_cli_export_progress(
+        {
+            "phase": "materialize_asset_substep",
+            "stage": "done",
+            "status": "timeout",
+            "substep": "public_token_get_file",
+            "asset_type": "video",
+            "file_name": "bad.mp4",
+            "timeout_s": 12.0,
+            "elapsed_s": 12.0,
+        }
+    )
+
+    assert rendered == (
+        "status=in progress export_progress: asset substep timeout "
+        "substep=public_token_get_file asset=video:bad.mp4 "
+        "timeout=12.0s elapsed=12.0s continuing=1"
+    )
+
+
+def test_repl_export_progress_keeps_asset_substep_timeout_as_in_progress_warning() -> None:
+    repl = SlashRepl()
+
+    rendered = repl._format_root_export_progress(
+        {
+            "phase": "materialize_asset_substep",
+            "stage": "done",
+            "status": "timeout",
+            "substep": "public_token_get_file",
+            "asset_type": "video",
+            "file_name": "bad.mp4",
+            "timeout_s": 12.0,
+            "elapsed_s": 12.0,
+        },
+        prefix="",
+    )
+
+    assert rendered == (
+        "status=in progress export_progress: asset substep timeout "
+        "substep=public_token_get_file asset=video:bad.mp4 "
+        "timeout=12.0s elapsed=12.0s continuing=1"
+    )
+
+
+def test_cli_export_progress_surfaces_forward_timeout_breaker_diag() -> None:
+    rendered = _format_cli_export_progress(
+        {
+            "stage": "progress",
+            "candidate_total": 20,
+            "completed": 3,
+            "failed": 2,
+            "cached": 1,
+            "queued": 0,
+            "active": 0,
+            "timeout_count": 7,
+            "forward_timeout_storm_skip_count": 4,
+            "phase": "download_assets",
+        }
+    )
+
+    assert rendered is not None
+    assert "diag=timeouts=7,forward_timeout_breaker=4" in rendered
+
+
+def test_cli_export_progress_keeps_asset_substep_storm_skip_as_in_progress_warning() -> None:
+    rendered = _format_cli_export_progress(
+        {
+            "phase": "materialize_asset_substep",
+            "stage": "done",
+            "status": "storm_skip",
+            "substep": "public_token_get_file",
+            "asset_type": "video",
+            "file_name": "bad.mp4",
+            "timeout_s": 12.0,
+            "elapsed_s": 0.0,
+        }
+    )
+
+    assert rendered == (
+        "status=in progress export_progress: asset substep storm_skip "
+        "substep=public_token_get_file asset=video:bad.mp4 "
+        "timeout=12.0s continuing=1"
+    )
