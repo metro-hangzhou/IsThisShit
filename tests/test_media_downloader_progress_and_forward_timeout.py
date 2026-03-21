@@ -21,10 +21,23 @@ class _DummyClient:
 class _TimeoutPublicFileClient:
     def __init__(self) -> None:
         self.get_file_calls = 0
+        self.timeouts: list[float | None] = []
 
     def get_file(self, *args, **kwargs):
         self.get_file_calls += 1
+        self.timeouts.append(kwargs.get("timeout"))
         raise NapCatApiTimeoutError("NapCat action timed out: get_file")
+
+
+class _TimeoutPublicRecordClient:
+    def __init__(self) -> None:
+        self.get_record_calls = 0
+        self.timeouts: list[float | None] = []
+
+    def get_record(self, *args, **kwargs):
+        self.get_record_calls += 1
+        self.timeouts.append(kwargs.get("timeout"))
+        raise NapCatApiTimeoutError("NapCat action timed out: get_record")
 
 
 class _MissingDirectFileClient:
@@ -34,6 +47,15 @@ class _MissingDirectFileClient:
     def get_file(self, *args, **kwargs):
         self.get_file_calls += 1
         raise NapCatApiError("file not found")
+
+
+class _BlankPublicFileClient:
+    def __init__(self) -> None:
+        self.get_file_calls = 0
+
+    def get_file(self, *args, **kwargs):
+        self.get_file_calls += 1
+        return {"file": "", "url": ""}
 
 
 class _RemoteMediaDownloader(NapCatMediaDownloader):
@@ -167,6 +189,70 @@ class _SuccessForwardClient:
         }
 
 
+class _SlowMismatchedForwardClient:
+    def __init__(self, delay_s: float = 0.02) -> None:
+        self.delay_s = delay_s
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        time.sleep(self.delay_s)
+        return {
+            "targeted_mode": "single_target_download",
+            "assets": [
+                {
+                    "asset_type": "video",
+                    "asset_role": "forward_media",
+                    "file_name": "not-the-requested-video.mp4",
+                    "file": str(Path(__file__).resolve()),
+                }
+            ],
+        }
+
+
+class _RecordingForwardClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"assets": []}
+
+
+class _OldForwardMetadataTimeoutClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            raise AssertionError("targeted materialize should be skipped for stale old forward video")
+        raise NapCatFastHistoryTimeoutError("timed out")
+
+
+class _OldForwardTokenOnlyClient:
+    def __init__(self, stale_url: str) -> None:
+        self.stale_url = stale_url
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            raise AssertionError("targeted materialize should be skipped after old forward token timeout")
+        return {
+            "assets": [
+                {
+                    "asset_type": "video",
+                    "asset_role": "forward_media",
+                    "file_name": "old-forward-timeout.mp4",
+                    "url": self.stale_url,
+                    "public_action": "get_file",
+                    "public_file_token": "old-forward-timeout-token",
+                }
+            ]
+        }
+
+
 def _build_forward_request(file_name: str) -> dict[str, object]:
     return {
         "asset_type": "image",
@@ -188,6 +274,46 @@ def _build_forward_video_request(file_name: str) -> dict[str, object]:
     request = _build_forward_request(file_name)
     request["asset_type"] = "video"
     return request
+
+
+def _build_forward_speech_request(file_name: str) -> dict[str, object]:
+    request = _build_forward_request(file_name)
+    request["asset_type"] = "speech"
+    return request
+
+
+def _mark_request_old(request: dict[str, object], *, days: int = 90) -> dict[str, object]:
+    updated = dict(request)
+    updated["timestamp_ms"] = int((time.time() - (days * 24 * 60 * 60)) * 1000)
+    return updated
+
+
+def _set_forward_parent_identity(
+    request: dict[str, object],
+    *,
+    message_id_raw: str,
+    element_id: str,
+) -> dict[str, object]:
+    updated = dict(request)
+    hint = dict(updated.get("download_hint") or {})
+    parent = dict(hint.get("_forward_parent") or {})
+    parent["message_id_raw"] = message_id_raw
+    parent["element_id"] = element_id
+    hint["_forward_parent"] = parent
+    updated["download_hint"] = hint
+    return updated
+
+
+def _set_forward_stale_local_path(
+    request: dict[str, object],
+    path: str,
+) -> dict[str, object]:
+    updated = dict(request)
+    hint = dict(updated.get("download_hint") or {})
+    hint["url"] = path
+    updated["download_hint"] = hint
+    updated["source_path"] = path
+    return updated
 
 
 def _build_context_hint_request(file_name: str) -> dict[str, object]:
@@ -379,6 +505,312 @@ def test_forward_video_public_token_timeout_skips_later_retry_even_with_new_toke
     assert first is None
     assert second is None
     assert client.get_file_calls == 1
+
+
+def test_forward_video_materialize_timeout_skips_later_retry_for_sibling_assets() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    first = downloader._download_via_forward_context(
+        _build_forward_video_request("slow-forward-video-a.mp4"),
+        materialize=True,
+    )
+    second = downloader._download_via_forward_context(
+        _build_forward_video_request("slow-forward-video-b.mp4"),
+        materialize=True,
+    )
+
+    assert first is None
+    assert second is None
+    assert len(fast_client.calls) == 1
+
+
+def test_forward_video_public_token_timeout_skips_later_retry_for_sibling_assets() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+
+    first = downloader._call_public_action_with_token(
+        "get_file",
+        "first-token",
+        request=_build_forward_video_request("slow-forward-video-a.mp4"),
+    )
+    second = downloader._call_public_action_with_token(
+        "get_file",
+        "second-token",
+        request=_build_forward_video_request("slow-forward-video-b.mp4"),
+    )
+
+    assert first is None
+    assert second is None
+    assert client.get_file_calls == 1
+
+
+def test_forward_speech_materialize_timeout_skips_later_retry_for_sibling_assets() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    first = downloader._download_via_forward_context(
+        _build_forward_speech_request("slow-forward-audio-a.amr"),
+        materialize=True,
+    )
+    second = downloader._download_via_forward_context(
+        _build_forward_speech_request("slow-forward-audio-b.amr"),
+        materialize=True,
+    )
+
+    assert first is None
+    assert second is None
+    assert len(fast_client.calls) == 1
+
+
+def test_forward_speech_public_token_timeout_skips_later_retry_for_sibling_assets() -> None:
+    client = _TimeoutPublicRecordClient()
+    downloader = NapCatMediaDownloader(client)
+
+    first = downloader._call_public_action_with_token(
+        "get_record",
+        "first-token",
+        request=_build_forward_speech_request("slow-forward-audio-a.amr"),
+    )
+    second = downloader._call_public_action_with_token(
+        "get_record",
+        "second-token",
+        request=_build_forward_speech_request("slow-forward-audio-b.amr"),
+    )
+
+    assert first is None
+    assert second is None
+    assert client.get_record_calls == 1
+
+
+def test_old_forward_video_uses_shorter_public_token_timeout() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-timeout.mp4"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-timeout.mp4",
+    )
+
+    assert downloader._call_public_action_with_token(
+        "get_file",
+        "old-forward-timeout-token",
+        request=request,
+    ) is None
+
+    assert client.get_file_calls == 1
+    assert client.timeouts == [downloader.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S]
+
+
+def test_old_forward_video_uses_shorter_forward_context_timeouts() -> None:
+    fast_client = _RecordingForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-context.mp4"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-context.mp4",
+    )
+
+    assert downloader._download_via_forward_context(request, materialize=False) is None
+    assert downloader._download_via_forward_context(request, materialize=True) is None
+
+    assert [call.get("timeout") for call in fast_client.calls] == [
+        downloader.OLD_FORWARD_EXPENSIVE_METADATA_TIMEOUT_S,
+        downloader.OLD_FORWARD_EXPENSIVE_MATERIALIZE_TIMEOUT_S,
+    ]
+
+
+def test_old_forward_video_metadata_timeout_is_classified_before_targeted_materialize() -> None:
+    fast_client = _OldForwardMetadataTimeoutClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-metadata-timeout.mp4"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-metadata-timeout.mp4",
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert len(fast_client.calls) == 1
+    assert fast_client.calls[0].get("materialize") is False
+
+
+def test_old_forward_video_public_token_timeout_is_classified_before_targeted_materialize() -> None:
+    stale_url = r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-timeout.mp4"
+    fast_client = _OldForwardTokenOnlyClient(stale_url)
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client, fast_client=fast_client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-timeout.mp4"), days=240),
+        stale_url,
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert client.get_file_calls == 1
+    assert client.timeouts == [downloader.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S]
+    assert len(fast_client.calls) == 1
+    assert fast_client.calls[0].get("materialize") is False
+
+
+def test_forward_video_public_token_timeout_breaker_skips_distinct_old_parents_after_limit() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+
+    for index in range(downloader.FORWARD_TIMEOUT_STORM_LIMIT):
+        request = _mark_request_old(
+            _build_forward_video_request(f"storm-video-{index}.mp4"),
+            days=90,
+        )
+        parent = request["download_hint"]["_forward_parent"]  # type: ignore[index]
+        parent["message_id_raw"] = f"7618{index:012d}"  # type: ignore[index]
+        parent["element_id"] = f"7618{index:012d}"  # type: ignore[index]
+        assert downloader._call_public_action_with_token(
+            "get_file",
+            f"storm-token-{index}",
+            request=request,
+        ) is None
+
+    skipped_request = _mark_request_old(
+        _build_forward_video_request("storm-video-skip.mp4"),
+        days=90,
+    )
+    skipped_parent = skipped_request["download_hint"]["_forward_parent"]  # type: ignore[index]
+    skipped_parent["message_id_raw"] = "7618999999999999"  # type: ignore[index]
+    skipped_parent["element_id"] = "7618999999999999"  # type: ignore[index]
+    assert downloader._call_public_action_with_token(
+        "get_file",
+        "storm-token-skip",
+        request=skipped_request,
+    ) is None
+
+    assert client.get_file_calls == downloader.FORWARD_TIMEOUT_STORM_LIMIT
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
+
+
+def test_forward_video_materialize_timeout_breaker_skips_distinct_old_parents_after_limit() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+
+    for index in range(downloader.FORWARD_TIMEOUT_STORM_LIMIT):
+        request = _mark_request_old(
+            _build_forward_video_request(f"storm-mat-{index}.mp4"),
+            days=90,
+        )
+        parent = request["download_hint"]["_forward_parent"]  # type: ignore[index]
+        parent["message_id_raw"] = f"7628{index:012d}"  # type: ignore[index]
+        parent["element_id"] = f"7628{index:012d}"  # type: ignore[index]
+        assert downloader._download_via_forward_context(
+            request,
+            materialize=True,
+        ) is None
+
+    skipped_request = _mark_request_old(
+        _build_forward_video_request("storm-mat-skip.mp4"),
+        days=90,
+    )
+    skipped_parent = skipped_request["download_hint"]["_forward_parent"]  # type: ignore[index]
+    skipped_parent["message_id_raw"] = "7628999999999999"  # type: ignore[index]
+    skipped_parent["element_id"] = "7628999999999999"  # type: ignore[index]
+    assert downloader._download_via_forward_context(
+        skipped_request,
+        materialize=True,
+    ) is None
+
+    assert len(fast_client.calls) == downloader.FORWARD_TIMEOUT_STORM_LIMIT
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
+
+
+def test_forward_video_direct_file_id_timeout_breaker_skips_distinct_old_parents_after_limit() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+
+    for index in range(downloader.FORWARD_TIMEOUT_STORM_LIMIT):
+        request = _mark_request_old(
+            _build_forward_video_request(f"storm-direct-{index}.mp4"),
+            days=90,
+        )
+        request["download_hint"]["file_id"] = f"/storm/{index}"  # type: ignore[index]
+        parent = request["download_hint"]["_forward_parent"]  # type: ignore[index]
+        parent["message_id_raw"] = f"7638{index:012d}"  # type: ignore[index]
+        parent["element_id"] = f"7638{index:012d}"  # type: ignore[index]
+        assert downloader._resolve_via_direct_file_id(request) is None
+
+    skipped_request = _mark_request_old(
+        _build_forward_video_request("storm-direct-skip.mp4"),
+        days=90,
+    )
+    skipped_request["download_hint"]["file_id"] = "/storm/skip"  # type: ignore[index]
+    skipped_parent = skipped_request["download_hint"]["_forward_parent"]  # type: ignore[index]
+    skipped_parent["message_id_raw"] = "7638999999999999"  # type: ignore[index]
+    skipped_parent["element_id"] = "7638999999999999"  # type: ignore[index]
+    assert downloader._resolve_via_direct_file_id(skipped_request) is None
+
+    assert client.get_file_calls == downloader.FORWARD_TIMEOUT_STORM_LIMIT
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
+
+
+def test_forward_video_public_token_timeout_breaker_groups_very_old_months_together() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    downloader.FORWARD_TIMEOUT_STORM_LIMIT = 2
+
+    first = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("old-1.mp4"), days=240),
+        message_id_raw="8618000000000001",
+        element_id="8618000000000001",
+    )
+    second = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("old-2.mp4"), days=300),
+        message_id_raw="8618000000000002",
+        element_id="8618000000000002",
+    )
+    third = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("old-3.mp4"), days=330),
+        message_id_raw="8618000000000003",
+        element_id="8618000000000003",
+    )
+
+    assert downloader._call_public_action_with_token("get_file", "old-token-1", request=first) is None
+    assert downloader._call_public_action_with_token("get_file", "old-token-2", request=second) is None
+    assert downloader._call_public_action_with_token("get_file", "old-token-3", request=third) is None
+
+    assert client.get_file_calls == 2
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
+
+
+def test_forward_video_materialize_slow_noop_contributes_to_breaker_for_very_old_assets() -> None:
+    fast_client = _SlowMismatchedForwardClient(delay_s=0.02)
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader.FORWARD_TIMEOUT_STORM_LIMIT = 2
+    downloader.FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S = 0.01
+
+    first = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("noop-1.mp4"), days=240),
+        message_id_raw="8718000000000001",
+        element_id="8718000000000001",
+    )
+    second = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("noop-2.mp4"), days=300),
+        message_id_raw="8718000000000002",
+        element_id="8718000000000002",
+    )
+    third = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("noop-3.mp4"), days=330),
+        message_id_raw="8718000000000003",
+        element_id="8718000000000003",
+    )
+
+    assert downloader._download_via_forward_context(first, materialize=True) in {None, (None, None)}
+    assert downloader._download_via_forward_context(second, materialize=True) in {None, (None, None)}
+    assert downloader._download_via_forward_context(third, materialize=True) in {None, (None, None)}
+
+    assert len(fast_client.calls) == 2
+    snapshot = downloader.export_download_progress_snapshot()
+    assert snapshot["forward_timeout_storm_skip_count"] == 1
 
 
 def test_prefetched_forward_remote_payload_is_used_before_metadata_requery() -> None:
@@ -783,6 +1215,52 @@ def test_resolve_via_direct_file_id_marks_old_file_not_found_as_background() -> 
     resolved = downloader._resolve_via_direct_file_id(request)
 
     assert resolved == (None, "qq_expired_after_napcat")
+
+
+def test_resolve_from_public_token_marks_old_video_blank_payload_as_background() -> None:
+    downloader = NapCatMediaDownloader(_BlankPublicFileClient())
+    request = {
+        "asset_type": "video",
+        "file_name": "old-video.mp4",
+        "timestamp_ms": 1757142395000,
+        "download_hint": {},
+    }
+
+    resolved = downloader._resolve_from_public_token(
+        {
+            "asset_type": "video",
+            "public_action": "get_file",
+            "public_file_token": "old-video-token",
+            "file_name": "old-video.mp4",
+        },
+        old_bucket=("video", "2025-09"),
+        request=request,
+    )
+
+    assert resolved == (None, "qq_expired_after_napcat")
+
+
+def test_classify_missing_from_public_payload_marks_old_video_with_stale_local_url_as_background() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+
+    classification = downloader._classify_missing_from_public_payload(
+        {
+            "asset_type": "video",
+            "public_action": "get_file",
+            "public_file_token": "old-video-token",
+            "file": "",
+            "url": r"C:\QQ\3956020260\nt_qq\nt_data\Video\2025-09\Ori\missing-old-video.mp4",
+            "file_name": "missing-old-video.mp4",
+            "file_id": "old-file-id",
+        },
+        old_bucket=("video", "2025-09"),
+        request={
+            "asset_type": "video",
+            "file_name": "missing-old-video.mp4",
+        },
+    )
+
+    assert classification == "qq_expired_after_napcat"
 
 
 def test_consume_remote_media_prefetch_peek_does_not_block_on_inflight_future() -> None:

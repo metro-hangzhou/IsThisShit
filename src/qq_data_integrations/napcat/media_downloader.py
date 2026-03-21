@@ -33,6 +33,14 @@ class NapCatMediaDownloader:
     OLD_CONTEXT_BUCKET_MIN_AGE_DAYS = 120
     OLD_CONTEXT_BUCKET_FAILURE_LIMIT = 5
     SHARED_MISS_CACHE_MIN_AGE_DAYS = 30
+    FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS = 45
+    FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS = 180
+    FORWARD_TIMEOUT_STORM_LIMIT = 6
+    FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S = 10.0
+    OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S = 4.0
+    OLD_FORWARD_EXPENSIVE_DIRECT_FILE_ID_TIMEOUT_S = 4.0
+    OLD_FORWARD_EXPENSIVE_METADATA_TIMEOUT_S = 6.0
+    OLD_FORWARD_EXPENSIVE_MATERIALIZE_TIMEOUT_S = 8.0
     PREFETCH_BATCH_SIZE = 200
     PREFETCH_LARGE_REQUEST_THRESHOLD = 1000
     PREFETCH_LARGE_BATCH_SIZE = 50
@@ -77,6 +85,8 @@ class NapCatMediaDownloader:
         self._forward_context_error_cache: set[tuple[str, ...]] = set()
         self._forward_context_payload_cache: dict[tuple[str, ...], dict[str, Any]] = {}
         self._request_scoped_public_action_timeout_cache: set[tuple[str, ...]] = set()
+        self._forward_timeout_storm_counts: dict[tuple[str, ...], int] = {}
+        self._forward_timeout_storm_open: set[tuple[str, ...]] = set()
         self._remote_cache_root = remote_cache_dir
         self._remote_process_cache_dir = (
             remote_cache_dir / f"pid_{os.getpid()}"
@@ -229,6 +239,8 @@ class NapCatMediaDownloader:
             self._forward_context_error_cache.clear()
             self._forward_context_payload_cache.clear()
             self._request_scoped_public_action_timeout_cache.clear()
+            self._forward_timeout_storm_counts.clear()
+            self._forward_timeout_storm_open.clear()
             self._image_placeholder_missing_cache.clear()
         with self._download_progress_lock:
             self._download_progress = self._new_download_progress_state()
@@ -259,6 +271,7 @@ class NapCatMediaDownloader:
             "forward_context_timeout_count": 0,
             "forward_context_empty_count": 0,
             "forward_context_error_count": 0,
+            "forward_timeout_storm_skip_count": 0,
             "last_asset_type": None,
             "last_file_name": None,
             "last_status": None,
@@ -796,6 +809,23 @@ class NapCatMediaDownloader:
                 fast_resolved = self._resolve_from_fast_payload(forward_payload)
                 if fast_resolved != (None, None):
                     return self._remember_shared_outcome(shared_key, request, fast_resolved)
+                classified_old_forward_missing = self._classify_old_forward_expensive_missing(
+                    request,
+                    payload=forward_payload,
+                    require_timeout_signal=True,
+                )
+                if classified_old_forward_missing is not None:
+                    self._emit_missing_classification_trace(
+                        trace_callback,
+                        request,
+                        substep="forward_missing_classification",
+                        classification=classified_old_forward_missing,
+                    )
+                    return self._remember_shared_outcome(
+                        shared_key,
+                        request,
+                        (None, classified_old_forward_missing),
+                    )
             if asset_type == "image":
                 has_forward_payload = isinstance(forward_payload, dict)
                 has_hint_file_id = bool(str(hint.get("file_id") or "").strip())
@@ -835,7 +865,24 @@ class NapCatMediaDownloader:
                 fast_resolved = self._resolve_from_fast_payload(forward_payload)
                 if fast_resolved != (None, None):
                     return self._remember_shared_outcome(shared_key, request, fast_resolved)
-            if asset_type in {"video", "file"}:
+            classified_old_forward_missing = self._classify_old_forward_expensive_missing(
+                request,
+                payload=forward_payload if isinstance(forward_payload, dict) else None,
+                require_timeout_signal=True,
+            )
+            if classified_old_forward_missing is not None:
+                self._emit_missing_classification_trace(
+                    trace_callback,
+                    request,
+                    substep="forward_missing_classification",
+                    classification=classified_old_forward_missing,
+                )
+                return self._remember_shared_outcome(
+                    shared_key,
+                    request,
+                    (None, classified_old_forward_missing),
+                )
+            if asset_type in {"video", "file", "speech"}:
                 targeted_forward_download = self._download_via_forward_context(
                     request,
                     materialize=True,
@@ -1130,6 +1177,10 @@ class NapCatMediaDownloader:
                 self._download_progress["forward_context_error_count"] = (
                     int(self._download_progress.get("forward_context_error_count") or 0) + 1
                 )
+            elif normalized_status == "storm_skip":
+                self._download_progress["forward_timeout_storm_skip_count"] = (
+                    int(self._download_progress.get("forward_timeout_storm_skip_count") or 0) + 1
+                )
 
     def _resolve_via_context_only(
         self,
@@ -1268,7 +1319,26 @@ class NapCatMediaDownloader:
         file_id = str(hint.get("file_id") or "").strip()
         if not file_id or not file_id.startswith("/"):
             return None
-        timeout_s = self.DIRECT_FILE_ID_TIMEOUT_S
+        timeout_s = self._direct_file_id_timeout_s(request)
+        if self._should_skip_forward_timeout_storm(
+            request,
+            route="direct_file_id_get_file",
+        ):
+            self._emit_asset_substep_trace(
+                trace_callback,
+                request,
+                stage="done",
+                substep="direct_file_id_get_file",
+                timeout_s=timeout_s,
+                status="storm_skip",
+                elapsed_s=0.0,
+                detail="skipped old forward route after repeated timeouts",
+            )
+            self._note_remote_substep_progress(
+                substep="direct_file_id_get_file",
+                status="storm_skip",
+            )
+            return None
         self._emit_asset_substep_trace(
             trace_callback,
             request,
@@ -1302,6 +1372,10 @@ class NapCatMediaDownloader:
                 elapsed_s=elapsed_s,
                 detail=str(exc),
             )
+            self._note_forward_timeout_storm(
+                request,
+                route="direct_file_id_get_file",
+            )
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
@@ -1328,6 +1402,10 @@ class NapCatMediaDownloader:
                         classification="qq_expired_after_napcat",
                     )
                 return None, "qq_expired_after_napcat"
+            self._note_forward_timeout_storm_success(
+                request,
+                route="direct_file_id_get_file",
+            )
             return None
         elapsed_s = monotonic() - started
         self._emit_asset_substep_trace(
@@ -1345,6 +1423,10 @@ class NapCatMediaDownloader:
             status="ok",
             timeout_s=timeout_s,
             elapsed_s=elapsed_s,
+        )
+        self._note_forward_timeout_storm_success(
+            request,
+            route="direct_file_id_get_file",
         )
         resolved = self._resolved_path_from_payload(payload if isinstance(payload, dict) else None)
         if resolved is not None:
@@ -1400,6 +1482,14 @@ class NapCatMediaDownloader:
         ):
             return prefetched
         if (
+            materialize
+            and timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_timeout_cache
+        ):
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return None
+        if (
             not materialize
             and timeout_cache_key is not None
             and timeout_cache_key in self._forward_context_timeout_cache
@@ -1451,10 +1541,29 @@ class NapCatMediaDownloader:
                 self._prefetched_forward_media[key] = matched
                 self._prefetched_forward_media_payloads[key] = matched_payload
                 return matched
-        timeout_s = (
-            self.FORWARD_TARGET_HTTP_TIMEOUT_S if materialize else self.FORWARD_CONTEXT_TIMEOUT_S
+        timeout_s = self._forward_context_timeout_s(
+            request,
+            materialize=materialize,
         )
         substep = "forward_context_materialize" if materialize else "forward_context_metadata"
+        if self._should_skip_forward_timeout_storm(
+            request,
+            route=substep,
+        ):
+            self._emit_asset_substep_trace(
+                trace_callback,
+                request,
+                stage="done",
+                substep=substep,
+                timeout_s=timeout_s,
+                status="storm_skip",
+                elapsed_s=0.0,
+                detail="skipped old forward route after repeated timeouts",
+            )
+            self._note_remote_substep_progress(substep=substep, status="storm_skip")
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return None
         self._emit_asset_substep_trace(
             trace_callback,
             request,
@@ -1525,6 +1634,10 @@ class NapCatMediaDownloader:
             if timeout_cache_key is not None:
                 self._forward_context_timeout_cache.add(timeout_cache_key)
                 self._forward_context_payload_cache.pop(timeout_cache_key, None)
+            self._note_forward_timeout_storm(
+                request,
+                route=substep,
+            )
             self._prefetched_forward_media[key] = (None, None)
             self._prefetched_forward_media_payloads[key] = None
             return None
@@ -1572,6 +1685,16 @@ class NapCatMediaDownloader:
         assets = payload.get("assets") if isinstance(payload, dict) else None
         assets_list = assets if isinstance(assets, list) else []
         if not assets_list:
+            if materialize and elapsed_s >= self.FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S:
+                self._note_forward_timeout_storm(
+                    request,
+                    route=substep,
+                )
+            elif not materialize:
+                self._note_forward_timeout_storm_success(
+                    request,
+                    route=substep,
+                )
             if timeout_cache_key is not None and not materialize:
                 self._forward_context_empty_cache.add(timeout_cache_key)
                 self._forward_context_payload_cache.pop(timeout_cache_key, None)
@@ -1600,6 +1723,22 @@ class NapCatMediaDownloader:
                 request=request,
                 request_data=request,
                 payload=matched_payload,
+            )
+        if materialize:
+            if matched not in {None, (None, None)}:
+                self._note_forward_timeout_storm_success(
+                    request,
+                    route=substep,
+                )
+            elif elapsed_s >= self.FORWARD_TIMEOUT_STORM_SLOW_NOOP_ELAPSED_S:
+                self._note_forward_timeout_storm(
+                    request,
+                    route=substep,
+                )
+        else:
+            self._note_forward_timeout_storm_success(
+                request,
+                route=substep,
             )
         return matched
 
@@ -1865,11 +2004,40 @@ class NapCatMediaDownloader:
             return None
         known_bad_token = self._known_bad_public_tokens.get((normalized_action, token))
         if known_bad_token:
-            return {
+            return self._annotate_public_token_payload(
+                {
                 "_known_missing_classification": known_bad_token,
                 "_known_missing_detail": "cached_known_bad_token",
-            }
-        timeout_s = self.PUBLIC_TOKEN_ACTION_TIMEOUT_S
+                },
+                action=normalized_action,
+                token=token,
+                file_name=file_name,
+                request=request,
+            )
+        timeout_s = self._public_action_timeout_s(
+            normalized_action,
+            request=request,
+        )
+        if self._should_skip_forward_timeout_storm(
+            request,
+            route=f"public_token_{normalized_action}",
+        ):
+            if request is not None:
+                self._emit_asset_substep_trace(
+                    trace_callback,
+                    request,
+                    stage="done",
+                    substep=f"public_token_{normalized_action}",
+                    timeout_s=timeout_s,
+                    status="storm_skip",
+                    elapsed_s=0.0,
+                    detail="skipped old forward route after repeated timeouts",
+                )
+                self._note_remote_substep_progress(
+                    substep=f"public_token_{normalized_action}",
+                    status="storm_skip",
+                )
+            return None
         cache_key = (normalized_action, token)
 
         primary_substep = f"public_token_{normalized_action}"
@@ -1933,6 +2101,10 @@ class NapCatMediaDownloader:
             if request_timeout_scope_key is not None:
                 self._request_scoped_public_action_timeout_cache.add(request_timeout_scope_key)
             self._public_token_action_outcomes[cache_key] = None
+            self._note_forward_timeout_storm(
+                request,
+                route=primary_substep,
+            )
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
@@ -1950,10 +2122,16 @@ class NapCatMediaDownloader:
                 )
             if known_missing is not None:
                 self._known_bad_public_tokens[(normalized_action, token)] = known_missing
-                payload = {
+                payload = self._annotate_public_token_payload(
+                    {
                     "_known_missing_classification": known_missing,
                     "_known_missing_detail": str(exc),
-                }
+                    },
+                    action=normalized_action,
+                    token=token,
+                    file_name=file_name,
+                    request=request,
+                )
                 self._public_token_action_outcomes[cache_key] = payload
                 return payload
             payload = None
@@ -1976,6 +2154,13 @@ class NapCatMediaDownloader:
                     timeout_s=timeout_s,
                     elapsed_s=elapsed_s,
                 )
+            payload = self._annotate_public_token_payload(
+                payload,
+                action=normalized_action,
+                token=token,
+                file_name=file_name,
+                request=request,
+            )
             self._public_token_action_outcomes[cache_key] = payload
             return payload
 
@@ -2040,13 +2225,27 @@ class NapCatMediaDownloader:
                 )
             if known_missing is not None:
                 self._known_bad_public_tokens[(normalized_action, token)] = known_missing
-                payload = {
+                payload = self._annotate_public_token_payload(
+                    {
                     "_known_missing_classification": known_missing,
                     "_known_missing_detail": str(exc),
-                }
+                    },
+                    action=normalized_action,
+                    token=token,
+                    file_name=file_name,
+                    request=request,
+                )
                 self._public_token_action_outcomes[cache_key] = payload
+                self._note_forward_timeout_storm_success(
+                    request,
+                    route=primary_substep,
+                )
                 return payload
             self._public_token_action_outcomes[cache_key] = None
+            self._note_forward_timeout_storm_success(
+                request,
+                route=primary_substep,
+            )
             return None
         elapsed_s = monotonic() - started
         if request is not None:
@@ -2066,8 +2265,46 @@ class NapCatMediaDownloader:
                 timeout_s=timeout_s,
                 elapsed_s=elapsed_s,
             )
+        payload = self._annotate_public_token_payload(
+            payload,
+            action=normalized_action,
+            token=token,
+            file_name=file_name,
+            request=request,
+        )
         self._public_token_action_outcomes[cache_key] = payload
+        self._note_forward_timeout_storm_success(
+            request,
+            route=primary_substep,
+        )
         return payload
+
+    @staticmethod
+    def _annotate_public_token_payload(
+        payload: dict[str, Any] | None,
+        *,
+        action: str,
+        token: str,
+        file_name: str | None,
+        request: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return payload
+        annotated = dict(payload)
+        annotated.setdefault("public_action", action)
+        annotated.setdefault("public_file_token", token)
+        if file_name:
+            annotated.setdefault("file_name", file_name)
+        if isinstance(request, dict):
+            asset_type = str(request.get("asset_type") or "").strip()
+            if asset_type:
+                annotated.setdefault("asset_type", asset_type)
+            hint = request.get("download_hint")
+            if isinstance(hint, dict):
+                file_id = str(hint.get("file_id") or "").strip()
+                if file_id:
+                    annotated.setdefault("file_id", file_id)
+        return annotated
 
     @staticmethod
     def _classify_known_public_action_error(action: str, exc: Exception) -> str | None:
@@ -3701,8 +3938,14 @@ class NapCatMediaDownloader:
             return None
         payload_file = str(data.get("file") or "").strip()
         remote_url = str(data.get("url") or data.get("remote_url") or "").strip()
-        if payload_file or remote_url:
+        if payload_file:
             return None
+        if remote_url:
+            parsed = urlparse(remote_url)
+            if parsed.scheme.lower() in {"http", "https"}:
+                return None
+            if Path(remote_url).exists():
+                return None
         file_name = str(
             data.get("file_name")
             or ((request or {}).get("file_name") if isinstance(request, dict) else "")
@@ -3714,6 +3957,102 @@ class NapCatMediaDownloader:
         if not any([file_name, file_size, file_id, token]):
             return None
         return "qq_expired_after_napcat"
+
+    def _should_skip_forward_timeout_storm(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> bool:
+        storm_key = self._forward_timeout_storm_key(request, route=route)
+        if storm_key is None:
+            return False
+        return storm_key in self._forward_timeout_storm_open
+
+    def _note_forward_timeout_storm(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> None:
+        storm_key = self._forward_timeout_storm_key(request, route=route)
+        if storm_key is None:
+            return
+        failures = self._forward_timeout_storm_counts.get(storm_key, 0) + 1
+        self._forward_timeout_storm_counts[storm_key] = failures
+        if failures >= self.FORWARD_TIMEOUT_STORM_LIMIT:
+            self._forward_timeout_storm_open.add(storm_key)
+
+    def _note_forward_timeout_storm_success(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> None:
+        storm_key = self._forward_timeout_storm_key(request, route=route)
+        if storm_key is None:
+            return
+        self._forward_timeout_storm_counts.pop(storm_key, None)
+        self._forward_timeout_storm_open.discard(storm_key)
+
+    def _forward_timeout_storm_key(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> tuple[str, ...] | None:
+        if not isinstance(request, dict):
+            return None
+        hint = self._request_hint(request)
+        if not self._has_forward_parent_hint(hint):
+            return None
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type not in {"file", "video", "speech"}:
+            return None
+        raw_timestamp = request.get("timestamp_ms")
+        if not isinstance(raw_timestamp, (int, float)):
+            return None
+        try:
+            asset_dt = datetime.fromtimestamp(float(raw_timestamp) / 1000.0, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        asset_age = datetime.now(timezone.utc) - asset_dt
+        if asset_age < timedelta(days=self.FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS):
+            return None
+        normalized_route = self._forward_timeout_storm_route_group(
+            route=route,
+            asset_age=asset_age,
+        )
+        if asset_age >= timedelta(days=self.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS):
+            age_bucket = f"{self.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS}d_plus"
+        else:
+            age_bucket = asset_dt.strftime("%Y-%m")
+        return (
+            "forward_timeout_storm",
+            normalized_route,
+            asset_type,
+            str(request.get("asset_role") or "").strip().lower(),
+            age_bucket,
+        )
+
+    @staticmethod
+    def _forward_timeout_storm_route_group(
+        *,
+        route: str,
+        asset_age: timedelta,
+    ) -> str:
+        normalized = str(route or "").strip().lower()
+        if asset_age >= timedelta(days=NapCatMediaDownloader.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS):
+            if normalized in {
+                "public_token_get_file",
+                "public_token_get_record",
+                "forward_context_materialize",
+                "direct_file_id_get_file",
+            }:
+                return "forward_expensive"
+            if normalized == "forward_context_metadata":
+                return "forward_meta"
+        return normalized
 
     def _classify_forward_missing(self, request: dict[str, Any]) -> str | None:
         if str(request.get("asset_type") or "").strip() != "image":
@@ -3727,6 +4066,227 @@ class NapCatMediaDownloader:
         if not self._should_share_missing_outcome(request):
             return None
         return "qq_expired_after_napcat"
+
+    def _classify_old_forward_expensive_missing(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+        require_timeout_signal: bool = False,
+    ) -> str | None:
+        if not self._is_very_old_forward_expensive_asset(request):
+            return None
+        if self._has_live_http_media_url(request, payload=payload):
+            return None
+        if self._has_direct_forward_file_identifier(request, payload=payload):
+            return None
+        if not self._has_stale_forward_local_media_hint(request, payload=payload):
+            return None
+        if require_timeout_signal and not self._has_old_forward_timeout_signal(request, payload=payload):
+            return None
+        return "qq_expired_after_napcat"
+
+    def _has_old_forward_timeout_signal(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        if self._forward_context_timed_out(request, materialize=False):
+            return True
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        action = "get_record" if asset_type == "speech" else "get_file"
+        if self._public_action_timed_out(request, action=action):
+            return True
+        return self._should_skip_forward_timeout_storm(
+            request,
+            route=f"public_token_{action}",
+        ) or self._should_skip_forward_timeout_storm(
+            request,
+            route="forward_context_materialize",
+        )
+
+    def _public_action_timeout_s(
+        self,
+        action: str,
+        *,
+        request: dict[str, Any] | None = None,
+    ) -> float:
+        normalized_action = str(action or "").strip().lower()
+        if normalized_action in {"get_file", "get_record"} and self._is_very_old_forward_expensive_asset(request):
+            return float(self.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S)
+        return float(self.PUBLIC_TOKEN_ACTION_TIMEOUT_S)
+
+    def _direct_file_id_timeout_s(self, request: dict[str, Any] | None) -> float:
+        if self._is_very_old_forward_expensive_asset(request):
+            return float(self.OLD_FORWARD_EXPENSIVE_DIRECT_FILE_ID_TIMEOUT_S)
+        return float(self.DIRECT_FILE_ID_TIMEOUT_S)
+
+    def _forward_context_timeout_s(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        materialize: bool,
+    ) -> float:
+        if self._is_very_old_forward_expensive_asset(request):
+            return float(
+                self.OLD_FORWARD_EXPENSIVE_MATERIALIZE_TIMEOUT_S
+                if materialize
+                else self.OLD_FORWARD_EXPENSIVE_METADATA_TIMEOUT_S
+            )
+        return float(
+            self.FORWARD_TARGET_HTTP_TIMEOUT_S if materialize else self.FORWARD_CONTEXT_TIMEOUT_S
+        )
+
+    def _is_very_old_forward_expensive_asset(self, request: dict[str, Any] | None) -> bool:
+        if not isinstance(request, dict):
+            return False
+        hint = self._request_hint(request)
+        if not self._has_forward_parent_hint(hint):
+            return False
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type not in {"file", "video", "speech"}:
+            return False
+        asset_age = self._request_asset_age(request)
+        if asset_age is None:
+            return False
+        return asset_age >= timedelta(days=self.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS)
+
+    def _has_live_http_media_url(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        for value in self._iter_request_media_locations(request, payload=payload):
+            resolved_url = self._resolve_remote_url(value)
+            if not resolved_url:
+                continue
+            parsed = urlparse(resolved_url)
+            if parsed.scheme.lower() in {"http", "https"}:
+                return True
+        return False
+
+    def _has_direct_forward_file_identifier(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        hint = self._request_hint(request) if isinstance(request, dict) else {}
+        for value in (
+            hint.get("file_id"),
+            (payload or {}).get("file_id") if isinstance(payload, dict) else None,
+        ):
+            candidate = str(value or "").strip()
+            if candidate:
+                return True
+        return False
+
+    def _has_stale_forward_local_media_hint(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        for value in self._iter_request_media_locations(request, payload=payload):
+            if self._looks_like_stale_local_media_path(value):
+                return True
+        return False
+
+    def _iter_request_media_locations(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[str, ...]:
+        values: list[str] = []
+        if isinstance(request, dict):
+            values.extend(
+                [
+                    str(request.get("source_path") or "").strip(),
+                ]
+            )
+            hint = self._request_hint(request)
+            values.extend(
+                [
+                    str(hint.get("url") or "").strip(),
+                    str(hint.get("remote_url") or "").strip(),
+                    str(hint.get("file") or "").strip(),
+                    str(hint.get("path") or "").strip(),
+                ]
+            )
+        if isinstance(payload, dict):
+            values.extend(
+                [
+                    str(payload.get("file") or "").strip(),
+                    str(payload.get("url") or "").strip(),
+                    str(payload.get("remote_url") or "").strip(),
+                    str(payload.get("path") or "").strip(),
+                ]
+            )
+        return tuple(value for value in values if value)
+
+    @staticmethod
+    def _looks_like_stale_local_media_path(value: object) -> bool:
+        candidate = str(value or "").strip()
+        if not candidate:
+            return False
+        if candidate.lower().startswith("file://"):
+            candidate = candidate[7:]
+        if not (
+            re.match(r"^[a-zA-Z]:[\\/]", candidate)
+            or candidate.startswith("\\\\")
+        ):
+            return False
+        return not Path(candidate).exists()
+
+    def _public_action_timed_out(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        action: str,
+    ) -> bool:
+        request_timeout_scope_key = self._request_scoped_public_action_timeout_key(
+            request,
+            action=action,
+        )
+        return (
+            request_timeout_scope_key is not None
+            and request_timeout_scope_key in self._request_scoped_public_action_timeout_cache
+        )
+
+    def _forward_context_timed_out(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        materialize: bool,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        timeout_cache_key = self._forward_context_timeout_key(
+            request,
+            materialize=materialize,
+        )
+        return (
+            timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_timeout_cache
+        )
+
+    @staticmethod
+    def _request_asset_age(request: dict[str, Any] | None) -> timedelta | None:
+        if not isinstance(request, dict):
+            return None
+        raw_timestamp = request.get("timestamp_ms")
+        if not isinstance(raw_timestamp, (int, float)):
+            return None
+        try:
+            asset_dt = datetime.fromtimestamp(float(raw_timestamp) / 1000.0, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        return datetime.now(timezone.utc) - asset_dt
 
     def _classify_image_local_placeholder_missing(
         self,
@@ -3844,6 +4404,9 @@ class NapCatMediaDownloader:
         )
         if not materialize:
             return ("metadata", *key)
+        asset_type = str(request.get("asset_type") or "").strip()
+        if asset_type in {"file", "video", "speech"}:
+            return ("materialize", *key)
         return (
             "materialize",
             *key,
@@ -3860,15 +4423,27 @@ class NapCatMediaDownloader:
         if not isinstance(request, dict):
             return None
         asset_type = str(request.get("asset_type") or "").strip()
-        if asset_type not in {"file", "video"}:
+        if asset_type not in {"file", "video", "speech"}:
             return None
         hint = NapCatMediaDownloader._request_hint(request)
         if not NapCatMediaDownloader._has_forward_parent_hint(hint):
             return None
-        if action != "get_file":
+        if asset_type in {"file", "video"} and action != "get_file":
             return None
-        request_key = NapCatMediaDownloader._request_key(request)
-        return ("forward_public_timeout", action, *(str(part) for part in request_key))
+        if asset_type == "speech" and action != "get_record":
+            return None
+        parent = hint.get("_forward_parent")
+        assert isinstance(parent, dict)
+        return (
+            "forward_public_timeout",
+            action,
+            str(parent.get("message_id_raw") or "").strip(),
+            str(parent.get("element_id") or "").strip(),
+            str(parent.get("peer_uid") or "").strip(),
+            str(parent.get("chat_type_raw") or "").strip(),
+            asset_type,
+            str(request.get("asset_role") or "").strip(),
+        )
 
     @staticmethod
     def _request_hint(request: dict[str, Any]) -> dict[str, Any]:
