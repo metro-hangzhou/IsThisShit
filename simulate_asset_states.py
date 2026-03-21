@@ -17,7 +17,10 @@ if RUNTIME_SITE_PACKAGES.exists() and str(RUNTIME_SITE_PACKAGES) not in sys.path
     sys.path.insert(0, str(RUNTIME_SITE_PACKAGES))
 
 from qq_data_integrations.napcat.asset_simulator import (  # noqa: E402
+    default_asset_resolution_scenarios,
     default_forward_timeout_matrix,
+    run_asset_resolution_matrix,
+    run_asset_resolution_scenario,
     run_forward_timeout_simulation,
     write_simulation_trace,
 )
@@ -48,6 +51,30 @@ def _render_result(result: dict[str, Any]) -> str:
             ),
             f"  trace_status_breakdown={result['trace_status_breakdown']}",
             f"  explanation={result['explanation']}",
+        ]
+    )
+
+
+def _render_resolution_result(result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "asset_resolution_simulation:",
+            f"  name={result['name']}",
+            f"  asset_type={result['asset_type']} topology={result['topology']} age_days={result['age_days']}",
+            (
+                "  expectation="
+                f"resolver={result['expected_resolver']} path_kind={result['expected_path_kind']}"
+            ),
+            (
+                "  actual="
+                f"resolver={result['actual_resolver']} path_kind={result['actual_path_kind']} matched={result['matched']}"
+            ),
+            (
+                "  calls="
+                f"public={result['client_call_count']} fast={result['fast_call_count']} remote={result['remote_attempt_count']}"
+            ),
+            f"  trace_status_breakdown={result['trace_status_breakdown']}",
+            f"  notes={result['notes']}",
         ]
     )
 
@@ -91,6 +118,19 @@ def main() -> None:
     matrix_parser.add_argument("--delay-s", type=float, default=0.02)
     matrix_parser.add_argument("--json", action="store_true")
 
+    resolution_parser = subparsers.add_parser(
+        "resolution-matrix",
+        help="Run a scenario-driven resolution matrix across asset families and states.",
+    )
+    resolution_parser.add_argument("--json", action="store_true")
+
+    resolution_case_parser = subparsers.add_parser(
+        "resolution-case",
+        help="Run one named asset resolution scenario.",
+    )
+    resolution_case_parser.add_argument("name")
+    resolution_case_parser.add_argument("--json", action="store_true")
+
     args = parser.parse_args()
 
     if args.command == "forward-timeout":
@@ -122,6 +162,34 @@ def main() -> None:
                 print()
             print(f"[scenario {index}]")
             print(_render_result(result))
+        return
+
+    if args.command == "resolution-matrix":
+        results = [item.to_dict() for item in run_asset_resolution_matrix()]
+        if args.json:
+            print(json.dumps(results, ensure_ascii=False, indent=2))
+            return
+        mismatches = [item for item in results if not bool(item.get("matched"))]
+        print(
+            "resolution_matrix:"
+            f" total={len(results)} matched={len(results) - len(mismatches)} mismatched={len(mismatches)}"
+        )
+        for index, result in enumerate(results, start=1):
+            print()
+            print(f"[scenario {index}]")
+            print(_render_resolution_result(result))
+        return
+
+    if args.command == "resolution-case":
+        scenarios = {item.name: item for item in default_asset_resolution_scenarios()}
+        scenario = scenarios.get(args.name)
+        if scenario is None:
+            raise SystemExit(f"unknown scenario: {args.name}")
+        result = run_asset_resolution_scenario(scenario).to_dict()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(_render_resolution_result(result))
         return
 
 

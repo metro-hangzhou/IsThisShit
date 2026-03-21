@@ -190,6 +190,27 @@ Recent field failures showed that the project has two separate but related stabi
   - narrow window around `2026-03-16T13:12:57+08:00`
   - full `2000`-message rerun on group `922065597`
 
+### [2026-03-22][014] Asset-state simulator is now required for exporter hardening
+
+- Motivation:
+  - friend-machine field reports keep surfacing asset combinations that are expensive to reproduce live
+  - waiting for a full `10k+` export to fail is too slow for development
+- Guardrail:
+  - new exporter fixes for media resolution should add or update local simulator cases first
+- Current simulator scope:
+  - direct local hints
+  - old image placeholder classification
+  - top-level public-token local/remote recovery
+  - direct `file_id` local/remote recovery
+  - sticker remote GIF recovery
+  - forward remote URL recovery
+  - old forward `video/file/speech` timeout-to-expired classification
+  - known NapCat media-url errors (`video/file/record`)
+- Remaining gaps still worth encoding later:
+  - malformed nested-forward parent chains
+  - route-unavailable / mixed-route deployment states
+  - batch-prefetch pressure and executor-level behavior
+
 ## Current Fix / Guardrail Tasks
 
 - [ ] Keep CLI launcher policy explicit in regression review:
@@ -218,6 +239,7 @@ Recent field failures showed that the project has two separate but related stabi
   - targeted forward `message_id_raw=7617760641125573795` now recovers `7/7` images in narrow-window retest
 - [ ] Record friend-machine failures into perf/forensics docs when new logs arrive
 - [ ] Keep quick-login path covered by regression tests so QR fallback remains intact
+- [ ] Keep the asset-state simulator matrix in sync with any new asset family or recovery heuristic
 - [ ] Keep `app.py login` and REPL `/login` behavior-compatible in regression coverage
 - [ ] Keep local live validation scripts/operator notes aligned with the fixed local account `3956020260`
 - [ ] Keep local live/export validation matrix aligned with the fixed test targets:
