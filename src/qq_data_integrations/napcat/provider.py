@@ -45,6 +45,7 @@ class NapCatHistoryProvider:
         self._known_unavailable_history_keys: set[str] = set()
         self._disable_parse_mult_forward_hydration = False
         self._known_forward_history_failures = 0
+        self._known_forward_detail_failures = 0
 
     def reset_export_state(self) -> None:
         self._fast_available = None
@@ -53,6 +54,7 @@ class NapCatHistoryProvider:
         self._known_unavailable_history_keys.clear()
         self._disable_parse_mult_forward_hydration = False
         self._known_forward_history_failures = 0
+        self._known_forward_detail_failures = 0
 
     def fetch_snapshot(self, request: ExportRequest) -> SourceChatSnapshot:
         return self.fetch_snapshot_before(
@@ -769,6 +771,7 @@ class NapCatHistoryProvider:
         parse_mult_cache: dict[str, bool] = {}
         skip_forward_msg_fallback = False
         history_retry_known_failures = 0
+        forward_detail_known_failures = 0
         structure_unavailable = 0
         already_resolved = sum(
             1
@@ -870,7 +873,13 @@ class NapCatHistoryProvider:
                 ):
                     structure_unavailable += 1
                 if not recovered_via_history:
-                    skip_forward_msg_fallback = True
+                    forward_detail_known_failures += 1
+                    self._known_forward_detail_failures += 1
+                    if (
+                        forward_detail_known_failures >= 3
+                        or self._known_forward_detail_failures >= 3
+                    ):
+                        skip_forward_msg_fallback = True
             if skip_forward_msg_fallback and forward_id not in cache:
                 cache[forward_id] = None
             if forward_id not in cache:
@@ -906,8 +915,16 @@ class NapCatHistoryProvider:
                         ):
                             structure_unavailable += 1
                         if not recovered_via_history:
-                            skip_forward_msg_fallback = True
+                            forward_detail_known_failures += 1
+                            self._known_forward_detail_failures += 1
+                            if (
+                                forward_detail_known_failures >= 3
+                                or self._known_forward_detail_failures >= 3
+                            ):
+                                skip_forward_msg_fallback = True
                 else:
+                    forward_detail_known_failures = 0
+                    self._known_forward_detail_failures = 0
                     payload = (
                         response
                         if isinstance(response, dict)
@@ -1061,7 +1078,19 @@ class NapCatHistoryProvider:
             if message_seq in item_keys:
                 return item
         if len(messages) == 1:
-            return messages[0]
+            only = messages[0]
+            if not isinstance(only, dict):
+                return None
+            raw_message = _message_raw(only)
+            only_keys = {
+                str(only.get("message_seq") or "").strip(),
+                str(only.get("messageSeq") or "").strip(),
+                str(only.get("real_seq") or "").strip(),
+                str(only.get("realSeq") or "").strip(),
+                str(raw_message.get("msgSeq") or "").strip(),
+            }
+            if not any(only_keys):
+                return only
         return None
 
     def _hydrate_fast_history_page_forwards(
@@ -1416,7 +1445,7 @@ class NapCatHistoryProvider:
                 remaining = data_count - len(collected_messages)
                 bridged = self._try_fast_history_tail_boundary_bridge(
                     request,
-                    anchor=anchor,
+                    anchor=next_anchor or anchor,
                     data_count=data_count,
                     remaining=remaining,
                     page_size=page_size,
