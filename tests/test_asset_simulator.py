@@ -81,6 +81,9 @@ def test_asset_resolution_matrix_includes_core_failure_and_remote_recovery_paths
     assert results["forward_old_video_public_token_timeout"].actual_resolver == "qq_expired_after_napcat"
     assert results["forward_old_video_public_token_timeout"].actual_path_kind == "missing"
 
+    assert results["forward_old_video_materialize_timeout"].actual_resolver == "qq_expired_after_napcat"
+    assert results["forward_old_video_materialize_timeout"].actual_path_kind == "missing"
+
     assert results["forward_video_relative_remote_url"].actual_resolver == "napcat_forward_remote_url"
     assert results["forward_video_relative_remote_url"].actual_path_kind == "remote"
 
