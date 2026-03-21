@@ -205,6 +205,68 @@ def test_collect_fast_history_tail_bulk_boundary_bridge_uses_current_next_anchor
     assert [item["message_id"] for item in state["messages"]] == ["m1", "m2", "m3"]
 
 
+def test_collect_fast_history_tail_bulk_boundary_bridge_does_not_overshoot_requested_count() -> None:
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=object())
+    payloads = iter(
+        [
+            {
+                "messages": [_message("m1", "1"), _message("m2", "2")],
+                "pages_scanned": 1,
+                "next_anchor": "anchor-2",
+                "page_size": 200,
+                "exhausted": False,
+            },
+            {
+                "messages": [_message("m2", "2")],
+                "pages_scanned": 1,
+                "next_anchor": "anchor-2",
+                "page_size": 200,
+                "exhausted": False,
+            },
+        ]
+    )
+
+    def fake_fetch_fast_history_tail_bulk(*args, **kwargs):
+        try:
+            return next(payloads)
+        except StopIteration:
+            return None
+
+    def fake_fetch_history_page(*args, **kwargs):
+        return (
+            _snapshot(
+                [
+                    _message("m3", "3"),
+                    _message("m4", "4"),
+                    _message("m5", "5"),
+                ]
+            ),
+            {
+                "history_source": "napcat_fast_history",
+                "page_duration_s": 0.01,
+                "page_size": 3,
+                "page_message_count": 3,
+                "retry_count": 0,
+            },
+        )
+
+    provider._fetch_fast_history_tail_bulk = fake_fetch_fast_history_tail_bulk  # type: ignore[method-assign]
+    provider._fetch_history_page = fake_fetch_history_page  # type: ignore[method-assign]
+
+    state = provider._collect_fast_history_tail_bulk(
+        _request(),
+        data_count=4,
+        page_size=200,
+        progress_callback=None,
+    )
+
+    assert state is not None
+    assert state["completed"] is True
+    assert len(state["messages"]) == 4
+    assert [item["message_id"] for item in state["messages"][:2]] == ["m1", "m2"]
+    assert {item["message_id"] for item in state["messages"][2:]} == {"m4", "m5"}
+
+
 def test_enrich_forward_details_uses_history_as_last_chance_after_get_forward_msg_failure() -> None:
     class _ForwardFailClient:
         def get_forward_msg(self, message_id: str):

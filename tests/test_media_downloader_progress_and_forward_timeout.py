@@ -36,6 +36,15 @@ class _MissingDirectFileClient:
         raise NapCatApiError("file not found")
 
 
+class _BlankPublicFileClient:
+    def __init__(self) -> None:
+        self.get_file_calls = 0
+
+    def get_file(self, *args, **kwargs):
+        self.get_file_calls += 1
+        return {"file": "", "url": ""}
+
+
 class _RemoteMediaDownloader(NapCatMediaDownloader):
     def __init__(self, remote_cache_dir: Path) -> None:
         super().__init__(_DummyClient(), remote_cache_dir=remote_cache_dir)
@@ -783,6 +792,52 @@ def test_resolve_via_direct_file_id_marks_old_file_not_found_as_background() -> 
     resolved = downloader._resolve_via_direct_file_id(request)
 
     assert resolved == (None, "qq_expired_after_napcat")
+
+
+def test_resolve_from_public_token_marks_old_video_blank_payload_as_background() -> None:
+    downloader = NapCatMediaDownloader(_BlankPublicFileClient())
+    request = {
+        "asset_type": "video",
+        "file_name": "old-video.mp4",
+        "timestamp_ms": 1757142395000,
+        "download_hint": {},
+    }
+
+    resolved = downloader._resolve_from_public_token(
+        {
+            "asset_type": "video",
+            "public_action": "get_file",
+            "public_file_token": "old-video-token",
+            "file_name": "old-video.mp4",
+        },
+        old_bucket=("video", "2025-09"),
+        request=request,
+    )
+
+    assert resolved == (None, "qq_expired_after_napcat")
+
+
+def test_classify_missing_from_public_payload_marks_old_video_with_stale_local_url_as_background() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+
+    classification = downloader._classify_missing_from_public_payload(
+        {
+            "asset_type": "video",
+            "public_action": "get_file",
+            "public_file_token": "old-video-token",
+            "file": "",
+            "url": r"C:\QQ\3956020260\nt_qq\nt_data\Video\2025-09\Ori\missing-old-video.mp4",
+            "file_name": "missing-old-video.mp4",
+            "file_id": "old-file-id",
+        },
+        old_bucket=("video", "2025-09"),
+        request={
+            "asset_type": "video",
+            "file_name": "missing-old-video.mp4",
+        },
+    )
+
+    assert classification == "qq_expired_after_napcat"
 
 
 def test_consume_remote_media_prefetch_peek_does_not_block_on_inflight_future() -> None:

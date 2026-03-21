@@ -1540,6 +1540,8 @@ class NapCatHistoryProvider:
         newest_dt = _message_datetime(page_messages[-1])
         added = 0
         for message in reversed(page_messages):
+            if len(collected_messages) >= data_count:
+                break
             dedupe_key = _message_key(message)
             if dedupe_key in seen_keys:
                 continue

@@ -1255,3 +1255,54 @@
     - 真卡死
     - 还是正在做 prefetch 规划
   - 导出完成后的 `status` / `verdict` 语义也更直观，不再互相打架
+
+### [2026-03-21][042] maintainer 侧 `10000` live smoke 已验证新心跳；朋友现场 trace 还单独暴露了一条视频恢复缺口
+
+- maintainer 侧 live smoke：
+  - `export-history group 922065597 --limit 10000 --format jsonl`
+  - 当前已能稳定显示：
+    - `planning media prefetch scanned=... context=... local=... skip_old=... rate=... elapsed=...`
+  - 最终结果：
+    - `export_status=success`
+    - `export_verdict=success_with_background_missing`
+    - `actionable_missing=0`
+- 朋友提供的复制现场：
+  - [state - 副本](C:/Users/Peter/Downloads/state%20-%20副本/state%20-%20副本) 里的 root export trace 仍显示另一条独立问题线：
+    - group `763328502`
+    - `message_count=10000`
+    - `elapsed_s≈856.4`
+    - `missing_after_napcat=18`
+    - 资产类型全部落在：
+      - `video`
+  - trace 里当前最慢一步：
+    - `resolver=missing_after_napcat`
+    - `asset_type=video`
+    - `slowest_materialize_step_s≈44.1`
+- 当前判断：
+  - `prefetch` 面板“像卡死”这一层已经和真正的 exporter 主链分离开了
+  - 朋友那份超慢失败现场更像是：
+    - 另一条尚未收完的 `video/public_token_get_file` 恢复链问题
+  - 后续修复要单独盯：
+    - 大窗视频 missing cluster 的 bounded probe
+    - 不再把它和 prefetch 可视化问题混在一起
+
+### [2026-03-21][043] `10000` tail export 的 overshoot 与老视频 actionable 误报已收口
+
+- 新发现并修复的两处问题：
+  - `tail boundary bridge` 在重复 anchor 边界补桥时可能追加超过请求上限，导致 `--limit 10000` 实际导出 `10047` 条
+  - 老 `video` 资产的 `public_token -> get_file` 可能返回：
+    - `file=""`
+    - `url=<已失效本地路径字符串>`
+    - 旧逻辑会把它漏成 `missing_after_napcat`
+- 当前处理：
+  - bridge 追加已经显式卡住 `data_count`
+  - 旧 `video/file` 的 blank-payload / stale-local-url `get_file` 返回现在会归到：
+    - `qq_expired_after_napcat`
+- maintainer live re-run：
+  - `export-history group 922065597 --limit 10000 --format jsonl`
+  - 当前结果：
+    - `records=10000`
+    - `export_status=success`
+    - `export_verdict=success_with_background_missing`
+    - `actionable_missing=0`
+    - `background_missing=900`
