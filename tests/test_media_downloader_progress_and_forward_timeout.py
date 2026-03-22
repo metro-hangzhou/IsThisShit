@@ -1225,6 +1225,58 @@ def test_recent_forward_speech_missing_is_not_shared_without_terminal_expired_re
     ) is True
 
 
+def test_classify_forward_missing_marks_old_forward_image_with_dead_remote_and_failed_public_token_as_background() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _mark_request_old(_build_forward_request("old-forward-dead.jpg"), days=90)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-token&spec=0"
+    )
+    payload = {
+        "asset_type": "image",
+        "public_action": "get_image",
+        "public_file_token": "dead-image-token",
+        "remote_url": "http://127.0.0.1:6099/download?appid=1407&fileid=dead-token&spec=0",
+    }
+    cache_key = (
+        "image",
+        downloader._normalized_match_url(
+            "http://127.0.0.1:6099/download?appid=1407&fileid=dead-token&spec=0"
+        ),
+    )
+    downloader._remote_media_resolution_cache[cache_key] = None
+    downloader._public_token_action_outcomes[("get_image", "dead-image-token")] = None
+
+    classification = downloader._classify_forward_missing(request, payload=payload)
+
+    assert classification == "qq_expired_after_napcat"
+
+
+def test_classify_forward_missing_keeps_recent_forward_image_actionable_even_when_routes_fail() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _mark_request_old(_build_forward_request("recent-forward-dead.jpg"), days=10)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=recent-token&spec=0"
+    )
+    payload = {
+        "asset_type": "image",
+        "public_action": "get_image",
+        "public_file_token": "recent-image-token",
+        "remote_url": "http://127.0.0.1:6099/download?appid=1407&fileid=recent-token&spec=0",
+    }
+    cache_key = (
+        "image",
+        downloader._normalized_match_url(
+            "http://127.0.0.1:6099/download?appid=1407&fileid=recent-token&spec=0"
+        ),
+    )
+    downloader._remote_media_resolution_cache[cache_key] = None
+    downloader._public_token_action_outcomes[("get_image", "recent-image-token")] = None
+
+    classification = downloader._classify_forward_missing(request, payload=payload)
+
+    assert classification is None
+
+
 def test_forward_file_shared_request_key_requires_strong_identity() -> None:
     downloader = NapCatMediaDownloader(_DummyClient())
     request = _build_forward_video_request("generic-name.mp4")
