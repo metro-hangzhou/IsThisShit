@@ -2,13 +2,19 @@ from __future__ import annotations
 
 from qq_data_integrations.napcat.asset_simulator import (
     all_asset_resolution_scenarios,
+    default_asset_resolution_pair_cases,
+    default_cross_run_reset_cases,
     default_asset_resolution_scenarios,
+    default_direct_file_id_scope_cases,
     default_forward_candidate_priority_cases,
     default_public_timeout_scope_cases,
     default_shared_outcome_scope_cases,
     default_forward_timeout_matrix,
+    run_cross_run_reset_matrix,
+    run_asset_resolution_pair_matrix,
     run_forward_candidate_priority_case,
     run_forward_candidate_priority_matrix,
+    run_direct_file_id_scope_matrix,
     run_public_timeout_scope_matrix,
     run_prefetch_planning_matrix,
     run_asset_resolution_matrix,
@@ -17,9 +23,12 @@ from qq_data_integrations.napcat.asset_simulator import (
     run_forward_timeout_simulation,
     run_shared_outcome_scope_matrix,
     summarize_forward_candidate_priority_results,
+    summarize_asset_resolution_pair_results,
+    summarize_cross_run_reset_results,
     summarize_prefetch_planning_results,
     summarize_asset_resolution_catalog,
     summarize_asset_resolution_results,
+    summarize_direct_file_id_scope_results,
     summarize_forward_timeout_results,
     summarize_public_timeout_scope_results,
     summarize_shared_outcome_scope_results,
@@ -314,6 +323,39 @@ def test_public_timeout_scope_matrix_matches_expectations() -> None:
     assert summary["mismatched"] == 0
     assert summary["asset_type_counts"]["video"] > 0
     assert summary["relationship_counts"]["same_parent_new_token"] > 0
+
+
+def test_asset_resolution_pair_matrix_matches_expectations() -> None:
+    results = run_asset_resolution_pair_matrix()
+    summary = summarize_asset_resolution_pair_results(results)
+
+    assert len(results) == len(default_asset_resolution_pair_cases())
+    assert summary["mismatched"] == 0
+    assert summary["resolver_counts"]["napcat_public_token_get_image_remote_url"] > 0
+    assert summary["resolver_counts"]["napcat_segment_file_id_get_file_remote_url"] > 0
+    assert summary["path_kind_counts"]["remote"] == len(results)
+
+
+def test_cross_run_reset_matrix_matches_expectations() -> None:
+    results = run_cross_run_reset_matrix()
+    summary = summarize_cross_run_reset_results(results)
+
+    assert len(results) == len(default_cross_run_reset_cases())
+    assert summary["mismatched"] == 0
+    assert summary["resolver_counts"]["napcat_public_token_get_image_remote_url"] > 0
+    assert summary["resolver_counts"]["napcat_segment_file_id_get_file_remote_url"] > 0
+    assert summary["resolver_counts"]["napcat_public_token_get_record_remote_url"] > 0
+    assert summary["path_kind_counts"]["remote"] == len(results)
+
+
+def test_direct_file_id_scope_matrix_matches_expectations() -> None:
+    results = run_direct_file_id_scope_matrix()
+    summary = summarize_direct_file_id_scope_results(results)
+
+    assert len(results) == len(default_direct_file_id_scope_cases())
+    assert summary["mismatched"] == 0
+    assert summary["asset_type_counts"]["video"] > 0
+    assert summary["relationship_counts"]["same_parent_different_file_id"] > 0
 
 
 def test_asset_resolution_exhaustive_old_forward_terminal_suite_matches_expectations() -> None:

@@ -99,6 +99,57 @@ class _BrokenRemoteRuntimeDownloader(NapCatMediaDownloader):
         raise RuntimeError("remote media async runtime failed to start")
 
 
+class _ResettingExecutor:
+    def __init__(self, downloader: NapCatMediaDownloader) -> None:
+        self.downloader = downloader
+
+    def submit(self, fn, *args, **kwargs):
+        _ = fn, args, kwargs
+        future: Future[dict[str, object] | None] = Future()
+        self.downloader.reset_export_state()
+        future.set_result(None)
+        return future
+
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
+        _ = wait, cancel_futures
+        return
+
+
+class _ResetDuringTokenPrefetchDownloader(NapCatMediaDownloader):
+    def _create_prefetch_executors(self) -> None:  # type: ignore[override]
+        self._remote_prefetch_runtime_disabled = True
+        self._remote_prefetch_runtime_disable_reason = "simulated"
+        self._remote_loop = None
+        self._remote_loop_thread = None
+        self._remote_async_client = None
+        self._remote_async_semaphore = None
+        self._public_token_executor = _ResettingExecutor(self)
+
+
+class _ResetDuringRemoteSubmitDownloader(NapCatMediaDownloader):
+    def _create_prefetch_executors(self) -> None:  # type: ignore[override]
+        self._remote_prefetch_runtime_disabled = True
+        self._remote_prefetch_runtime_disable_reason = "simulated"
+        self._remote_loop = None
+        self._remote_loop_thread = None
+        self._remote_async_client = None
+        self._remote_async_semaphore = None
+        self._public_token_executor = None
+
+    def _submit_remote_media_download(  # type: ignore[override]
+        self,
+        *,
+        asset_type: str,
+        file_name: str | None,
+        resolved_remote_url: str,
+    ) -> Future[str | None] | None:
+        _ = asset_type, file_name, resolved_remote_url
+        future: Future[str | None] = Future()
+        self.reset_export_state()
+        future.set_result("stale")
+        return future
+
+
 def _workspace_temp_dir() -> Path:
     root = Path(".tmp") / f"pytest_remote_cache_{uuid.uuid4().hex}"
     root.mkdir(parents=True, exist_ok=True)
@@ -1652,3 +1703,81 @@ def test_forward_timeout_updates_download_progress_counters() -> None:
     snapshot = downloader.export_download_progress_snapshot()
     assert snapshot["timeout_count"] == 1
     assert snapshot["forward_context_timeout_count"] == 1
+
+
+def test_reset_export_state_generation_rejects_stale_prefetch_store_writes() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    stale_generation = downloader._transient_state_generation
+
+    downloader.reset_export_state()
+
+    current_generation = downloader._transient_state_generation
+    assert current_generation == stale_generation + 1
+
+    remote_key = ("image", "https://assets.example.invalid/test.png")
+    public_key = ("speech", "forward_media", "get_record", "token-a", "scope-a")
+    downloader._store_remote_prefetch_result(remote_key, "stale", generation=stale_generation)
+    downloader._store_public_token_prefetch_result(
+        public_key,
+        {"payload": {"url": "https://assets.example.invalid/test.mp3"}},
+        generation=stale_generation,
+    )
+
+    assert remote_key not in downloader._remote_media_resolution_cache
+    assert public_key not in downloader._public_token_prefetch_cache
+
+    downloader._store_remote_prefetch_result(remote_key, "fresh", generation=current_generation)
+    downloader._store_public_token_prefetch_result(
+        public_key,
+        {"payload": {"url": "https://assets.example.invalid/test.mp3"}},
+        generation=current_generation,
+    )
+
+    assert downloader._remote_media_resolution_cache[remote_key] == "fresh"
+    assert public_key in downloader._public_token_prefetch_cache
+
+
+def test_schedule_public_token_prefetch_drops_future_submitted_before_reset_boundary() -> None:
+    downloader = _ResetDuringTokenPrefetchDownloader(_DummyClient())
+    request = {
+        "asset_type": "speech",
+        "asset_role": "forward_media",
+        "file_name": "speech-a.mp3",
+        "download_hint": {
+            "_forward_parent": {
+                "message_id_raw": "parent-a",
+                "element_id": "element:parent-a",
+                "peer_uid": "u-reset",
+                "chat_type_raw": "2",
+            }
+        },
+    }
+    payload = {
+        "public_action": "get_record",
+        "public_file_token": "token-a",
+        "file_name": "speech-a.mp3",
+    }
+
+    downloader._schedule_public_token_prefetch(
+        request=request,
+        request_data=request,
+        payload=payload,
+    )
+
+    assert downloader._public_token_prefetch_futures == {}
+    assert downloader._public_token_prefetch_cache == {}
+
+
+def test_ensure_remote_media_future_drops_future_submitted_before_reset_boundary() -> None:
+    downloader = _ResetDuringRemoteSubmitDownloader(_DummyClient())
+
+    future, created = downloader._ensure_remote_media_future(
+        asset_type="image",
+        file_name="image-a.jpg",
+        resolved_remote_url="https://assets.example.invalid/image-a.jpg",
+    )
+
+    assert future is None
+    assert created is False
+    assert downloader._remote_media_resolution_futures == {}
+    assert downloader._remote_media_resolution_cache == {}

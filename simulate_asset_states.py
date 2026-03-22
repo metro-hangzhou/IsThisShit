@@ -20,9 +20,18 @@ from qq_data_integrations.napcat.asset_simulator import (  # noqa: E402
     all_asset_resolution_scenarios,
     default_asset_resolution_scenarios,
     default_forward_candidate_priority_cases,
+    default_asset_resolution_pair_cases,
+    default_cross_run_reset_cases,
+    default_direct_file_id_scope_cases,
     default_public_timeout_scope_cases,
     default_shared_outcome_scope_cases,
     default_forward_timeout_matrix,
+    run_cross_run_reset_case,
+    run_cross_run_reset_matrix,
+    run_asset_resolution_pair_case,
+    run_asset_resolution_pair_matrix,
+    run_direct_file_id_scope_case,
+    run_direct_file_id_scope_matrix,
     run_forward_candidate_priority_case,
     run_forward_candidate_priority_matrix,
     run_public_timeout_scope_case,
@@ -36,8 +45,11 @@ from qq_data_integrations.napcat.asset_simulator import (  # noqa: E402
     run_shared_outcome_scope_matrix,
     summarize_forward_candidate_priority_results,
     summarize_prefetch_planning_results,
+    summarize_asset_resolution_pair_results,
     summarize_asset_resolution_catalog,
     summarize_asset_resolution_results,
+    summarize_cross_run_reset_results,
+    summarize_direct_file_id_scope_results,
     summarize_forward_timeout_results,
     summarize_public_timeout_scope_results,
     summarize_shared_outcome_scope_results,
@@ -240,6 +252,83 @@ def _render_public_timeout_scope_result(result: dict[str, Any]) -> str:
     return "\n".join(
         [
             "public_timeout_scope_case:",
+            (
+                "  case="
+                f"{result['name']} asset_type={result['asset_type']} "
+                f"relationship={result['relationship']}"
+            ),
+            (
+                "  outcome="
+                f"expected_same_key={result['expected_same_key']} actual_same_key={result['actual_same_key']} "
+                f"matched={result['matched']}"
+            ),
+            f"  key_a={result['key_a']}",
+            f"  key_b={result['key_b']}",
+        ]
+    )
+
+
+def _render_pair_summary(summary: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "pair_sequence_summary:",
+            (
+                "  totals="
+                f"total={summary['total']} matched={summary['matched']} "
+                f"mismatched={summary['mismatched']}"
+            ),
+            f"  resolver_counts={summary['resolver_counts']}",
+            f"  path_kind_counts={summary['path_kind_counts']}",
+            f"  mismatch_names={summary['mismatch_names']}",
+        ]
+    )
+
+
+def _render_pair_result(result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "pair_sequence_case:",
+            f"  name={result['name']}",
+            f"  first={result['first_name']} -> resolver={result['actual_first_resolver']} path_kind={result['actual_first_path_kind']}",
+            (
+                "  second="
+                f"{result['second_name']} expected_resolver={result['expected_second_resolver']} "
+                f"expected_path_kind={result['expected_second_path_kind']}"
+            ),
+            (
+                "  outcome="
+                f"resolver={result['actual_second_resolver']} path_kind={result['actual_second_path_kind']} "
+                f"matched={result['matched']}"
+            ),
+            (
+                "  calls="
+                f"public={result['client_call_count']} fast={result['fast_call_count']} remote={result['remote_attempt_count']}"
+            ),
+            f"  cost_matched={result['cost_matched']}",
+        ]
+    )
+
+
+def _render_direct_file_id_scope_summary(summary: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "direct_file_id_scope_summary:",
+            (
+                "  totals="
+                f"total={summary['total']} matched={summary['matched']} "
+                f"mismatched={summary['mismatched']}"
+            ),
+            f"  asset_type_counts={summary['asset_type_counts']}",
+            f"  relationship_counts={summary['relationship_counts']}",
+            f"  mismatch_names={summary['mismatch_names']}",
+        ]
+    )
+
+
+def _render_direct_file_id_scope_result(result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "direct_file_id_scope_case:",
             (
                 "  case="
                 f"{result['name']} asset_type={result['asset_type']} "
@@ -467,6 +556,57 @@ def main() -> None:
     )
     public_timeout_scope_case_parser.add_argument("--json", action="store_true")
 
+    pair_matrix_parser = subparsers.add_parser(
+        "pair-sequence-matrix",
+        help="Run bounded cross-scenario cache/breaker carry-over cases on one downloader instance.",
+    )
+    pair_matrix_parser.add_argument("--json", action="store_true")
+    pair_matrix_parser.add_argument("--summary-only", action="store_true")
+
+    pair_case_parser = subparsers.add_parser(
+        "pair-sequence-case",
+        help="Run one bounded cross-scenario cache/breaker carry-over case.",
+    )
+    pair_case_parser.add_argument(
+        "name",
+        choices=sorted(item.name for item in default_asset_resolution_pair_cases()),
+    )
+    pair_case_parser.add_argument("--json", action="store_true")
+
+    cross_run_reset_matrix_parser = subparsers.add_parser(
+        "cross-run-reset-matrix",
+        help="Run bounded cross-run reset cases to verify reset_export_state clears run-local poisoning.",
+    )
+    cross_run_reset_matrix_parser.add_argument("--json", action="store_true")
+    cross_run_reset_matrix_parser.add_argument("--summary-only", action="store_true")
+
+    cross_run_reset_case_parser = subparsers.add_parser(
+        "cross-run-reset-case",
+        help="Run one bounded cross-run reset case.",
+    )
+    cross_run_reset_case_parser.add_argument(
+        "name",
+        choices=sorted(item.name for item in default_cross_run_reset_cases()),
+    )
+    cross_run_reset_case_parser.add_argument("--json", action="store_true")
+
+    direct_file_id_scope_parser = subparsers.add_parser(
+        "direct-file-id-scope-matrix",
+        help="Run the bounded direct-file-id request-key scope matrix.",
+    )
+    direct_file_id_scope_parser.add_argument("--json", action="store_true")
+    direct_file_id_scope_parser.add_argument("--summary-only", action="store_true")
+
+    direct_file_id_scope_case_parser = subparsers.add_parser(
+        "direct-file-id-scope-case",
+        help="Run one bounded direct-file-id request-key scope case.",
+    )
+    direct_file_id_scope_case_parser.add_argument(
+        "name",
+        choices=sorted(item.name for item in default_direct_file_id_scope_cases()),
+    )
+    direct_file_id_scope_case_parser.add_argument("--json", action="store_true")
+
     resolution_parser = subparsers.add_parser(
         "resolution-matrix",
         help="Run a scenario-driven resolution matrix across asset families and states.",
@@ -648,6 +788,78 @@ def main() -> None:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             print(_render_public_timeout_scope_result(result))
+        return
+
+    if args.command == "pair-sequence-matrix":
+        pair_results = run_asset_resolution_pair_matrix()
+        results = [item.to_dict() for item in pair_results]
+        summary = summarize_asset_resolution_pair_results(pair_results)
+        if args.json:
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+        else:
+            print(_render_pair_summary(summary))
+            if not args.summary_only:
+                for index, result in enumerate(results, start=1):
+                    print()
+                    print(f"[scenario {index}]")
+                    print(_render_pair_result(result))
+        return
+
+    if args.command == "pair-sequence-case":
+        cases = {item.name: item for item in default_asset_resolution_pair_cases()}
+        result = run_asset_resolution_pair_case(cases[args.name]).to_dict()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(_render_pair_result(result))
+        return
+
+    if args.command == "cross-run-reset-matrix":
+        reset_results = run_cross_run_reset_matrix()
+        results = [item.to_dict() for item in reset_results]
+        summary = summarize_cross_run_reset_results(reset_results)
+        if args.json:
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+        else:
+            print(_render_pair_summary(summary).replace("pair_sequence", "cross_run_reset"))
+            if not args.summary_only:
+                for index, result in enumerate(results, start=1):
+                    print()
+                    print(f"[scenario {index}]")
+                    print(_render_pair_result(result).replace("pair_sequence", "cross_run_reset"))
+        return
+
+    if args.command == "cross-run-reset-case":
+        cases = {item.name: item for item in default_cross_run_reset_cases()}
+        result = run_cross_run_reset_case(cases[args.name]).to_dict()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(_render_pair_result(result).replace("pair_sequence", "cross_run_reset"))
+        return
+
+    if args.command == "direct-file-id-scope-matrix":
+        direct_results = run_direct_file_id_scope_matrix()
+        results = [item.to_dict() for item in direct_results]
+        summary = summarize_direct_file_id_scope_results(direct_results)
+        if args.json:
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+        else:
+            print(_render_direct_file_id_scope_summary(summary))
+            if not args.summary_only:
+                for index, result in enumerate(results, start=1):
+                    print()
+                    print(f"[scenario {index}]")
+                    print(_render_direct_file_id_scope_result(result))
+        return
+
+    if args.command == "direct-file-id-scope-case":
+        cases = {item.name: item for item in default_direct_file_id_scope_cases()}
+        result = run_direct_file_id_scope_case(cases[args.name]).to_dict()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(_render_direct_file_id_scope_result(result))
         return
 
     if args.command == "resolution-catalog":

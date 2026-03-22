@@ -6,7 +6,7 @@ import os
 import shutil
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -1429,6 +1429,511 @@ def summarize_public_timeout_scope_results(
     }
 
 
+def _retarget_simulation_clients(
+    downloader: "_ScenarioAwareDownloader",
+    client: "_ScenarioPublicClient",
+    fast_client: "_ScenarioFastClient",
+    runtime: "_ScenarioRuntimeState",
+    scenario: "AssetResolutionScenario",
+) -> None:
+    downloader._scenario_state = runtime
+    client._scenario = scenario
+    client._state = runtime
+    fast_client._scenario = scenario
+    fast_client._state = runtime
+
+
+def default_asset_resolution_pair_cases() -> list[AssetResolutionPairCase]:
+    scenarios = {item.name: item for item in all_asset_resolution_scenarios()}
+    cases: list[AssetResolutionPairCase] = []
+
+    shared_image_name = "pair_top_level_image_shared_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="top_level_image_placeholder_then_public_remote",
+            first=replace(
+                scenarios["top_level_image_placeholder_zero_byte"],
+                name=shared_image_name,
+                age_days=240,
+            ),
+            second=replace(
+                scenarios["top_level_image_public_token_remote"],
+                name=shared_image_name,
+                age_days=20,
+            ),
+            expected_second_resolver="napcat_public_token_get_image_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=1,
+            notes="Old placeholder image missing must not poison later recoverable public-token remote recovery for the same logical asset identity.",
+        )
+    )
+
+    shared_video_name = "pair_top_level_video_shared_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="top_level_video_old_timeout_then_direct_remote",
+            first=AssetResolutionScenario(
+                name=shared_video_name,
+                suite="pair_sequence",
+                asset_type="video",
+                topology="top_level",
+                age_days=240,
+                context_payload_state="timeout",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1,
+                max_remote_attempts=0,
+                notes="Synthetic old top-level video timeout miss for cross-scenario cache poisoning checks.",
+            ),
+            second=replace(
+                scenarios["top_level_video_context_timeout_direct_file_id_remote"],
+                name=shared_video_name,
+                age_days=20,
+            ),
+            expected_second_resolver="napcat_segment_file_id_get_file_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=2,
+            max_remote_attempts=1,
+            notes="Old unresolved top-level video timeout miss must not poison later direct-file-id remote recovery for the same logical asset identity.",
+        )
+    )
+
+    shared_file_name = "pair_top_level_file_shared_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="top_level_file_old_timeout_then_direct_remote",
+            first=AssetResolutionScenario(
+                name=shared_file_name,
+                suite="pair_sequence",
+                asset_type="file",
+                topology="top_level",
+                age_days=240,
+                context_payload_state="timeout",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1,
+                max_remote_attempts=0,
+                notes="Synthetic old top-level file timeout miss for cross-scenario cache poisoning checks.",
+            ),
+            second=AssetResolutionScenario(
+                name=shared_file_name,
+                suite="pair_sequence",
+                asset_type="file",
+                topology="top_level",
+                age_days=20,
+                context_payload_state="unavailable",
+                direct_file_result_state="valid_remote",
+                expected_resolver="napcat_segment_file_id_get_file_remote_url",
+                expected_path_kind="remote",
+                max_client_calls=1,
+                max_fast_calls=1,
+                max_remote_attempts=1,
+                notes="Same logical asset identity later becomes recoverable through direct-file-id remote path.",
+            ),
+            expected_second_resolver="napcat_segment_file_id_get_file_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=2,
+            max_remote_attempts=1,
+            notes="Top-level file timeout miss must not poison later remote direct-file-id recovery.",
+        )
+    )
+
+    shared_speech_name = "pair_top_level_speech_shared_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="top_level_speech_old_timeout_then_public_remote",
+            first=AssetResolutionScenario(
+                name=shared_speech_name,
+                suite="pair_sequence",
+                asset_type="speech",
+                topology="top_level",
+                age_days=240,
+                context_payload_state="timeout",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1,
+                max_remote_attempts=0,
+            ),
+            second=replace(
+                scenarios["top_level_speech_public_token_remote"],
+                name=shared_speech_name,
+                age_days=20,
+            ),
+            expected_second_resolver="napcat_public_token_get_record_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=2,
+            max_remote_attempts=1,
+            notes="Old unresolved top-level speech timeout miss must not poison later public-token remote recovery.",
+        )
+    )
+
+    shared_forward_name = "pair_forward_video_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="forward_old_public_timeout_then_recent_remote",
+            first=replace(
+                scenarios["forward_old_video_public_token_timeout"],
+                name=shared_forward_name,
+            ),
+            second=AssetResolutionScenario(
+                name=shared_forward_name,
+                suite="pair_sequence",
+                asset_type="video",
+                topology="forward",
+                age_days=20,
+                source_path_state="stale_missing",
+                hint_remote_state="live_http",
+                forward_payload_state="remote_url",
+                expected_resolver="napcat_forward_remote_url",
+                expected_path_kind="remote",
+                max_client_calls=0,
+                max_fast_calls=0,
+                max_remote_attempts=1,
+                notes="Recent forward remote recovery should not be poisoned by a prior old forward public-token timeout under the same logical asset identity.",
+            ),
+            expected_second_resolver="napcat_forward_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=1,
+        )
+    )
+
+    return cases
+
+
+def run_asset_resolution_pair_case(
+    case: AssetResolutionPairCase,
+    *,
+    trace_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> AssetResolutionPairResult:
+    runtime_first = _ScenarioRuntimeState(case.first)
+    runtime_second: _ScenarioRuntimeState | None = None
+    events: list[dict[str, Any]] = []
+    client = _ScenarioPublicClient(case.first, runtime_first)
+    fast_client = _ScenarioFastClient(case.first, runtime_first)
+    downloader = _ScenarioAwareDownloader(client, fast_client=fast_client, state=runtime_first)
+    try:
+        first_result = downloader.resolve_for_export(
+            copy.deepcopy(runtime_first.request),
+            trace_callback=(
+                (lambda event: (events.append(dict(event)), trace_callback and trace_callback(dict(event))))
+                if trace_callback is not None
+                else events.append
+            ),
+        )
+        first_path_kind, _ = _path_kind_for_result(first_result, runtime_first)
+
+        runtime_second = _ScenarioRuntimeState(case.second)
+        _retarget_simulation_clients(
+            downloader,
+            client,
+            fast_client,
+            runtime_second,
+            case.second,
+        )
+        second_result = downloader.resolve_for_export(
+            copy.deepcopy(runtime_second.request),
+            trace_callback=(
+                (lambda event: (events.append(dict(event)), trace_callback and trace_callback(dict(event))))
+                if trace_callback is not None
+                else events.append
+            ),
+        )
+        second_path_kind, _ = _path_kind_for_result(second_result, runtime_second)
+        cost_matched = True
+        if case.max_client_calls is not None and len(client.calls) > case.max_client_calls:
+            cost_matched = False
+        if case.max_fast_calls is not None and len(fast_client.calls) > case.max_fast_calls:
+            cost_matched = False
+        total_remote_attempts = len(runtime_first.remote_attempts) + len(runtime_second.remote_attempts)
+        if case.max_remote_attempts is not None and total_remote_attempts > case.max_remote_attempts:
+            cost_matched = False
+        matched = (
+            second_result[1] == case.expected_second_resolver
+            and second_path_kind == case.expected_second_path_kind
+            and cost_matched
+        )
+        trace_status_breakdown: dict[str, int] = {}
+        for event in events:
+            if str(event.get("phase") or "").strip() != "materialize_asset_substep":
+                continue
+            status = str(event.get("status") or "").strip()
+            if not status:
+                continue
+            trace_status_breakdown[status] = trace_status_breakdown.get(status, 0) + 1
+        return AssetResolutionPairResult(
+            name=case.name,
+            first_name=case.first.name,
+            second_name=case.second.name,
+            expected_second_resolver=case.expected_second_resolver,
+            expected_second_path_kind=case.expected_second_path_kind,
+            actual_first_resolver=first_result[1],
+            actual_first_path_kind=first_path_kind,
+            actual_second_resolver=second_result[1],
+            actual_second_path_kind=second_path_kind,
+            matched=matched,
+            client_call_count=len(client.calls),
+            fast_call_count=len(fast_client.calls),
+            remote_attempt_count=total_remote_attempts,
+            trace_event_count=len(events),
+            trace_status_breakdown=trace_status_breakdown,
+            cost_matched=cost_matched,
+            notes=case.notes,
+        )
+    finally:
+        downloader.close()
+        runtime_first.close()
+        if runtime_second is not None:
+            runtime_second.close()
+
+
+def run_asset_resolution_pair_matrix() -> list[AssetResolutionPairResult]:
+    return [
+        run_asset_resolution_pair_case(case)
+        for case in default_asset_resolution_pair_cases()
+    ]
+
+
+def summarize_asset_resolution_pair_results(
+    results: list[AssetResolutionPairResult],
+) -> dict[str, Any]:
+    mismatches = [item.name for item in results if not item.matched]
+    resolver_counts: Counter[str] = Counter(
+        str(item.actual_second_resolver or "<none>") for item in results
+    )
+    path_kind_counts: Counter[str] = Counter(item.actual_second_path_kind for item in results)
+    return {
+        "total": len(results),
+        "matched": len(results) - len(mismatches),
+        "mismatched": len(mismatches),
+        "resolver_counts": dict(resolver_counts),
+        "path_kind_counts": dict(path_kind_counts),
+        "mismatch_names": mismatches,
+    }
+
+
+def default_cross_run_reset_cases() -> list[AssetResolutionPairCase]:
+    return [
+        replace(
+            case,
+            name=f"cross_run_reset_{case.name}",
+            notes=(
+                f"{case.notes} The second step runs after reset_export_state() to prove per-run caches "
+                "and breakers do not poison the next run."
+            ).strip(),
+        )
+        for case in default_asset_resolution_pair_cases()
+    ]
+
+
+def run_cross_run_reset_case(
+    case: AssetResolutionPairCase,
+    *,
+    trace_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> AssetResolutionPairResult:
+    runtime_first = _ScenarioRuntimeState(case.first)
+    runtime_second: _ScenarioRuntimeState | None = None
+    events: list[dict[str, Any]] = []
+    client = _ScenarioPublicClient(case.first, runtime_first)
+    fast_client = _ScenarioFastClient(case.first, runtime_first)
+    downloader = _ScenarioAwareDownloader(client, fast_client=fast_client, state=runtime_first)
+    try:
+        first_result = downloader.resolve_for_export(
+            copy.deepcopy(runtime_first.request),
+            trace_callback=(
+                (lambda event: (events.append(dict(event)), trace_callback and trace_callback(dict(event))))
+                if trace_callback is not None
+                else events.append
+            ),
+        )
+        first_path_kind, _ = _path_kind_for_result(first_result, runtime_first)
+
+        downloader.reset_export_state()
+
+        runtime_second = _ScenarioRuntimeState(case.second)
+        _retarget_simulation_clients(
+            downloader,
+            client,
+            fast_client,
+            runtime_second,
+            case.second,
+        )
+        second_result = downloader.resolve_for_export(
+            copy.deepcopy(runtime_second.request),
+            trace_callback=(
+                (lambda event: (events.append(dict(event)), trace_callback and trace_callback(dict(event))))
+                if trace_callback is not None
+                else events.append
+            ),
+        )
+        second_path_kind, _ = _path_kind_for_result(second_result, runtime_second)
+        cost_matched = True
+        if case.max_client_calls is not None and len(client.calls) > case.max_client_calls:
+            cost_matched = False
+        if case.max_fast_calls is not None and len(fast_client.calls) > case.max_fast_calls:
+            cost_matched = False
+        total_remote_attempts = len(runtime_first.remote_attempts) + len(runtime_second.remote_attempts)
+        if case.max_remote_attempts is not None and total_remote_attempts > case.max_remote_attempts:
+            cost_matched = False
+        matched = (
+            second_result[1] == case.expected_second_resolver
+            and second_path_kind == case.expected_second_path_kind
+            and cost_matched
+        )
+        trace_status_breakdown: dict[str, int] = {}
+        for event in events:
+            if str(event.get("phase") or "").strip() != "materialize_asset_substep":
+                continue
+            status = str(event.get("status") or "").strip()
+            if not status:
+                continue
+            trace_status_breakdown[status] = trace_status_breakdown.get(status, 0) + 1
+        return AssetResolutionPairResult(
+            name=case.name,
+            first_name=case.first.name,
+            second_name=case.second.name,
+            expected_second_resolver=case.expected_second_resolver,
+            expected_second_path_kind=case.expected_second_path_kind,
+            actual_first_resolver=first_result[1],
+            actual_first_path_kind=first_path_kind,
+            actual_second_resolver=second_result[1],
+            actual_second_path_kind=second_path_kind,
+            matched=matched,
+            client_call_count=len(client.calls),
+            fast_call_count=len(fast_client.calls),
+            remote_attempt_count=total_remote_attempts,
+            trace_event_count=len(events),
+            trace_status_breakdown=trace_status_breakdown,
+            cost_matched=cost_matched,
+            notes=case.notes,
+        )
+    finally:
+        downloader.close()
+        runtime_first.close()
+        if runtime_second is not None:
+            runtime_second.close()
+
+
+def run_cross_run_reset_matrix() -> list[AssetResolutionPairResult]:
+    return [
+        run_cross_run_reset_case(case)
+        for case in default_cross_run_reset_cases()
+    ]
+
+
+def summarize_cross_run_reset_results(
+    results: list[AssetResolutionPairResult],
+) -> dict[str, Any]:
+    return summarize_asset_resolution_pair_results(results)
+
+
+def default_direct_file_id_scope_cases() -> list[DirectFileIdScopeCase]:
+    cases: list[DirectFileIdScopeCase] = []
+    for asset_type in ("video", "file", "speech"):
+        cases.extend(
+            [
+                DirectFileIdScopeCase(
+                    name=f"{asset_type}_same_parent_same_file_id",
+                    asset_type=asset_type,
+                    relationship="same_parent_same_file_id",
+                    expected_same_key=True,
+                ),
+                DirectFileIdScopeCase(
+                    name=f"{asset_type}_same_parent_different_file_id",
+                    asset_type=asset_type,
+                    relationship="same_parent_different_file_id",
+                    expected_same_key=False,
+                ),
+                DirectFileIdScopeCase(
+                    name=f"{asset_type}_same_parent_same_file_id_different_remote",
+                    asset_type=asset_type,
+                    relationship="same_parent_same_file_id_different_remote",
+                    expected_same_key=False,
+                ),
+                DirectFileIdScopeCase(
+                    name=f"{asset_type}_different_parent_same_file_id",
+                    asset_type=asset_type,
+                    relationship="different_parent_same_file_id",
+                    expected_same_key=False,
+                ),
+            ]
+        )
+    return cases
+
+
+def run_direct_file_id_scope_case(
+    case: DirectFileIdScopeCase,
+) -> DirectFileIdScopeResult:
+    request_a = _timeout_scope_request(
+        asset_type=case.asset_type,
+        parent_id="parent-a",
+        token="unused-token-a",
+        file_name=f"{case.asset_type}-a.bin",
+        md5=f"{case.asset_type}-md5-a",
+        file_id=f"/scope/{case.asset_type}/a",
+        forward=True,
+    )
+    request_b = copy.deepcopy(request_a)
+    if case.relationship == "same_parent_different_file_id":
+        request_b["download_hint"]["file_id"] = f"/scope/{case.asset_type}/b"
+    elif case.relationship == "same_parent_same_file_id_different_remote":
+        request_a["download_hint"]["remote_url"] = f"https://assets.example.invalid/{case.asset_type}/a.bin"
+        request_b["download_hint"]["remote_url"] = f"https://assets.example.invalid/{case.asset_type}/b.bin"
+    elif case.relationship == "different_parent_same_file_id":
+        request_b["download_hint"]["_forward_parent"]["message_id_raw"] = "parent-b"
+        request_b["download_hint"]["_forward_parent"]["element_id"] = "element:parent-b"
+    key_a = NapCatMediaDownloader._request_key(request_a)
+    key_b = NapCatMediaDownloader._request_key(request_b)
+    actual_same_key = key_a == key_b
+    return DirectFileIdScopeResult(
+        name=case.name,
+        asset_type=case.asset_type,
+        relationship=case.relationship,
+        expected_same_key=case.expected_same_key,
+        actual_same_key=actual_same_key,
+        matched=actual_same_key == case.expected_same_key,
+        key_a=key_a,
+        key_b=key_b,
+    )
+
+
+def run_direct_file_id_scope_matrix() -> list[DirectFileIdScopeResult]:
+    return [
+        run_direct_file_id_scope_case(case)
+        for case in default_direct_file_id_scope_cases()
+    ]
+
+
+def summarize_direct_file_id_scope_results(
+    results: list[DirectFileIdScopeResult],
+) -> dict[str, Any]:
+    asset_type_counts: Counter[str] = Counter()
+    relationship_counts: Counter[str] = Counter()
+    mismatches: list[str] = []
+    for item in results:
+        asset_type_counts[item.asset_type] += 1
+        relationship_counts[item.relationship] += 1
+        if not item.matched:
+            mismatches.append(item.name)
+    return {
+        "total": len(results),
+        "matched": len(results) - len(mismatches),
+        "mismatched": len(mismatches),
+        "asset_type_counts": dict(asset_type_counts),
+        "relationship_counts": dict(relationship_counts),
+        "mismatch_names": mismatches,
+    }
+
+
 def write_simulation_trace(path: Path, events: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -1510,6 +2015,82 @@ class AssetResolutionSequenceResult:
     trace_status_breakdown: dict[str, int]
     cost_matched: bool
     notes: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class AssetResolutionPairCase:
+    name: str
+    first: AssetResolutionScenario
+    second: AssetResolutionScenario
+    expected_second_resolver: str | None
+    expected_second_path_kind: str
+    max_client_calls: int | None = None
+    max_fast_calls: int | None = None
+    max_remote_attempts: int | None = None
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "first": self.first.to_dict(),
+            "second": self.second.to_dict(),
+            "expected_second_resolver": self.expected_second_resolver,
+            "expected_second_path_kind": self.expected_second_path_kind,
+            "max_client_calls": self.max_client_calls,
+            "max_fast_calls": self.max_fast_calls,
+            "max_remote_attempts": self.max_remote_attempts,
+            "notes": self.notes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AssetResolutionPairResult:
+    name: str
+    first_name: str
+    second_name: str
+    expected_second_resolver: str | None
+    expected_second_path_kind: str
+    actual_first_resolver: str | None
+    actual_first_path_kind: str
+    actual_second_resolver: str | None
+    actual_second_path_kind: str
+    matched: bool
+    client_call_count: int
+    fast_call_count: int
+    remote_attempt_count: int
+    trace_event_count: int
+    trace_status_breakdown: dict[str, int]
+    cost_matched: bool
+    notes: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectFileIdScopeCase:
+    name: str
+    asset_type: str
+    relationship: str
+    expected_same_key: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class DirectFileIdScopeResult:
+    name: str
+    asset_type: str
+    relationship: str
+    expected_same_key: bool
+    actual_same_key: bool
+    matched: bool
+    key_a: tuple[Any, ...] | None
+    key_b: tuple[Any, ...] | None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

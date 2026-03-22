@@ -127,6 +127,7 @@ class NapCatMediaDownloader:
         self._prefetch_state_lock = Lock()
         self._executor_lock = Lock()
         self._download_progress_lock = Lock()
+        self._transient_state_generation = 0
         self._download_progress = self._new_download_progress_state()
         self._download_operation_states: dict[tuple[str, str], str] = {}
         self._prefetch_feedback: dict[str, int] = {
@@ -220,6 +221,7 @@ class NapCatMediaDownloader:
 
     def _reset_transient_export_state(self) -> None:
         with self._prefetch_state_lock:
+            self._transient_state_generation += 1
             self._fast_context_route_disabled = False
             self._fast_forward_context_route_disabled = False
             self._prefetched_media.clear()
@@ -2632,18 +2634,21 @@ class NapCatMediaDownloader:
         *,
         resolver: str | None = None,
     ) -> bool:
+        terminal_missing_resolvers = {
+            "qq_expired_after_napcat",
+            "qq_not_downloaded_local_placeholder",
+            "napcat_video_url_unavailable",
+            "napcat_file_url_unavailable",
+            "napcat_record_url_unavailable",
+        }
+        normalized_resolver = str(resolver or "").strip()
+        if normalized_resolver not in terminal_missing_resolvers:
+            return False
         hint = self._request_hint(request)
         asset_type = str(request.get("asset_type") or "").strip()
         if self._has_forward_parent_hint(hint) and asset_type in {"file", "video", "speech"}:
-            return str(resolver or "").strip() == "qq_expired_after_napcat"
-        raw_timestamp = request.get("timestamp_ms")
-        if not isinstance(raw_timestamp, (int, float)):
-            return False
-        try:
-            asset_dt = datetime.fromtimestamp(float(raw_timestamp) / 1000.0, tz=timezone.utc)
-        except (OverflowError, OSError, ValueError):
-            return False
-        return datetime.now(timezone.utc) - asset_dt >= timedelta(days=self.SHARED_MISS_CACHE_MIN_AGE_DAYS)
+            return normalized_resolver == "qq_expired_after_napcat"
+        return True
 
     def _shared_request_key(self, request: dict[str, Any]) -> tuple[Any, ...] | None:
         hint = self._request_hint(request)
@@ -3214,6 +3219,7 @@ class NapCatMediaDownloader:
             return
         if future is not None and not future.done():
             return
+        generation = self._transient_state_generation
         file_name = (
             str(payload.get("file_name") or "").strip()
             or str(request_data.get("file_name") or "").strip()
@@ -3229,8 +3235,12 @@ class NapCatMediaDownloader:
                 action,
                 token,
                 file_name,
+                generation,
             )
         with self._prefetch_state_lock:
+            if generation != self._transient_state_generation:
+                future.cancel()
+                return
             existing_future = self._public_token_prefetch_futures.get(cache_key)
             existing_result = self._public_token_prefetch_cache.get(cache_key, ...)
             if existing_result is not ... or (
@@ -3351,6 +3361,7 @@ class NapCatMediaDownloader:
         action: str,
         token: str,
         file_name: str | None,
+        generation: int,
     ) -> dict[str, Any] | None:
         payload = self._call_public_action_with_token(action, token)
         result: dict[str, Any] = {
@@ -3380,7 +3391,7 @@ class NapCatMediaDownloader:
             hint={"url": resolved_remote_url},
         )
         cache_key = (asset_type, self._normalized_match_url(resolved_remote_url))
-        self._store_remote_prefetch_result(cache_key, downloaded)
+        self._store_remote_prefetch_result(cache_key, downloaded, generation=generation)
         if downloaded is None:
             self._record_prefetch_feedback("token_remote_error")
             return result
@@ -3510,6 +3521,7 @@ class NapCatMediaDownloader:
             return None, False
         if future is not None and not future.done():
             return future, False
+        generation = self._transient_state_generation
         future = self._submit_remote_media_download(
             asset_type=asset_type,
             file_name=file_name,
@@ -3518,6 +3530,9 @@ class NapCatMediaDownloader:
         if future is None:
             return None, False
         with self._prefetch_state_lock:
+            if generation != self._transient_state_generation:
+                future.cancel()
+                return None, False
             existing_future = self._remote_media_resolution_futures.get(cache_key)
             existing_result = self._remote_media_resolution_cache.get(cache_key, ...)
             if existing_result is not ...:
@@ -3813,8 +3828,12 @@ class NapCatMediaDownloader:
         self,
         cache_key: tuple[str, str],
         value: str | None,
+        *,
+        generation: int | None = None,
     ) -> None:
         with self._prefetch_state_lock:
+            if generation is not None and generation != self._transient_state_generation:
+                return
             self._remote_media_resolution_cache[cache_key] = value
             self._remote_media_resolution_futures.pop(cache_key, None)
 
@@ -3837,8 +3856,12 @@ class NapCatMediaDownloader:
         self,
         cache_key: tuple[str, str, str, str],
         value: dict[str, Any] | None,
+        *,
+        generation: int | None = None,
     ) -> None:
         with self._prefetch_state_lock:
+            if generation is not None and generation != self._transient_state_generation:
+                return
             self._public_token_prefetch_cache[cache_key] = value
             self._public_token_prefetch_futures.pop(cache_key, None)
 
@@ -4306,7 +4329,7 @@ class NapCatMediaDownloader:
         source_path = str(request.get("source_path") or "").strip()
         if source_path:
             return None
-        if not self._should_share_missing_outcome(request):
+        if self._old_context_bucket("image", request) is None:
             return None
         return "qq_expired_after_napcat"
 
@@ -5020,11 +5043,15 @@ class NapCatMediaDownloader:
     def _request_key(request: dict[str, Any]) -> tuple[Any, ...]:
         hint = NapCatMediaDownloader._request_hint(request)
         parent = hint.get("_forward_parent") if isinstance(hint.get("_forward_parent"), dict) else {}
+        remote_url = NapCatMediaDownloader._normalized_match_url(hint.get("remote_url") or hint.get("url"))
         return (
             str(request.get("asset_type") or "").strip(),
             str(request.get("asset_role") or "").strip(),
             str(request.get("file_name") or "").strip().lower(),
             str(request.get("md5") or "").strip().lower(),
+            str(hint.get("file_id") or "").strip(),
+            str(hint.get("file_biz_id") or request.get("file_biz_id") or "").strip(),
+            remote_url,
             str(hint.get("message_id_raw") or "").strip(),
             str(hint.get("element_id") or "").strip(),
             str(hint.get("peer_uid") or "").strip(),
