@@ -24,6 +24,9 @@ from qq_data_integrations.napcat.asset_simulator import (  # noqa: E402
     run_asset_resolution_sequence,
     run_asset_resolution_scenario,
     run_forward_timeout_simulation,
+    summarize_asset_resolution_catalog,
+    summarize_asset_resolution_results,
+    summarize_forward_timeout_results,
     write_simulation_trace,
 )
 
@@ -59,6 +62,37 @@ def _render_result(result: dict[str, Any]) -> str:
     )
 
 
+def _render_forward_timeout_summary(summary: dict[str, Any]) -> str:
+    worst_case = summary.get("worst_case") or {}
+    return "\n".join(
+        [
+            "forward_timeout_summary:",
+            (
+                "  totals="
+                f"scenarios={summary['total']} "
+                f"equivalent_live_timeout_total_s={summary['equivalent_live_timeout_total_s']:.1f} "
+                f"breaker_savings_total_s={summary['breaker_savings_total_s']:.1f}"
+            ),
+            (
+                "  risk="
+                f"storm_risk_count={summary['storm_risk_count']} "
+                f"short_circuit_help_count={summary['short_circuit_help_count']}"
+            ),
+            f"  route_counts={summary['route_counts']}",
+            f"  asset_type_counts={summary['asset_type_counts']}",
+            f"  age_bucket_counts={summary['age_bucket_counts']}",
+            f"  trace_status_totals={summary['trace_status_totals']}",
+            (
+                "  worst_case="
+                f"{worst_case.get('route')} {worst_case.get('asset_type')} "
+                f"age_days={worst_case.get('age_days')} "
+                f"parents={worst_case.get('parents')} siblings={worst_case.get('siblings_per_parent')} "
+                f"equivalent_live_timeout_s={worst_case.get('equivalent_live_timeout_s')}"
+            ),
+        ]
+    )
+
+
 def _render_resolution_result(result: dict[str, Any]) -> str:
     return "\n".join(
         [
@@ -83,6 +117,51 @@ def _render_resolution_result(result: dict[str, Any]) -> str:
             f"  notes={result['notes']}",
         ]
     )
+
+
+def _render_resolution_summary(summary: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "resolution_summary:",
+            (
+                "  totals="
+                f"total={summary['total']} matched={summary['matched']} "
+                f"mismatched={summary['mismatched']} cost_overruns={summary['cost_overruns']}"
+            ),
+            f"  suite_counts={summary['suite_counts']}",
+            f"  asset_type_counts={summary['asset_type_counts']}",
+            f"  topology_counts={summary['topology_counts']}",
+            f"  age_bucket_counts={summary['age_bucket_counts']}",
+            f"  resolver_counts={summary['resolver_counts']}",
+            f"  path_kind_counts={summary['path_kind_counts']}",
+            f"  trace_status_totals={summary['trace_status_totals']}",
+        ]
+    )
+
+
+def _render_catalog_summary(summary: dict[str, Any]) -> str:
+    interesting_fields = (
+        "forward_parent_state",
+        "source_path_state",
+        "hint_local_state",
+        "hint_remote_state",
+        "forward_payload_state",
+        "public_result_state",
+        "public_fallback_result_state",
+        "direct_file_result_state",
+    )
+    lines = [
+        "resolution_catalog:",
+        f"  total={summary['total']}",
+        f"  suite_counts={summary['suite_counts']}",
+        f"  asset_type_counts={summary['asset_type_counts']}",
+        f"  topology_counts={summary['topology_counts']}",
+        f"  age_bucket_counts={summary['age_bucket_counts']}",
+    ]
+    state_field_counts = summary.get("state_field_counts") or {}
+    for field_name in interesting_fields:
+        lines.append(f"  {field_name}={state_field_counts.get(field_name, {})}")
+    return "\n".join(lines)
 
 
 def _render_resolution_sequence_result(result: dict[str, Any]) -> str:
@@ -150,6 +229,7 @@ def main() -> None:
     )
     matrix_parser.add_argument("--delay-s", type=float, default=0.02)
     matrix_parser.add_argument("--json", action="store_true")
+    matrix_parser.add_argument("--summary-only", action="store_true")
 
     resolution_parser = subparsers.add_parser(
         "resolution-matrix",
@@ -161,6 +241,15 @@ def main() -> None:
         choices=RESOLUTION_SUITES,
         default=None,
     )
+    resolution_parser.add_argument("--summary-only", action="store_true")
+    resolution_parser.add_argument("--only-mismatched", action="store_true")
+    resolution_parser.add_argument("--only-cost-overrun", action="store_true")
+
+    resolution_catalog_parser = subparsers.add_parser(
+        "resolution-catalog",
+        help="Summarize scenario coverage and state-shape distribution without running exporter logic.",
+    )
+    resolution_catalog_parser.add_argument("--json", action="store_true")
 
     resolution_case_parser = subparsers.add_parser(
         "resolution-case",
@@ -199,33 +288,56 @@ def main() -> None:
         return
 
     if args.command == "matrix":
-        results = [item.to_dict() for item in default_forward_timeout_matrix(delay_s=args.delay_s)]
+        matrix_results = default_forward_timeout_matrix(delay_s=args.delay_s)
+        summary = summarize_forward_timeout_results(matrix_results)
+        results = [item.to_dict() for item in matrix_results]
         if args.json:
-            print(json.dumps(results, ensure_ascii=False, indent=2))
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+            return
+        print(_render_forward_timeout_summary(summary))
+        if args.summary_only:
             return
         for index, result in enumerate(results, start=1):
-            if index > 1:
+            if index == 1:
+                print()
+            else:
                 print()
             print(f"[scenario {index}]")
             print(_render_result(result))
         return
 
     if args.command == "resolution-matrix":
-        results = [item.to_dict() for item in run_asset_resolution_matrix(suite=args.suite)]
+        all_results = run_asset_resolution_matrix(suite=args.suite)
+        summary = summarize_asset_resolution_results(all_results)
+        results = [item.to_dict() for item in all_results]
+        if args.only_mismatched:
+            results = [item for item in results if not bool(item.get("matched"))]
+        if args.only_cost_overrun:
+            results = [item for item in results if not bool(item.get("cost_matched"))]
         if args.json:
-            print(json.dumps(results, ensure_ascii=False, indent=2))
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
             return
-        mismatches = [item for item in results if not bool(item.get("matched"))]
-        print(
-            "resolution_matrix:"
-            f" total={len(results)} matched={len(results) - len(mismatches)} mismatched={len(mismatches)}"
-        )
+        print(_render_resolution_summary(summary))
         if args.suite:
             print(f"resolution_suite: {args.suite}")
+        if args.only_mismatched:
+            print("resolution_filter: only_mismatched=1")
+        if args.only_cost_overrun:
+            print("resolution_filter: only_cost_overrun=1")
+        if args.summary_only:
+            return
         for index, result in enumerate(results, start=1):
             print()
             print(f"[scenario {index}]")
             print(_render_resolution_result(result))
+        return
+
+    if args.command == "resolution-catalog":
+        summary = summarize_asset_resolution_catalog()
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+        else:
+            print(_render_catalog_summary(summary))
         return
 
     if args.command == "resolution-case":

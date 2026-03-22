@@ -2020,8 +2020,8 @@ class NapCatMediaDownloader:
             if score <= 0:
                 continue
             rank = (
-                1 if str(asset.get("public_file_token") or "").strip() else 0,
                 1 if self._resolved_path_from_payload(asset) is not None else 0,
+                1 if str(asset.get("public_file_token") or "").strip() else 0,
                 len(asset_file_name or ""),
                 score,
             )
@@ -2601,16 +2601,24 @@ class NapCatMediaDownloader:
     ) -> tuple[Path | None, str | None]:
         if shared_key is None:
             return result
-        resolved_path, _resolver = result
-        if resolved_path is not None or self._should_share_missing_outcome(request):
+        resolved_path, resolver = result
+        if resolved_path is not None or self._should_share_missing_outcome(
+            request,
+            resolver=resolver,
+        ):
             self._shared_media_outcomes[shared_key] = result
         return result
 
-    def _should_share_missing_outcome(self, request: dict[str, Any]) -> bool:
+    def _should_share_missing_outcome(
+        self,
+        request: dict[str, Any],
+        *,
+        resolver: str | None = None,
+    ) -> bool:
         hint = self._request_hint(request)
         asset_type = str(request.get("asset_type") or "").strip()
         if self._has_forward_parent_hint(hint) and asset_type in {"file", "video"}:
-            return True
+            return str(resolver or "").strip() == "qq_expired_after_napcat"
         raw_timestamp = request.get("timestamp_ms")
         if not isinstance(raw_timestamp, (int, float)):
             return False

@@ -8,6 +8,9 @@ from qq_data_integrations.napcat.asset_simulator import (
     run_asset_resolution_sequence,
     run_asset_resolution_scenario,
     run_forward_timeout_simulation,
+    summarize_asset_resolution_catalog,
+    summarize_asset_resolution_results,
+    summarize_forward_timeout_results,
 )
 
 
@@ -58,10 +61,46 @@ def test_forward_materialize_same_parent_short_circuits_siblings() -> None:
 def test_default_matrix_includes_video_and_speech_routes() -> None:
     results = default_forward_timeout_matrix(delay_s=0.0)
 
-    assert len(results) >= 6
+    assert len(results) >= 54
     assert any(item.route == "public-token" and item.asset_type == "video" for item in results)
     assert any(item.route == "forward-materialize" and item.asset_type == "video" for item in results)
     assert any(item.route == "public-token" and item.asset_type == "speech" for item in results)
+    assert any(item.age_days >= 180 for item in results)
+    assert any(item.age_days < 30 for item in results)
+
+
+def test_old_forward_timeout_budget_is_shorter_than_recent_for_same_route() -> None:
+    recent = run_forward_timeout_simulation(
+        route="public-token",
+        asset_type="video",
+        parents=4,
+        siblings_per_parent=1,
+        age_days=20,
+        delay_s=0.0,
+    )
+    old = run_forward_timeout_simulation(
+        route="public-token",
+        asset_type="video",
+        parents=4,
+        siblings_per_parent=1,
+        age_days=260,
+        delay_s=0.0,
+    )
+
+    assert old.timeout_budget_s < recent.timeout_budget_s
+    assert old.equivalent_live_timeout_s < recent.equivalent_live_timeout_s
+
+
+def test_forward_timeout_summary_reports_age_buckets_and_worst_case() -> None:
+    summary = summarize_forward_timeout_results(default_forward_timeout_matrix(delay_s=0.0))
+
+    assert summary["total"] >= 54
+    assert summary["age_bucket_counts"]["recent"] > 0
+    assert summary["age_bucket_counts"]["old_forward"] > 0
+    assert summary["storm_risk_count"] > 0
+    assert summary["short_circuit_help_count"] > 0
+    assert summary["breaker_savings_total_s"] > 0
+    assert summary["worst_case"]["equivalent_live_timeout_s"] > 0
 
 
 def test_asset_resolution_matrix_matches_expectations() -> None:
@@ -158,6 +197,34 @@ def test_asset_resolution_scenario_catalog_is_systematic() -> None:
     assert any("public_not_found" in item.name for item in scenarios)
     assert any("direct_not_found" in item.name for item in scenarios)
     assert any(item.asset_type == "sticker" and item.topology == "nested_forward" for item in scenarios)
+
+
+def test_asset_resolution_summary_reports_no_mismatches_and_catalog_shape() -> None:
+    results = run_asset_resolution_matrix()
+    summary = summarize_asset_resolution_results(results)
+
+    assert summary["total"] >= 450
+    assert summary["mismatched"] == 0
+    assert summary["cost_overruns"] == 0
+    assert summary["suite_counts"]["route_health"] > 0
+    assert summary["asset_type_counts"]["video"] > 0
+    assert summary["topology_counts"]["nested_forward"] > 0
+    assert summary["age_bucket_counts"]["old_forward"] > 0
+    assert "<none>" in summary["resolver_counts"] or any(
+        key.startswith("napcat_") or key == "qq_expired_after_napcat"
+        for key in summary["resolver_counts"]
+    )
+
+
+def test_asset_resolution_catalog_reports_state_coverage() -> None:
+    summary = summarize_asset_resolution_catalog()
+
+    assert summary["total"] >= 450
+    assert summary["suite_counts"]["public_token_shape_drift"] == 36
+    assert summary["state_field_counts"]["hint_remote_state"]["live_http"] > 0
+    assert summary["state_field_counts"]["public_fallback_result_state"]["valid_remote_only"] > 0
+    assert summary["state_field_counts"]["forward_parent_state"]["missing_peer_uid"] > 0
+    assert summary["state_field_counts"]["direct_file_result_state"]["not_found"] > 0
 
 
 def test_asset_resolution_exhaustive_old_forward_terminal_suite_matches_expectations() -> None:

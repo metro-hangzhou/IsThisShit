@@ -211,6 +211,22 @@ Recent field failures showed that the project has two separate but related stabi
   - route-unavailable / mixed-route deployment states
   - batch-prefetch pressure and executor-level behavior
 
+### [2026-03-22][015] Summary-first simulator coverage is now part of exporter review discipline
+
+- Problem:
+  - raw matrix dumps are too noisy for broad developer review
+  - the real missing insight is often:
+    - which suites are covered
+    - which age buckets are expensive
+    - which cost overruns still exist
+- Current fix:
+  - simulator now emits:
+    - forward timeout summary
+    - resolution summary
+    - resolution coverage catalog
+- Remaining gap:
+  - add batch/shared-cache poisoning simulations and prefetch-pressure suites
+
 ## Current Fix / Guardrail Tasks
 
 - [ ] Keep CLI launcher policy explicit in regression review:
@@ -240,6 +256,7 @@ Recent field failures showed that the project has two separate but related stabi
 - [ ] Record friend-machine failures into perf/forensics docs when new logs arrive
 - [ ] Keep quick-login path covered by regression tests so QR fallback remains intact
 - [ ] Keep the asset-state simulator matrix in sync with any new asset family or recovery heuristic
+- [ ] Extend the asset-state simulator toward batch/shared-cache and executor-pressure coverage, not just single-request resolution
 - [ ] Keep `app.py login` and REPL `/login` behavior-compatible in regression coverage
 - [ ] Keep local live validation scripts/operator notes aligned with the fixed local account `3956020260`
 - [ ] Keep local live/export validation matrix aligned with the fixed test targets:

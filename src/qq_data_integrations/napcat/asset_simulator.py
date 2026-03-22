@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -59,6 +60,7 @@ class _SleepingTimeoutForwardClient:
 class AssetSimulationResult:
     route: str
     asset_type: str
+    age_days: int
     parents: int
     siblings_per_parent: int
     total_requests: int
@@ -76,11 +78,21 @@ class AssetSimulationResult:
         return asdict(self)
 
 
+def _age_bucket_label(age_days: int) -> str:
+    normalized = max(0, int(age_days))
+    if normalized >= 180:
+        return "old_forward"
+    if normalized >= 30:
+        return "aged"
+    return "recent"
+
+
 def build_forward_timeout_request(
     *,
     asset_type: str,
     parent_index: int,
     sibling_index: int,
+    age_days: int = 20,
 ) -> dict[str, object]:
     suffix = {
         "video": "mp4",
@@ -92,6 +104,7 @@ def build_forward_timeout_request(
         "asset_role": "forward_media",
         "file_name": f"{asset_type}-p{parent_index:04d}-s{sibling_index:04d}.{suffix}",
         "md5": f"{parent_index:04d}{sibling_index:04d}".lower(),
+        "timestamp_ms": _timestamp_ms_for_age_days(age_days),
         "download_hint": {
             "_forward_parent": {
                 "message_id_raw": f"7617{parent_index:012d}",
@@ -109,6 +122,7 @@ def run_forward_timeout_simulation(
     asset_type: str,
     parents: int,
     siblings_per_parent: int,
+    age_days: int = 20,
     delay_s: float = 0.0,
     trace_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AssetSimulationResult:
@@ -120,6 +134,7 @@ def run_forward_timeout_simulation(
         raise ValueError(f"unsupported asset_type: {asset_type}")
     parents = max(1, int(parents))
     siblings_per_parent = max(1, int(siblings_per_parent))
+    age_days = max(0, int(age_days))
 
     events: list[dict[str, Any]] = []
 
@@ -132,15 +147,20 @@ def run_forward_timeout_simulation(
         if normalized_asset_type == "speech":
             client = _SleepingTimeoutPublicRecordClient(delay_s=delay_s)
             downloader = NapCatMediaDownloader(client)
-            timeout_budget_s = downloader.PUBLIC_TOKEN_ACTION_TIMEOUT_S
             backend_call_getter = lambda: client.get_record_calls
             action = "get_record"
         else:
             client = _SleepingTimeoutPublicFileClient(delay_s=delay_s)
             downloader = NapCatMediaDownloader(client)
-            timeout_budget_s = downloader.PUBLIC_TOKEN_ACTION_TIMEOUT_S
             backend_call_getter = lambda: client.get_file_calls
             action = "get_file"
+        timeout_probe_request = build_forward_timeout_request(
+            asset_type=normalized_asset_type,
+            parent_index=0,
+            sibling_index=0,
+            age_days=age_days,
+        )
+        timeout_budget_s = downloader._public_action_timeout_s(action, request=timeout_probe_request)
         started = time.perf_counter()
         for parent_index in range(parents):
             for sibling_index in range(siblings_per_parent):
@@ -148,6 +168,7 @@ def run_forward_timeout_simulation(
                     asset_type=normalized_asset_type,
                     parent_index=parent_index,
                     sibling_index=sibling_index,
+                    age_days=age_days,
                 )
                 token = f"token-{normalized_asset_type}-{parent_index:04d}-{sibling_index:04d}"
                 downloader._call_public_action_with_token(
@@ -161,7 +182,16 @@ def run_forward_timeout_simulation(
     else:
         fast_client = _SleepingTimeoutForwardClient(delay_s=delay_s)
         downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
-        timeout_budget_s = downloader.FORWARD_CONTEXT_TIMEOUT_S
+        timeout_probe_request = build_forward_timeout_request(
+            asset_type=normalized_asset_type,
+            parent_index=0,
+            sibling_index=0,
+            age_days=age_days,
+        )
+        timeout_budget_s = downloader._forward_context_timeout_s(
+            timeout_probe_request,
+            materialize=(normalized_route == "forward-materialize"),
+        )
         started = time.perf_counter()
         for parent_index in range(parents):
             for sibling_index in range(siblings_per_parent):
@@ -169,6 +199,7 @@ def run_forward_timeout_simulation(
                     asset_type=normalized_asset_type,
                     parent_index=parent_index,
                     sibling_index=sibling_index,
+                    age_days=age_days,
                 )
                 downloader._download_via_forward_context(
                     request,
@@ -198,6 +229,7 @@ def run_forward_timeout_simulation(
     return AssetSimulationResult(
         route=normalized_route,
         asset_type=normalized_asset_type,
+        age_days=age_days,
         parents=parents,
         siblings_per_parent=siblings_per_parent,
         total_requests=total_requests,
@@ -215,24 +247,11 @@ def run_forward_timeout_simulation(
 
 def default_forward_timeout_matrix(*, delay_s: float = 0.0) -> list[AssetSimulationResult]:
     scenarios = [
-        ("public-token", "video", 1, 12),
-        ("public-token", "video", 12, 1),
-        ("public-token", "file", 1, 12),
-        ("public-token", "file", 12, 1),
-        ("forward-materialize", "video", 1, 12),
-        ("forward-materialize", "video", 12, 1),
-        ("forward-materialize", "file", 1, 12),
-        ("forward-materialize", "file", 12, 1),
-        ("forward-metadata", "video", 1, 12),
-        ("forward-metadata", "video", 12, 1),
-        ("forward-metadata", "file", 1, 12),
-        ("forward-metadata", "file", 12, 1),
-        ("public-token", "speech", 1, 8),
-        ("public-token", "speech", 8, 1),
-        ("forward-materialize", "speech", 1, 8),
-        ("forward-materialize", "speech", 8, 1),
-        ("forward-metadata", "speech", 1, 8),
-        ("forward-metadata", "speech", 8, 1),
+        (route, asset_type, parents, siblings_per_parent, age_days)
+        for route in ("public-token", "forward-materialize", "forward-metadata")
+        for asset_type in ("video", "file", "speech")
+        for age_days in (20, 260)
+        for parents, siblings_per_parent in ((1, 8), (8, 1), (4, 4))
     ]
     return [
         run_forward_timeout_simulation(
@@ -240,10 +259,71 @@ def default_forward_timeout_matrix(*, delay_s: float = 0.0) -> list[AssetSimulat
             asset_type=asset_type,
             parents=parents,
             siblings_per_parent=siblings_per_parent,
+            age_days=age_days,
             delay_s=delay_s,
         )
-        for route, asset_type, parents, siblings_per_parent in scenarios
+        for route, asset_type, parents, siblings_per_parent, age_days in scenarios
     ]
+
+
+def summarize_forward_timeout_results(results: list[AssetSimulationResult]) -> dict[str, Any]:
+    route_counts: Counter[str] = Counter()
+    asset_counts: Counter[str] = Counter()
+    age_bucket_counts: Counter[str] = Counter()
+    trace_totals: Counter[str] = Counter()
+    total_live_timeout = 0.0
+    total_breaker_savings = 0.0
+    max_backend_calls = 0
+    max_timeout_budget = 0.0
+    worst_case: AssetSimulationResult | None = None
+    storm_risk_count = 0
+    short_circuit_help_count = 0
+    for item in results:
+        route_counts[item.route] += 1
+        asset_counts[item.asset_type] += 1
+        age_bucket = _age_bucket_label(item.age_days)
+        age_bucket_counts[age_bucket] += 1
+        total_live_timeout += float(item.equivalent_live_timeout_s)
+        total_breaker_savings += max(
+            0.0,
+            (float(item.total_requests) * float(item.timeout_budget_s))
+            - float(item.equivalent_live_timeout_s),
+        )
+        max_backend_calls = max(max_backend_calls, int(item.backend_timeout_calls))
+        max_timeout_budget = max(max_timeout_budget, float(item.timeout_budget_s))
+        if item.short_circuited_requests > 0:
+            short_circuit_help_count += 1
+        if item.parents > 1 and item.siblings_per_parent == 1 and item.backend_timeout_calls == item.total_requests:
+            storm_risk_count += 1
+        if worst_case is None or float(item.equivalent_live_timeout_s) > float(worst_case.equivalent_live_timeout_s):
+            worst_case = item
+        for status, count in item.trace_status_breakdown.items():
+            trace_totals[status] += int(count)
+    summary = {
+        "total": len(results),
+        "route_counts": dict(route_counts),
+        "asset_type_counts": dict(asset_counts),
+        "age_bucket_counts": dict(age_bucket_counts),
+        "trace_status_totals": dict(trace_totals),
+        "equivalent_live_timeout_total_s": round(total_live_timeout, 3),
+        "breaker_savings_total_s": round(total_breaker_savings, 3),
+        "max_backend_timeout_calls": max_backend_calls,
+        "max_timeout_budget_s": round(max_timeout_budget, 3),
+        "storm_risk_count": storm_risk_count,
+        "short_circuit_help_count": short_circuit_help_count,
+    }
+    if worst_case is not None:
+        summary["worst_case"] = {
+            "route": worst_case.route,
+            "asset_type": worst_case.asset_type,
+            "age_days": worst_case.age_days,
+            "parents": worst_case.parents,
+            "siblings_per_parent": worst_case.siblings_per_parent,
+            "equivalent_live_timeout_s": round(float(worst_case.equivalent_live_timeout_s), 3),
+            "backend_timeout_calls": int(worst_case.backend_timeout_calls),
+            "timeout_budget_s": round(float(worst_case.timeout_budget_s), 3),
+        }
+    return summary
 
 
 def write_simulation_trace(path: Path, events: list[dict[str, Any]]) -> None:
@@ -330,6 +410,94 @@ class AssetResolutionSequenceResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def summarize_asset_resolution_results(
+    results: list[AssetResolutionResult],
+) -> dict[str, Any]:
+    suite_counts: Counter[str] = Counter()
+    asset_counts: Counter[str] = Counter()
+    topology_counts: Counter[str] = Counter()
+    age_bucket_counts: Counter[str] = Counter()
+    resolver_counts: Counter[str] = Counter()
+    path_kind_counts: Counter[str] = Counter()
+    trace_totals: Counter[str] = Counter()
+    mismatches: list[str] = []
+    cost_overruns: list[str] = []
+    for item in results:
+        suite_counts[item.suite] += 1
+        asset_counts[item.asset_type] += 1
+        topology_counts[item.topology] += 1
+        age_bucket_counts[_age_bucket_label(item.age_days)] += 1
+        resolver_counts[str(item.actual_resolver or "<none>")] += 1
+        path_kind_counts[item.actual_path_kind] += 1
+        if not item.matched:
+            mismatches.append(item.name)
+        if not item.cost_matched:
+            cost_overruns.append(item.name)
+        for status, count in item.trace_status_breakdown.items():
+            trace_totals[status] += int(count)
+    return {
+        "total": len(results),
+        "matched": len(results) - len(mismatches),
+        "mismatched": len(mismatches),
+        "cost_overruns": len(cost_overruns),
+        "suite_counts": dict(suite_counts),
+        "asset_type_counts": dict(asset_counts),
+        "topology_counts": dict(topology_counts),
+        "age_bucket_counts": dict(age_bucket_counts),
+        "resolver_counts": dict(resolver_counts),
+        "path_kind_counts": dict(path_kind_counts),
+        "trace_status_totals": dict(trace_totals),
+        "mismatch_names": mismatches,
+        "cost_overrun_names": cost_overruns,
+    }
+
+
+def summarize_asset_resolution_catalog(
+    scenarios: list["AssetResolutionScenario"] | None = None,
+) -> dict[str, Any]:
+    active = list(all_asset_resolution_scenarios() if scenarios is None else scenarios)
+    suite_counts: Counter[str] = Counter()
+    asset_counts: Counter[str] = Counter()
+    topology_counts: Counter[str] = Counter()
+    age_bucket_counts: Counter[str] = Counter()
+    state_field_names = (
+        "forward_parent_state",
+        "source_path_state",
+        "hint_local_state",
+        "hint_remote_state",
+        "context_payload_state",
+        "forward_payload_state",
+        "forward_metadata_state",
+        "forward_materialize_state",
+        "public_result_state",
+        "public_fallback_result_state",
+        "direct_file_result_state",
+    )
+    state_field_counts: dict[str, Counter[str]] = {
+        field_name: Counter() for field_name in state_field_names
+    }
+    for item in active:
+        suite_counts[item.suite] += 1
+        asset_counts[item.asset_type] += 1
+        topology_counts[item.topology] += 1
+        age_bucket_counts[_age_bucket_label(item.age_days)] += 1
+        for field_name in state_field_names:
+            raw_value = getattr(item, field_name)
+            normalized = str(raw_value or "<none>")
+            state_field_counts[field_name][normalized] += 1
+    return {
+        "total": len(active),
+        "suite_counts": dict(suite_counts),
+        "asset_type_counts": dict(asset_counts),
+        "topology_counts": dict(topology_counts),
+        "age_bucket_counts": dict(age_bucket_counts),
+        "state_field_counts": {
+            field_name: dict(counter)
+            for field_name, counter in state_field_counts.items()
+        },
+    }
 
 
 def _asset_suffix(asset_type: str) -> str:
