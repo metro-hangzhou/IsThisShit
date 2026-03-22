@@ -1985,6 +1985,7 @@ class NapCatMediaDownloader:
         file_name = str(request.get("file_name") or "").strip().lower()
         md5 = str(request.get("md5") or "").strip().lower()
         file_id = str(hint.get("file_id") or "").strip()
+        file_biz_id = str(hint.get("file_biz_id") or request.get("file_biz_id") or "").strip()
         request_url = self._normalized_match_url(
             hint.get("remote_url") or hint.get("url")
         )
@@ -2002,6 +2003,7 @@ class NapCatMediaDownloader:
             asset_file_name = str(asset.get("file_name") or "").strip().lower()
             asset_md5 = str(asset.get("md5") or "").strip().lower()
             asset_file_id = str(asset.get("file_id") or "").strip()
+            asset_file_biz_id = str(asset.get("file_biz_id") or "").strip()
             asset_url = self._normalized_match_url(
                 asset.get("remote_url") or asset.get("url")
             )
@@ -2011,19 +2013,27 @@ class NapCatMediaDownloader:
                 score += 100
             if file_id and asset_file_id and asset_file_id == file_id:
                 score += 90
+            if file_biz_id and asset_file_biz_id and asset_file_biz_id == file_biz_id:
+                score += 85
             if request_url and asset_url and asset_url == request_url:
                 score += 70
-            if file_name and asset_file_name and asset_file_name == file_name:
+            exact_file_name_match = bool(file_name and asset_file_name and asset_file_name == file_name)
+            if exact_file_name_match:
                 score += 50
-            if request_stem and asset_stem and asset_stem == request_stem:
+            elif request_stem and asset_stem and asset_stem == request_stem:
                 score += 20
             if score <= 0:
                 continue
+            has_local_recovery = 1 if self._resolved_path_from_payload(asset) is not None else 0
+            has_remote_recovery = 1 if self._resolve_remote_url(
+                asset.get("remote_url") or asset.get("url")
+            ) else 0
+            has_public_recovery = 1 if str(asset.get("public_file_token") or "").strip() else 0
             rank = (
-                1 if self._resolved_path_from_payload(asset) is not None else 0,
-                1 if str(asset.get("public_file_token") or "").strip() else 0,
+                has_local_recovery,
+                has_remote_recovery,
+                has_public_recovery,
                 len(asset_file_name or ""),
-                score,
             )
             if score > best_score or (score == best_score and rank > best_rank):
                 best_score = score
@@ -2035,18 +2045,24 @@ class NapCatMediaDownloader:
             best_match,
             default_resolver="napcat_forward_hydrated",
         )
+        if not isinstance(resolved, tuple) or len(resolved) != 2:
+            resolved = (None, None)
         if resolved == (None, None):
             resolved = self._resolve_from_forward_remote_url(
                 best_match,
                 request=request,
                 trace_callback=trace_callback,
             )
+        if not isinstance(resolved, tuple) or len(resolved) != 2:
+            resolved = (None, None)
         if resolved == (None, None):
             resolved = self._resolve_from_public_token(
                 best_match,
                 request=request,
                 trace_callback=trace_callback,
             )
+        if not isinstance(resolved, tuple) or len(resolved) != 2:
+            resolved = (None, None)
         return resolved, best_match
 
     def _download(self, asset_type: str, *, file_id: str | None, file_name: str | None) -> str | None:
@@ -2091,6 +2107,7 @@ class NapCatMediaDownloader:
         request_timeout_scope_key = self._request_scoped_public_action_timeout_key(
             request,
             action=normalized_action,
+            token=token,
         )
         if (
             request_timeout_scope_key is not None
@@ -2617,7 +2634,7 @@ class NapCatMediaDownloader:
     ) -> bool:
         hint = self._request_hint(request)
         asset_type = str(request.get("asset_type") or "").strip()
-        if self._has_forward_parent_hint(hint) and asset_type in {"file", "video"}:
+        if self._has_forward_parent_hint(hint) and asset_type in {"file", "video", "speech"}:
             return str(resolver or "").strip() == "qq_expired_after_napcat"
         raw_timestamp = request.get("timestamp_ms")
         if not isinstance(raw_timestamp, (int, float)):
@@ -2630,6 +2647,7 @@ class NapCatMediaDownloader:
 
     def _shared_request_key(self, request: dict[str, Any]) -> tuple[Any, ...] | None:
         hint = self._request_hint(request)
+        asset_type = str(request.get("asset_type") or "").strip()
         file_name = str(request.get("file_name") or "").strip().lower()
         md5 = str(request.get("md5") or "").strip().lower()
         source_leaf = ""
@@ -2638,10 +2656,14 @@ class NapCatMediaDownloader:
             source_leaf = PureWindowsPath(source_path).name.strip().lower()
         file_id = str(hint.get("file_id") or "").strip()
         remote_url = self._normalized_match_url(hint.get("remote_url") or hint.get("url"))
+        if self._has_forward_parent_hint(hint) and asset_type in {"file", "video", "speech"}:
+            strong_forward_identity = any([md5, source_leaf, file_id, remote_url])
+            if not strong_forward_identity:
+                return None
         if not any([file_name, md5, source_leaf, file_id, remote_url]):
             return None
         return (
-            str(request.get("asset_type") or "").strip(),
+            asset_type,
             str(request.get("asset_role") or "").strip(),
             file_name,
             md5,
@@ -4351,7 +4373,11 @@ class NapCatMediaDownloader:
             return True
         asset_type = str(request.get("asset_type") or "").strip().lower()
         action = "get_record" if asset_type == "speech" else "get_file"
-        if self._public_action_timed_out(request, action=action):
+        if self._public_action_timed_out(
+            request,
+            action=action,
+            payload=payload,
+        ):
             return True
         if self._has_failed_direct_forward_file_identifier(request):
             return True
@@ -4769,10 +4795,16 @@ class NapCatMediaDownloader:
         request: dict[str, Any] | None,
         *,
         action: str,
+        payload: dict[str, Any] | None = None,
+        token: str | None = None,
     ) -> bool:
+        effective_token = str(token or "").strip()
+        if not effective_token and isinstance(payload, dict):
+            effective_token = str(payload.get("public_file_token") or "").strip()
         request_timeout_scope_key = self._request_scoped_public_action_timeout_key(
             request,
             action=action,
+            token=effective_token or None,
         )
         return (
             request_timeout_scope_key is not None
@@ -4945,6 +4977,7 @@ class NapCatMediaDownloader:
         request: dict[str, Any] | None,
         *,
         action: str,
+        token: str | None = None,
     ) -> tuple[str, ...] | None:
         if not isinstance(request, dict):
             return None
@@ -4960,6 +4993,12 @@ class NapCatMediaDownloader:
             return None
         parent = hint.get("_forward_parent")
         assert isinstance(parent, dict)
+        discriminator = (
+            str(token or "").strip(),
+            str(request.get("file_name") or "").strip().lower(),
+            str(request.get("md5") or "").strip().lower(),
+            str(hint.get("file_id") or "").strip(),
+        )
         return (
             "forward_public_timeout",
             action,
@@ -4969,6 +5008,7 @@ class NapCatMediaDownloader:
             str(parent.get("chat_type_raw") or "").strip(),
             asset_type,
             str(request.get("asset_role") or "").strip(),
+            *discriminator,
         )
 
     @staticmethod

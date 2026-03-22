@@ -85,17 +85,73 @@ Current simulator coverage includes:
     - resolution summary
     - resolution coverage catalog
 
+### [2026-03-22][006] forward candidate matrix previously over-reported green while hiding recoverability loss
+
+- Problem:
+  - candidate winner selection could look correct even when the simulated resolver/path kind fell through to `missing`
+  - root cause was simulator-side:
+    - candidate token/remote path maps were copied too early
+    - matrix matching only checked winner label, not terminal recoverability
+- Current fix:
+  - candidate simulator now keeps live token/remote maps
+  - matrix matching now requires both:
+    - expected winner
+    - expected `path_kind`
+  - bounded candidate-priority matrix is now a real recoverability check instead of a label-only check
+
+### [2026-03-22][007] shared miss/outcome scope was under-tested
+
+- Problem:
+  - exporter correctness depends on not poisoning shared old-asset outcomes across weak identities
+  - previous simulator coverage did not systematically check when `_shared_request_key(...)` should or should not collapse requests
+- Current fix:
+  - simulator now has a bounded shared-outcome scope matrix covering:
+    - `image`
+    - `video`
+    - `file`
+    - `speech`
+    - `top_level`
+    - `forward`
+    - identity modes:
+      - `file_name_only`
+      - `md5`
+      - `file_id`
+      - `source_leaf`
+      - `remote_url_same`
+      - `none`
+
+### [2026-03-22][008] public-token timeout-key scope was under-tested
+
+- Problem:
+  - exporter speed depends on timeout suppression keys being neither too broad nor too narrow
+  - prior simulator coverage did not explicitly lock:
+    - same parent / same token reuse
+    - new token separation
+    - new file separation
+    - different parent separation
+    - non-forward ignore behavior
+- Current fix:
+  - simulator now has a bounded public-timeout-scope matrix covering:
+    - `video`
+    - `file`
+    - `speech`
+    - ignored `image`
+
 ## Remaining High-Value Gaps
 
-- [ ] add batch / pair simulations for cross-parent cache poisoning and shared-outcome scope
-- [ ] add explicit multi-candidate forward matching scenarios:
+- [x] add batch / pair simulations for cross-parent cache poisoning and shared-outcome scope
+- [x] add explicit multi-candidate forward matching scenarios:
   - local-path vs token
   - remote-url vs token
   - `file_id` vs remote-url
-- [ ] add bounded exhaustive prefetch/executor pressure simulation:
+- [x] add bounded exhaustive prefetch/executor pressure simulation:
   - many remote candidates
   - many stale forward candidates
   - mixed recent/old batches
+- [ ] extend bounded exhaustive coverage to multi-stage cache interaction:
+  - shared outcome reuse after public timeout
+  - forward timeout breaker after slow-noop materialize
+  - mixed local+remote+public candidate reuse across repeats
 - [ ] add shape-drift coverage for rarer mixed payloads:
   - share/card media hints
   - malformed nested-forward wrappers
@@ -109,3 +165,15 @@ Current simulator coverage includes:
 
 - Any exporter-side asset recovery change should first add or update simulator coverage.
 - If a live failure can be represented as a bounded synthetic asset state, encode it in the simulator before expanding live tests.
+
+## Current Quantitative Baseline
+
+- `resolution-matrix`: `570/570 matched`, `cost_overruns=0`
+- `forward-candidate-matrix`: `42/42 matched`
+- `shared-scope-matrix`: `48/48 matched`
+- `public-timeout-scope-matrix`: `16/16 matched`
+- `prefetch-planning-matrix`:
+  - `total=20`
+  - `max_batch_size=200`
+  - `large_window_batch=50..50`
+  - `duplicate_shared_key_total=18088`
