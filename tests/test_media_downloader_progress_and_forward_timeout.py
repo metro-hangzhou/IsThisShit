@@ -253,6 +253,17 @@ class _OldForwardTokenOnlyClient:
         }
 
 
+class _OldForwardMaterializeOnlyTimeoutClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            raise NapCatFastHistoryTimeoutError("timed out")
+        return {"assets": []}
+
+
 def _build_forward_request(file_name: str) -> dict[str, object]:
     return {
         "asset_type": "image",
@@ -650,6 +661,36 @@ def test_old_forward_video_public_token_timeout_is_classified_before_targeted_ma
     assert client.timeouts == [downloader.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S]
     assert len(fast_client.calls) == 1
     assert fast_client.calls[0].get("materialize") is False
+
+
+def test_old_forward_video_materialize_timeout_is_classified_as_expired() -> None:
+    fast_client = _OldForwardMaterializeOnlyTimeoutClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-materialize-timeout.mp4"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-materialize-timeout.mp4",
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert len(fast_client.calls) == 2
+    assert fast_client.calls[0].get("materialize") is False
+    assert fast_client.calls[1].get("materialize") is True
+
+
+def test_old_forward_video_route_unavailable_is_classified_as_expired() -> None:
+    fast_client = _UnavailableForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-unavailable.mp4"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-unavailable.mp4",
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert len(fast_client.forward_calls) == 1
 
 
 def test_forward_video_public_token_timeout_breaker_skips_distinct_old_parents_after_limit() -> None:

@@ -244,9 +244,11 @@ def write_simulation_trace(path: Path, events: list[dict[str, Any]]) -> None:
 class AssetResolutionScenario:
     name: str
     asset_type: str
+    suite: str = "core"
     topology: str = "top_level"
     age_days: int = 7
     asset_role: str | None = None
+    forward_parent_state: str = "valid"
     source_path_state: str = "none"
     hint_local_state: str = "none"
     hint_remote_state: str = "none"
@@ -258,6 +260,9 @@ class AssetResolutionScenario:
     direct_file_result_state: str = "none"
     expected_resolver: str | None = None
     expected_path_kind: str = "missing"
+    max_client_calls: int | None = None
+    max_fast_calls: int | None = None
+    max_remote_attempts: int | None = None
     notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -267,6 +272,7 @@ class AssetResolutionScenario:
 @dataclass(frozen=True, slots=True)
 class AssetResolutionResult:
     name: str
+    suite: str
     asset_type: str
     topology: str
     age_days: int
@@ -281,6 +287,7 @@ class AssetResolutionResult:
     remote_attempt_count: int
     trace_event_count: int
     trace_status_breakdown: dict[str, int]
+    cost_matched: bool
     notes: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -481,14 +488,26 @@ class _ScenarioRuntimeState:
         hint: dict[str, Any] = {}
         if self.scenario.topology == "top_level":
             hint.update(_context_hint(f"{self.scenario.name}_top"))
-        elif self.scenario.topology == "forward":
+        elif self.scenario.topology in {"forward", "nested_forward", "forward_missing_parent"}:
             hint.update(_context_hint(f"{self.scenario.name}_asset"))
             hint["_forward_parent"] = _context_hint(f"{self.scenario.name}_parent")
-        elif self.scenario.topology == "forward_missing_parent":
-            hint.update(_context_hint(f"{self.scenario.name}_asset"))
-            broken_parent = _context_hint(f"{self.scenario.name}_parent")
-            broken_parent["element_id"] = ""
-            hint["_forward_parent"] = broken_parent
+        if self.scenario.topology in {"forward", "nested_forward", "forward_missing_parent"}:
+            broken_parent = hint.get("_forward_parent") if isinstance(hint.get("_forward_parent"), dict) else {}
+            parent_state = self.scenario.forward_parent_state
+            if self.scenario.topology == "forward_missing_parent" and parent_state == "valid":
+                parent_state = "missing_element_id"
+            if parent_state == "missing_element_id":
+                broken_parent["element_id"] = ""
+            elif parent_state == "missing_message_id_raw":
+                broken_parent["message_id_raw"] = ""
+            elif parent_state == "missing_peer_uid":
+                broken_parent["peer_uid"] = ""
+            elif parent_state == "blank_parent_bundle":
+                broken_parent.clear()
+            elif parent_state != "valid":
+                raise ValueError(f"unsupported forward_parent_state: {parent_state}")
+            if broken_parent:
+                hint["_forward_parent"] = broken_parent
 
         if self.scenario.hint_local_state == "path_existing":
             hint["path"] = self.local_path
@@ -681,9 +700,17 @@ def run_asset_resolution_scenario(
         )
         actual_path_kind, resolved_path = _path_kind_for_result(result, runtime)
         actual_resolver = result[1]
+        cost_matched = True
+        if scenario.max_client_calls is not None and len(client.calls) > scenario.max_client_calls:
+            cost_matched = False
+        if scenario.max_fast_calls is not None and len(fast_client.calls) > scenario.max_fast_calls:
+            cost_matched = False
+        if scenario.max_remote_attempts is not None and len(runtime.remote_attempts) > scenario.max_remote_attempts:
+            cost_matched = False
         matched = (
             actual_resolver == scenario.expected_resolver
             and actual_path_kind == scenario.expected_path_kind
+            and cost_matched
         )
         trace_status_breakdown: dict[str, int] = {}
         for event in events:
@@ -695,6 +722,7 @@ def run_asset_resolution_scenario(
             trace_status_breakdown[status] = trace_status_breakdown.get(status, 0) + 1
         return AssetResolutionResult(
             name=scenario.name,
+            suite=scenario.suite,
             asset_type=scenario.asset_type,
             topology=scenario.topology,
             age_days=scenario.age_days,
@@ -709,6 +737,7 @@ def run_asset_resolution_scenario(
             remote_attempt_count=len(runtime.remote_attempts),
             trace_event_count=len(events),
             trace_status_breakdown=trace_status_breakdown,
+            cost_matched=cost_matched,
             notes=scenario.notes,
         )
     finally:
@@ -721,98 +750,143 @@ def default_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
         AssetResolutionScenario(
             name="top_level_image_hint_local_path",
             asset_type="image",
+            suite="live_recovery_paths",
             hint_local_state="file_existing",
             expected_resolver="hint_local_path",
             expected_path_kind="local",
+            max_client_calls=0,
+            max_fast_calls=0,
+            max_remote_attempts=0,
             notes="Direct local hint should bypass NapCat calls.",
         ),
         AssetResolutionScenario(
             name="top_level_image_placeholder_zero_byte",
             asset_type="image",
+            suite="classification_fast_fail",
             age_days=240,
             source_path_state="placeholder_zero",
             expected_resolver="qq_not_downloaded_local_placeholder",
             expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=0,
+            max_remote_attempts=0,
             notes="Image placeholder should classify quickly without remote work.",
         ),
         AssetResolutionScenario(
             name="top_level_image_public_token_remote",
             asset_type="image",
+            suite="live_recovery_paths",
             context_payload_state="public_token",
             public_result_state="valid_remote",
             expected_resolver="napcat_public_token_get_image_remote_url",
             expected_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=1,
         ),
         AssetResolutionScenario(
             name="top_level_video_public_token_local",
             asset_type="video",
+            suite="live_recovery_paths",
             context_payload_state="public_token",
             public_result_state="valid_local",
             expected_resolver="napcat_public_token_get_file",
             expected_path_kind="local",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="top_level_video_old_blank_public_payload",
             asset_type="video",
+            suite="classification_fast_fail",
             age_days=240,
             context_payload_state="public_token",
             public_result_state="blank_payload",
             expected_resolver="qq_expired_after_napcat",
             expected_path_kind="missing",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="top_level_file_direct_file_id_local",
             asset_type="file",
+            suite="live_recovery_paths",
             direct_file_result_state="valid_local",
             expected_resolver="napcat_segment_file_id_get_file",
             expected_path_kind="local",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="top_level_speech_public_token_remote",
             asset_type="speech",
+            suite="live_recovery_paths",
             context_payload_state="public_token",
             public_result_state="valid_remote",
             expected_resolver="napcat_public_token_get_record_remote_url",
             expected_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=1,
         ),
         AssetResolutionScenario(
             name="top_level_sticker_remote_gif",
             asset_type="sticker",
+            suite="live_recovery_paths",
             hint_remote_state="live_http",
             expected_resolver="sticker_remote_download",
             expected_path_kind="remote",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=1,
         ),
         AssetResolutionScenario(
             name="forward_image_remote_url_hit",
             asset_type="image",
+            suite="live_recovery_paths",
             topology="forward",
             age_days=45,
             forward_payload_state="remote_url",
             hint_remote_state="live_http",
             expected_resolver="napcat_forward_remote_url",
             expected_path_kind="remote",
+            max_client_calls=0,
+            max_fast_calls=0,
+            max_remote_attempts=1,
         ),
         AssetResolutionScenario(
             name="forward_old_image_expired_without_payload",
             asset_type="image",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=240,
             expected_resolver="qq_expired_after_napcat",
             expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=0,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_recent_video_public_token_local",
             asset_type="video",
+            suite="live_recovery_paths",
             topology="forward",
             age_days=20,
             forward_payload_state="public_token",
             public_result_state="valid_local",
             expected_resolver="napcat_public_token_get_file",
             expected_path_kind="local",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_old_video_public_token_timeout",
             asset_type="video",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=260,
             source_path_state="stale_missing",
@@ -820,20 +894,28 @@ def default_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
             public_result_state="timeout",
             expected_resolver="qq_expired_after_napcat",
             expected_path_kind="missing",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_old_video_metadata_timeout",
             asset_type="video",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=260,
             source_path_state="stale_missing",
             forward_payload_state="timeout",
             expected_resolver="qq_expired_after_napcat",
             expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_old_video_materialize_timeout",
             asset_type="video",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=260,
             source_path_state="stale_missing",
@@ -841,10 +923,14 @@ def default_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
             forward_materialize_state="timeout",
             expected_resolver="qq_expired_after_napcat",
             expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=2,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_old_file_public_token_timeout",
             asset_type="file",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=260,
             source_path_state="stale_missing",
@@ -852,10 +938,14 @@ def default_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
             public_result_state="timeout",
             expected_resolver="qq_expired_after_napcat",
             expected_path_kind="missing",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_old_speech_public_token_timeout",
             asset_type="speech",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=260,
             source_path_state="stale_missing",
@@ -863,71 +953,199 @@ def default_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
             public_result_state="timeout",
             expected_resolver="qq_expired_after_napcat",
             expected_path_kind="missing",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_old_video_direct_file_id_local",
             asset_type="video",
+            suite="live_recovery_paths",
             topology="forward",
             age_days=260,
             source_path_state="stale_missing",
             direct_file_result_state="valid_local",
             expected_resolver="napcat_segment_file_id_get_file",
             expected_path_kind="local",
+            max_client_calls=1,
+            max_fast_calls=2,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_video_known_bad_public_token",
             asset_type="video",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=30,
             forward_payload_state="public_token",
             public_result_state="known_bad_video",
             expected_resolver="napcat_video_url_unavailable",
             expected_path_kind="missing",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_file_known_bad_public_token",
             asset_type="file",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=30,
             forward_payload_state="public_token",
             public_result_state="known_bad_file",
             expected_resolver="napcat_file_url_unavailable",
             expected_path_kind="missing",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_speech_known_bad_public_token",
             asset_type="speech",
+            suite="classification_fast_fail",
             topology="forward",
             age_days=30,
             forward_payload_state="public_token",
             public_result_state="known_bad_record",
             expected_resolver="napcat_record_url_unavailable",
             expected_path_kind="missing",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
         AssetResolutionScenario(
             name="forward_video_relative_remote_url",
             asset_type="video",
+            suite="live_recovery_paths",
             topology="forward",
             age_days=20,
             forward_payload_state="remote_url",
             hint_remote_state="relative_http",
             expected_resolver="napcat_forward_remote_url",
             expected_path_kind="remote",
+            max_client_calls=0,
+            max_fast_calls=0,
+            max_remote_attempts=1,
         ),
         AssetResolutionScenario(
             name="top_level_video_context_timeout_direct_file_id_remote",
             asset_type="video",
+            suite="live_recovery_paths",
             age_days=20,
             context_payload_state="timeout",
             direct_file_result_state="valid_remote",
             expected_resolver="napcat_segment_file_id_get_file_remote_url",
             expected_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=1,
+            max_remote_attempts=1,
+        ),
+        AssetResolutionScenario(
+            name="forward_old_video_route_unavailable",
+            asset_type="video",
+            suite="route_health",
+            topology="forward",
+            age_days=260,
+            source_path_state="stale_missing",
+            forward_payload_state="unavailable",
+            expected_resolver="qq_expired_after_napcat",
+            expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=0,
+            notes="Very old forward video should degrade quickly when the forward route itself is unavailable.",
+        ),
+        AssetResolutionScenario(
+            name="forward_old_file_route_unavailable",
+            asset_type="file",
+            suite="route_health",
+            topology="forward",
+            age_days=260,
+            source_path_state="stale_missing",
+            forward_payload_state="unavailable",
+            expected_resolver="qq_expired_after_napcat",
+            expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=0,
+        ),
+        AssetResolutionScenario(
+            name="forward_old_speech_route_unavailable",
+            asset_type="speech",
+            suite="route_health",
+            topology="forward",
+            age_days=260,
+            source_path_state="stale_missing",
+            forward_payload_state="unavailable",
+            expected_resolver="qq_expired_after_napcat",
+            expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=0,
+        ),
+        AssetResolutionScenario(
+            name="forward_video_missing_parent_element_id",
+            asset_type="video",
+            suite="forward_parent_shape",
+            topology="forward_missing_parent",
+            age_days=260,
+            source_path_state="stale_missing",
+            expected_resolver=None,
+            expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=0,
+            notes="Malformed forward parent should skip forward route and avoid repeated retries.",
+        ),
+        AssetResolutionScenario(
+            name="forward_video_missing_parent_message_id",
+            asset_type="video",
+            suite="forward_parent_shape",
+            topology="forward",
+            forward_parent_state="missing_message_id_raw",
+            age_days=260,
+            source_path_state="stale_missing",
+            expected_resolver=None,
+            expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=0,
+        ),
+        AssetResolutionScenario(
+            name="forward_video_stale_path_live_remote_url",
+            asset_type="video",
+            suite="live_recovery_paths",
+            topology="forward",
+            age_days=260,
+            source_path_state="stale_missing",
+            forward_payload_state="remote_url",
+            hint_remote_state="live_http",
+            expected_resolver="napcat_forward_remote_url",
+            expected_path_kind="remote",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=1,
+        ),
+        AssetResolutionScenario(
+            name="top_level_video_old_context_route_unavailable",
+            asset_type="video",
+            suite="route_health",
+            age_days=240,
+            source_path_state="stale_missing",
+            context_payload_state="unavailable",
+            expected_resolver=None,
+            expected_path_kind="missing",
+            max_client_calls=0,
+            max_fast_calls=1,
+            max_remote_attempts=0,
         ),
     ]
 
 
-def run_asset_resolution_matrix() -> list[AssetResolutionResult]:
+def run_asset_resolution_matrix(*, suite: str | None = None) -> list[AssetResolutionResult]:
+    normalized_suite = str(suite or "").strip().lower()
     return [
         run_asset_resolution_scenario(scenario)
         for scenario in default_asset_resolution_scenarios()
+        if not normalized_suite or scenario.suite.lower() == normalized_suite
     ]
