@@ -22,6 +22,7 @@ Specialized TODO logs now live here:
 - [TODOs.benshi-distribution.md](TODOs.benshi-distribution.md)
 - [TODOs.release-runtime-stability.md](TODOs.release-runtime-stability.md)
 - [TODOs.asset-simulator-hardening.md](TODOs.asset-simulator-hardening.md)
+- [TODOs.evidence-first-exporter.md](TODOs.evidence-first-exporter.md)
 - [TODOs.git-branch-governance.md](TODOs.git-branch-governance.md)
 - [TODOs.cli-product-review.md](TODOs.cli-product-review.md)
 - [TODOs.cli-ux.md](TODOs.cli-ux.md)

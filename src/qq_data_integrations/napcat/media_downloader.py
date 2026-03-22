@@ -33,7 +33,6 @@ class NapCatMediaDownloader:
     OLD_CONTEXT_BUCKET_MIN_AGE_DAYS = 120
     OLD_CONTEXT_BUCKET_FAILURE_LIMIT = 5
     SHARED_MISS_CACHE_MIN_AGE_DAYS = 30
-    OLD_FORWARD_IMAGE_EXPIRED_MIN_AGE_DAYS = 45
     FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS = 45
     FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS = 180
     FORWARD_TIMEOUT_STORM_LIMIT = 6
@@ -1479,7 +1478,7 @@ class NapCatMediaDownloader:
             )
             if (
                 asset_type in {"file", "video"}
-                and old_bucket is not None
+                and self._is_forward_expensive_terminal_candidate(request, payload=payload)
                 and "file not found" in str(exc).strip().lower()
             ):
                 if request is not None:
@@ -1795,7 +1794,10 @@ class NapCatMediaDownloader:
             self._forward_context_error_cache.discard(timeout_cache_key)
             self._forward_context_unavailable_cache.discard(timeout_cache_key)
             if not materialize and isinstance(payload, dict):
-                self._forward_context_payload_cache[timeout_cache_key] = payload
+                if self._is_forward_context_payload_cacheable(payload):
+                    self._forward_context_payload_cache[timeout_cache_key] = payload
+                else:
+                    self._forward_context_payload_cache.pop(timeout_cache_key, None)
         assets = payload.get("assets") if isinstance(payload, dict) else None
         assets_list = assets if isinstance(assets, list) else []
         if not assets_list:
@@ -2073,6 +2075,17 @@ class NapCatMediaDownloader:
         if not isinstance(resolved, tuple) or len(resolved) != 2:
             resolved = (None, None)
         return resolved, best_match
+
+    @staticmethod
+    def _is_forward_context_payload_cacheable(payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        if bool(payload.get("targeted")):
+            return False
+        targeted_mode = str(payload.get("targeted_mode") or "").strip().lower()
+        if targeted_mode in {"single_target_download", "hydrated"}:
+            return False
+        return True
 
     def _download(self, asset_type: str, *, file_id: str | None, file_name: str | None) -> str | None:
         try:
@@ -2479,6 +2492,13 @@ class NapCatMediaDownloader:
         message = str(exc).strip().lower()
         if "file not found" not in message:
             return None
+        if (
+            isinstance(request, dict)
+            and self._is_forward_expensive_asset(request)
+            and not self._has_unexhausted_live_http_media_url(request)
+            and action in {"get_file", "get_record"}
+        ):
+            return "qq_expired_after_napcat"
         old_bucket = self._old_context_bucket(
             str(request.get("asset_type") or "").strip() if isinstance(request, dict) else "",
             request or {},
@@ -4151,14 +4171,14 @@ class NapCatMediaDownloader:
             return local_placeholder_missing
         return "qq_expired_after_napcat"
 
-    @staticmethod
     def _classify_blank_public_get_file_missing(
+        self,
         data: dict[str, Any] | None,
         *,
         old_bucket: tuple[str, str] | None,
         request: dict[str, Any] | None = None,
     ) -> str | None:
-        if old_bucket is None or not isinstance(data, dict):
+        if not isinstance(data, dict):
             return None
         action = str(data.get("public_action") or "").strip().lower()
         if action != "get_file":
@@ -4190,6 +4210,14 @@ class NapCatMediaDownloader:
         token = str(data.get("public_file_token") or "").strip()
         if not any([file_name, file_size, file_id, token]):
             return None
+        if (
+            old_bucket is None
+            and not (
+                isinstance(request, dict)
+                and self._is_forward_expensive_asset(request)
+            )
+        ):
+            return None
         return "qq_expired_after_napcat"
 
     def _classify_zero_byte_public_payload_missing(
@@ -4199,7 +4227,7 @@ class NapCatMediaDownloader:
         old_bucket: tuple[str, str] | None,
         request: dict[str, Any] | None = None,
     ) -> str | None:
-        if old_bucket is None or not isinstance(data, dict):
+        if not isinstance(data, dict):
             return None
         action = str(data.get("public_action") or "").strip().lower()
         request_asset_type = str(
@@ -4228,6 +4256,14 @@ class NapCatMediaDownloader:
         file_id = str(data.get("file_id") or "").strip()
         token = str(data.get("public_file_token") or "").strip()
         if not any([file_name, file_size, file_id, token]):
+            return None
+        if (
+            old_bucket is None
+            and not (
+                isinstance(request, dict)
+                and self._is_forward_expensive_asset(request)
+            )
+        ):
             return None
         return "qq_expired_after_napcat"
 
@@ -4344,24 +4380,56 @@ class NapCatMediaDownloader:
         local_placeholder_missing = self._classify_image_local_placeholder_missing(request)
         if local_placeholder_missing is not None:
             return local_placeholder_missing
-        asset_age = self._request_asset_age(request)
-        has_terminal_failure_signal = (
-            self._has_failed_forward_remote_url(request, payload=payload)
-            or self._public_action_failed(
-                request,
-                action="get_image",
-                payload=payload,
-            )
-        )
-        if (
-            asset_age is not None
-            and asset_age >= timedelta(days=self.OLD_FORWARD_IMAGE_EXPIRED_MIN_AGE_DAYS)
-            and has_terminal_failure_signal
+        if self._has_unexhausted_live_http_media_url(request, payload=payload):
+            return None
+        if self._has_terminal_forward_image_missing_signal(
+            request,
+            payload=payload,
         ):
             return "qq_expired_after_napcat"
-        if self._old_context_bucket("image", request) is None:
-            return None
-        return "qq_expired_after_napcat"
+        return None
+
+    def _has_terminal_forward_image_missing_signal(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        if str(request.get("asset_type") or "").strip().lower() != "image":
+            return False
+        hint = self._request_hint(request)
+        if not self._has_forward_parent_hint(hint):
+            return False
+        remote_failed = self._has_failed_forward_remote_url(request, payload=payload)
+        public_failed = self._public_action_failed(
+            request,
+            action="get_image",
+            payload=payload,
+        )
+        local_broken = self._has_stale_forward_local_media_hint(
+            request,
+            payload=payload,
+        ) or self._has_zero_byte_forward_local_media_hint(
+            request,
+            payload=payload,
+        )
+        forward_terminal = (
+            self._forward_context_empty(request, materialize=False)
+            or self._forward_context_error(request, materialize=False)
+            or self._forward_context_empty(request, materialize=True)
+            or self._forward_context_error(request, materialize=True)
+            or self._forward_context_unavailable(request, materialize=False)
+            or self._forward_context_unavailable(request, materialize=True)
+        )
+        if remote_failed and public_failed:
+            return True
+        if public_failed and local_broken:
+            return True
+        if public_failed and forward_terminal:
+            return True
+        return False
 
     def _has_failed_forward_remote_url(
         self,
@@ -4397,18 +4465,24 @@ class NapCatMediaDownloader:
         require_timeout_signal: bool = False,
         failure_signal_mode: str = "strict",
     ) -> str | None:
-        if not self._is_very_old_forward_expensive_asset(request):
+        if not self._is_forward_expensive_asset(request):
             return None
-        if self._has_live_http_media_url(request, payload=payload):
+        if self._has_unexhausted_live_http_media_url(request, payload=payload):
             return None
         normalized_mode = str(failure_signal_mode or "strict").strip().lower()
         if require_timeout_signal:
             normalized_mode = "strict"
         if normalized_mode == "strict":
+            if not self._is_forward_expensive_terminal_candidate(request, payload=payload):
+                return None
             if not self._has_old_forward_timeout_signal(request, payload=payload):
                 return None
         elif normalized_mode == "terminal":
-            if not self._has_old_forward_terminal_signal(request, payload=payload):
+            if not self._has_forward_expensive_terminal_signal(
+                request,
+                payload=payload,
+                allow_timeout=self._is_forward_expensive_terminal_candidate(request, payload=payload),
+            ):
                 return None
         elif normalized_mode not in {"", "none"}:
             raise ValueError(f"unsupported failure_signal_mode: {failure_signal_mode}")
@@ -4471,13 +4545,14 @@ class NapCatMediaDownloader:
             route="direct_file_id_get_file",
         )
 
-    def _has_old_forward_terminal_signal(
+    def _has_forward_expensive_terminal_signal(
         self,
         request: dict[str, Any] | None,
         *,
         payload: dict[str, Any] | None = None,
+        allow_timeout: bool = False,
     ) -> bool:
-        if self._has_old_forward_timeout_signal(request, payload=payload):
+        if allow_timeout and self._has_old_forward_timeout_signal(request, payload=payload):
             return True
         if self._forward_context_empty(request, materialize=True):
             return True
@@ -4485,11 +4560,21 @@ class NapCatMediaDownloader:
             return True
         if self._has_zero_byte_forward_local_media_hint(request, payload=payload):
             return True
-        if self._has_blank_old_forward_public_payload(request, payload=payload):
+        if self._has_blank_forward_public_payload(request, payload=payload):
+            return True
+        if self._has_terminal_public_action_failure(
+            request,
+            payload=payload,
+        ):
+            return True
+        if self._has_terminal_direct_forward_file_identifier_failure(
+            request,
+            payload=payload,
+        ):
             return True
         return False
 
-    def _has_blank_old_forward_public_payload(
+    def _has_blank_forward_public_payload(
         self,
         request: dict[str, Any] | None,
         *,
@@ -4497,7 +4582,7 @@ class NapCatMediaDownloader:
     ) -> bool:
         if not isinstance(payload, dict):
             return False
-        if not self._is_very_old_forward_expensive_asset(request):
+        if not self._is_forward_expensive_asset(request):
             return False
         action = str(payload.get("public_action") or "").strip().lower()
         request_asset_type = str(
@@ -4532,6 +4617,53 @@ class NapCatMediaDownloader:
         token = str(payload.get("public_file_token") or "").strip()
         return bool(file_name or file_size or file_id or token)
 
+    def _has_terminal_public_action_failure(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type == "speech":
+            action = "get_record"
+        elif asset_type in {"file", "video"}:
+            action = "get_file"
+        elif asset_type == "image":
+            action = "get_image"
+        else:
+            return False
+        effective_token = str(
+            (payload or {}).get("public_file_token") if isinstance(payload, dict) else ""
+        ).strip()
+        cache_key = (action, effective_token)
+        cached_payload = (
+            self._public_token_action_outcomes.get(cache_key)
+            if effective_token
+            else None
+        )
+        if isinstance(cached_payload, dict):
+            if str(cached_payload.get("_known_missing_classification") or "").strip():
+                return True
+            classified_missing = self._classify_missing_from_public_payload(
+                cached_payload,
+                old_bucket=self._old_context_bucket(asset_type, request),
+                expired_candidate=self._is_forward_expensive_asset(request),
+                request=request,
+            )
+            if classified_missing is not None:
+                return True
+            if self._has_blank_forward_public_payload(request, payload=cached_payload):
+                return True
+        if asset_type == "image":
+            return self._public_action_failed(
+                request,
+                action=action,
+                payload=payload,
+            )
+        return False
+
     def _has_failed_direct_forward_file_identifier(
         self,
         request: dict[str, Any] | None,
@@ -4552,12 +4684,12 @@ class NapCatMediaDownloader:
     ) -> str | None:
         if not isinstance(request, dict):
             return None
-        if not self._is_very_old_forward_expensive_asset(request):
+        if not self._is_forward_expensive_asset(request):
             return None
         file_id = self._direct_forward_file_identifier(request, payload=payload)
         if not file_id.startswith("/"):
             return None
-        if self._has_live_http_media_url(request, payload=payload):
+        if self._has_unexhausted_live_http_media_url(request, payload=payload):
             return None
         if payload is None:
             return "qq_expired_after_napcat"
@@ -4576,6 +4708,17 @@ class NapCatMediaDownloader:
         file_size = str(payload.get("file_size") or "").strip()
         payload_file_id = str(payload.get("file_id") or "").strip()
         return "qq_expired_after_napcat" if (file_name or file_size or payload_file_id) else None
+
+    def _has_terminal_direct_forward_file_identifier_failure(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        return (
+            self._classify_blank_direct_file_id_missing(request, payload if isinstance(payload, dict) else None)
+            == "qq_expired_after_napcat"
+        )
 
     def _direct_forward_file_identifier(
         self,
@@ -4653,12 +4796,12 @@ class NapCatMediaDownloader:
         request: dict[str, Any] | None = None,
     ) -> float:
         normalized_action = str(action or "").strip().lower()
-        if normalized_action in {"get_file", "get_record"} and self._is_very_old_forward_expensive_asset(request):
+        if normalized_action in {"get_file", "get_record"} and self._is_forward_expensive_terminal_candidate(request):
             return float(self.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S)
         return float(self.PUBLIC_TOKEN_ACTION_TIMEOUT_S)
 
     def _direct_file_id_timeout_s(self, request: dict[str, Any] | None) -> float:
-        if self._is_very_old_forward_expensive_asset(request):
+        if self._is_forward_expensive_terminal_candidate(request):
             return float(self.OLD_FORWARD_EXPENSIVE_DIRECT_FILE_ID_TIMEOUT_S)
         return float(self.DIRECT_FILE_ID_TIMEOUT_S)
 
@@ -4668,7 +4811,7 @@ class NapCatMediaDownloader:
         *,
         materialize: bool,
     ) -> float:
-        if self._is_very_old_forward_expensive_asset(request):
+        if self._is_forward_expensive_terminal_candidate(request):
             return float(
                 self.OLD_FORWARD_EXPENSIVE_MATERIALIZE_TIMEOUT_S
                 if materialize
@@ -4679,6 +4822,47 @@ class NapCatMediaDownloader:
         )
 
     def _is_very_old_forward_expensive_asset(self, request: dict[str, Any] | None) -> bool:
+        if not self._is_forward_expensive_asset(request):
+            return False
+        asset_age = self._request_asset_age(request)
+        if asset_age is None:
+            return False
+        return asset_age >= timedelta(days=self.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS)
+
+    def _is_forward_expensive_terminal_candidate(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not self._is_forward_expensive_asset(request):
+            return False
+        if self._has_unexhausted_live_http_media_url(request, payload=payload):
+            return False
+        if self._has_stale_forward_local_media_hint(request, payload=payload):
+            return True
+        if self._has_zero_byte_forward_local_media_hint(request, payload=payload):
+            return True
+        if self._has_direct_forward_file_identifier(request, payload=payload):
+            return True
+        if isinstance(payload, dict):
+            action = str(payload.get("public_action") or "").strip().lower()
+            if action in {"get_file", "get_record"}:
+                return True
+            if str(payload.get("file_id") or "").strip().startswith("/"):
+                return True
+        return (
+            self._forward_context_unavailable(request, materialize=False)
+            or self._forward_context_unavailable(request, materialize=True)
+            or self._forward_context_error(request, materialize=False)
+            or self._forward_context_error(request, materialize=True)
+            or self._forward_context_empty(request, materialize=False)
+            or self._forward_context_empty(request, materialize=True)
+            or self._forward_context_timed_out(request, materialize=False)
+            or self._forward_context_timed_out(request, materialize=True)
+        )
+
+    def _is_forward_expensive_asset(self, request: dict[str, Any] | None) -> bool:
         if not isinstance(request, dict):
             return False
         hint = self._request_hint(request)
@@ -4687,10 +4871,7 @@ class NapCatMediaDownloader:
         asset_type = str(request.get("asset_type") or "").strip().lower()
         if asset_type not in {"file", "video", "speech"}:
             return False
-        asset_age = self._request_asset_age(request)
-        if asset_age is None:
-            return False
-        return asset_age >= timedelta(days=self.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS)
+        return True
 
     def _has_live_http_media_url(
         self,
@@ -4707,6 +4888,20 @@ class NapCatMediaDownloader:
                 return True
         return False
 
+    def _has_unexhausted_live_http_media_url(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        return self._has_live_http_media_url(
+            request,
+            payload=payload,
+        ) and not self._has_failed_forward_remote_url(
+            request,
+            payload=payload,
+        )
+
     def _has_direct_forward_file_identifier(
         self,
         request: dict[str, Any] | None,
@@ -4722,12 +4917,12 @@ class NapCatMediaDownloader:
         payload: dict[str, Any] | None = None,
         failure_signal_mode: str = "strict",
     ) -> bool:
-        if not self._is_very_old_forward_expensive_asset(request):
+        if not self._is_forward_expensive_terminal_candidate(request, payload=payload):
             return False
         normalized_mode = str(failure_signal_mode or "strict").strip().lower()
         if normalized_mode not in {"strict", "terminal"}:
             return False
-        return not self._has_live_http_media_url(request, payload=payload)
+        return not self._has_unexhausted_live_http_media_url(request, payload=payload)
 
     def _should_prefer_direct_file_id_before_targeted_materialize(
         self,
@@ -4740,12 +4935,12 @@ class NapCatMediaDownloader:
         asset_type = str(request.get("asset_type") or "").strip().lower()
         if asset_type not in {"video", "file"}:
             return False
-        if not self._is_very_old_forward_expensive_asset(request):
+        if not self._is_forward_expensive_terminal_candidate(request, payload=payload):
             return False
         file_id = self._direct_forward_file_identifier(request, payload=payload)
         if not file_id.startswith("/"):
             return False
-        if self._has_live_http_media_url(request, payload=payload):
+        if self._has_unexhausted_live_http_media_url(request, payload=payload):
             return False
         return True
 

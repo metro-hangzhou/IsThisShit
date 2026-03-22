@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 
 from qq_data_core.media_bundle import materialize_snapshot_media
 from qq_data_core.models import NormalizedMessage, NormalizedSegment, NormalizedSnapshot
@@ -35,6 +36,17 @@ class _MissingImageManager:
         self.public_retry_calls += 1
         _ = request
         return None, None
+
+
+class _RecoveringPublicRetryManager(_MissingImageManager):
+    def __init__(self, resolved_path: Path) -> None:
+        super().__init__(missing_resolver="missing_after_napcat")
+        self.resolved_path = resolved_path
+
+    def resolve_via_public_token_route(self, request):
+        self.public_retry_calls += 1
+        _ = request
+        return self.resolved_path, "napcat_public_token_get_image_remote_url_prefetched"
 
 
 def _forward_image_message(*, file_name: str, md5: str, timestamp_ms: int) -> NormalizedMessage:
@@ -113,114 +125,132 @@ def _top_level_image_message(
     )
 
 
-def test_recent_forward_image_missing_is_reused_after_later_top_level_success(tmp_path: Path) -> None:
-    image_path = tmp_path / "E23A4961D16C0004DBCCB8884A8E427B.jpg"
-    image_path.write_bytes(b"image-bytes")
-    manager = _MissingImageManager()
-    snapshot = NormalizedSnapshot(
-        chat_type="group",
-        chat_id="922065597",
-        chat_name="蕾米二次元萌萌群",
-        exported_at=datetime.now(timezone.utc),
-        messages=[
-            _forward_image_message(
-                file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
-                md5="e23a4961d16c0004dbccb8884a8e427b",
-                timestamp_ms=1768035294000,
-            ),
-            _top_level_image_message(
-                file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
-                md5="e23a4961d16c0004dbccb8884a8e427b",
-                source_path=str(image_path),
-                timestamp_ms=1768035301000,
-            ),
-        ],
+def _run_recent_forward_reuse_case(
+    *,
+    root_name: str,
+    first_missing_resolver: str,
+    second_file_name: str,
+    second_md5: str,
+    expect_statuses: list[str],
+    expect_public_retry_calls: int,
+) -> list:
+    temp_root = Path(".") / "state" / root_name
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        image_path = temp_root / second_file_name
+        image_path.write_bytes(b"image-bytes")
+        manager = _MissingImageManager(missing_resolver=first_missing_resolver)
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _forward_image_message(
+                    file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
+                    md5="e23a4961d16c0004dbccb8884a8e427b",
+                    timestamp_ms=1768035294000,
+                ),
+                _top_level_image_message(
+                    file_name=second_file_name,
+                    md5=second_md5,
+                    source_path=str(image_path),
+                    timestamp_ms=1768035301000,
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == expect_statuses
+        assert manager.public_retry_calls == expect_public_retry_calls
+        return assets
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_recent_forward_image_missing_is_reused_after_later_top_level_success() -> None:
+    assets = _run_recent_forward_reuse_case(
+        root_name="test_temp_recent_forward_reuse_success",
+        first_missing_resolver="missing_after_napcat",
+        second_file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
+        second_md5="e23a4961d16c0004dbccb8884a8e427b",
+        expect_statuses=["reused", "copied"],
+        expect_public_retry_calls=0,
     )
 
-    assets = materialize_snapshot_media(
-        snapshot,
-        tmp_path / "assets",
-        media_resolution_mode="napcat_only",
-        media_download_manager=manager,
-    )
-
-    assert [item.status for item in assets] == ["reused", "copied"]
     assert assets[0].exported_rel_path == assets[1].exported_rel_path
     assert assets[0].missing_kind is None
     assert assets[0].note is None
-    assert manager.public_retry_calls == 0
 
 
-def test_recent_forward_image_missing_does_not_reuse_different_logical_image(tmp_path: Path) -> None:
-    image_path = tmp_path / "DIFFERENT.jpg"
-    image_path.write_bytes(b"image-bytes")
-    manager = _MissingImageManager()
-    snapshot = NormalizedSnapshot(
-        chat_type="group",
-        chat_id="922065597",
-        chat_name="蕾米二次元萌萌群",
-        exported_at=datetime.now(timezone.utc),
-        messages=[
-            _forward_image_message(
-                file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
-                md5="e23a4961d16c0004dbccb8884a8e427b",
-                timestamp_ms=1768035294000,
-            ),
-            _top_level_image_message(
-                file_name="DIFFERENT.jpg",
-                md5="different-md5",
-                source_path=str(image_path),
-                timestamp_ms=1768035301000,
-            ),
-        ],
+def test_recent_forward_image_missing_does_not_reuse_different_logical_image() -> None:
+    assets = _run_recent_forward_reuse_case(
+        root_name="test_temp_recent_forward_reuse_mismatch",
+        first_missing_resolver="missing_after_napcat",
+        second_file_name="DIFFERENT.jpg",
+        second_md5="different-md5",
+        expect_statuses=["missing", "copied"],
+        expect_public_retry_calls=1,
     )
 
-    assets = materialize_snapshot_media(
-        snapshot,
-        tmp_path / "assets",
-        media_resolution_mode="napcat_only",
-        media_download_manager=manager,
-    )
-
-    assert [item.status for item in assets] == ["missing", "copied"]
     assert assets[0].resolver == "missing_after_napcat"
     assert assets[0].missing_kind == "missing_after_napcat"
-    assert manager.public_retry_calls == 1
 
 
-def test_recent_forward_background_missing_is_reused_after_later_top_level_success(tmp_path: Path) -> None:
-    image_path = tmp_path / "E23A4961D16C0004DBCCB8884A8E427B.jpg"
-    image_path.write_bytes(b"image-bytes")
-    manager = _MissingImageManager(missing_resolver="qq_expired_after_napcat")
-    snapshot = NormalizedSnapshot(
-        chat_type="group",
-        chat_id="922065597",
-        chat_name="蕾米二次元萌萌群",
-        exported_at=datetime.now(timezone.utc),
-        messages=[
-            _forward_image_message(
-                file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
-                md5="e23a4961d16c0004dbccb8884a8e427b",
-                timestamp_ms=1768035294000,
-            ),
-            _top_level_image_message(
-                file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
-                md5="e23a4961d16c0004dbccb8884a8e427b",
-                source_path=str(image_path),
-                timestamp_ms=1768035301000,
-            ),
-        ],
+def test_recent_forward_background_missing_is_reused_after_later_top_level_success() -> None:
+    assets = _run_recent_forward_reuse_case(
+        root_name="test_temp_recent_forward_reuse_background",
+        first_missing_resolver="qq_expired_after_napcat",
+        second_file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
+        second_md5="e23a4961d16c0004dbccb8884a8e427b",
+        expect_statuses=["reused", "copied"],
+        expect_public_retry_calls=0,
     )
 
-    assets = materialize_snapshot_media(
-        snapshot,
-        tmp_path / "assets",
-        media_resolution_mode="napcat_only",
-        media_download_manager=manager,
-    )
-
-    assert [item.status for item in assets] == ["reused", "copied"]
     assert assets[0].exported_rel_path == assets[1].exported_rel_path
     assert assets[0].missing_kind is None
     assert assets[0].note is None
-    assert manager.public_retry_calls == 0
+
+
+def test_recent_forward_public_retry_clears_missing_kind_after_recovery() -> None:
+    temp_root = Path(".") / "state" / "test_temp_public_retry"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        image_path = temp_root / "recovered.jpg"
+        image_path.write_bytes(b"image-bytes")
+        manager = _RecoveringPublicRetryManager(image_path)
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _forward_image_message(
+                    file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
+                    md5="e23a4961d16c0004dbccb8884a8e427b",
+                    timestamp_ms=1768035294000,
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["copied"]
+        assert assets[0].missing_kind is None
+        assert assets[0].note is None
+        assert manager.public_retry_calls == 1
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
