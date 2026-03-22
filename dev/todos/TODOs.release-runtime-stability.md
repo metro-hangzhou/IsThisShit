@@ -520,6 +520,26 @@ Recent field failures showed that the project has two separate but related stabi
   - current fix:
     - very old forward `video/file/speech` now share one expensive-route breaker bucket across months
     - slow `forward_context_materialize` attempts that still miss now count toward the breaker
+- [x] Expand the local asset simulator from hand-picked samples to bounded exhaustive old-forward audits
+  - current simulator suites now explicitly cover:
+    - `exhaustive_old_forward_terminal`
+    - `exhaustive_sticker_forward_parent`
+    - `exhaustive_local_path_states`
+    - `exhaustive_old_forward_direct_file_id`
+  - this round exposed and fixed two real logic holes:
+    - non-image `source_path` was not short-circuiting to local materialization
+    - old forward `video/file` could still spill from failed `direct_file_id_get_file` into targeted materialize
+- [ ] Add a stateful cache/breaker simulator pass instead of only single-scenario resolution checks
+  - current simulator is now much broader, but it is still mostly:
+    - one request -> one resolution result
+  - remaining high-value gap:
+    - cache reuse across repeated assets
+    - timeout-storm opening thresholds
+    - in-flight coalescing / duplicate concurrent requests
+- [ ] Add bounded compatibility coverage for NapCat public-token shape drift
+  - still missing from simulator:
+    - `file=<token>` vs `file_id=<token>` compatibility branches
+    - mixed blank payload vs remote URL vs local path return shapes under the same token family
 
 ## Related Files
 

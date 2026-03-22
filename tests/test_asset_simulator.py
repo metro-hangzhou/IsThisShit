@@ -66,7 +66,7 @@ def test_default_matrix_includes_video_and_speech_routes() -> None:
 def test_asset_resolution_matrix_matches_expectations() -> None:
     results = run_asset_resolution_matrix()
 
-    assert len(results) >= 170
+    assert len(results) >= 360
     assert all(item.matched for item in results)
 
 
@@ -143,10 +143,50 @@ def test_asset_resolution_scenario_catalog_is_systematic() -> None:
     scenarios = all_asset_resolution_scenarios()
     names = {item.name for item in scenarios}
 
-    assert len(scenarios) >= 170
+    assert len(scenarios) >= 360
     assert len(names) == len(scenarios)
     assert any(item.topology == "nested_forward" for item in scenarios)
     assert any(item.suite == "family_diff_matrix" for item in scenarios)
+    assert any(item.suite == "exhaustive_old_forward_terminal" for item in scenarios)
+    assert any(item.suite == "exhaustive_sticker_forward_parent" for item in scenarios)
+    assert any(item.suite == "exhaustive_local_path_states" for item in scenarios)
+    assert any(item.suite == "exhaustive_old_forward_direct_file_id" for item in scenarios)
     assert any("public_not_found" in item.name for item in scenarios)
     assert any("direct_not_found" in item.name for item in scenarios)
     assert any(item.asset_type == "sticker" and item.topology == "nested_forward" for item in scenarios)
+
+
+def test_asset_resolution_exhaustive_old_forward_terminal_suite_matches_expectations() -> None:
+    results = run_asset_resolution_matrix(suite="exhaustive_old_forward_terminal")
+
+    assert len(results) == 144
+    assert all(item.matched for item in results)
+    assert all(item.actual_resolver == "qq_expired_after_napcat" for item in results)
+    assert all(item.actual_path_kind == "missing" for item in results)
+
+
+def test_asset_resolution_exhaustive_sticker_forward_parent_suite_matches_expectations() -> None:
+    results = run_asset_resolution_matrix(suite="exhaustive_sticker_forward_parent")
+
+    assert len(results) == 24
+    assert all(item.matched for item in results)
+    assert any(item.actual_resolver == "sticker_remote_download" for item in results)
+    assert any(item.actual_resolver is None for item in results)
+
+
+def test_asset_resolution_exhaustive_local_path_state_suite_matches_expectations() -> None:
+    results = run_asset_resolution_matrix(suite="exhaustive_local_path_states")
+
+    assert len(results) == 25
+    assert all(item.matched for item in results)
+    assert any(item.actual_resolver == "source_local_path" for item in results)
+    assert any(item.actual_resolver == "hint_local_path" for item in results)
+
+
+def test_asset_resolution_exhaustive_old_forward_direct_file_id_suite_matches_expectations() -> None:
+    results = run_asset_resolution_matrix(suite="exhaustive_old_forward_direct_file_id")
+
+    assert len(results) == 36
+    assert all(item.matched for item in results)
+    assert all(item.actual_resolver == "qq_expired_after_napcat" for item in results)
+    assert all(item.actual_path_kind == "missing" for item in results)

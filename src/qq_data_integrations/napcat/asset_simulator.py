@@ -216,10 +216,22 @@ def default_forward_timeout_matrix(*, delay_s: float = 0.0) -> list[AssetSimulat
     scenarios = [
         ("public-token", "video", 1, 12),
         ("public-token", "video", 12, 1),
+        ("public-token", "file", 1, 12),
+        ("public-token", "file", 12, 1),
         ("forward-materialize", "video", 1, 12),
         ("forward-materialize", "video", 12, 1),
+        ("forward-materialize", "file", 1, 12),
+        ("forward-materialize", "file", 12, 1),
+        ("forward-metadata", "video", 1, 12),
+        ("forward-metadata", "video", 12, 1),
+        ("forward-metadata", "file", 1, 12),
+        ("forward-metadata", "file", 12, 1),
         ("public-token", "speech", 1, 8),
         ("public-token", "speech", 8, 1),
+        ("forward-materialize", "speech", 1, 8),
+        ("forward-materialize", "speech", 8, 1),
+        ("forward-metadata", "speech", 1, 8),
+        ("forward-metadata", "speech", 8, 1),
     ]
     return [
         run_forward_timeout_simulation(
@@ -409,15 +421,15 @@ class _ScenarioAwareDownloader(NapCatMediaDownloader):
     ) -> str | None:
         remote_url = str(hint.get("url") or "").strip()
         resolved_remote_url = self._resolve_remote_url(remote_url)
+        if not resolved_remote_url:
+            return None
         self._scenario_state.remote_attempts.append(
             {
                 "asset_type": asset_type,
                 "file_name": file_name,
-                "remote_url": resolved_remote_url or remote_url,
+                "remote_url": resolved_remote_url,
             }
         )
-        if not resolved_remote_url:
-            return None
         return self._scenario_state.remote_payload_path(resolved_remote_url)
 
     def _download_remote_sticker(
@@ -430,15 +442,15 @@ class _ScenarioAwareDownloader(NapCatMediaDownloader):
         _ = asset_role, file_name
         remote_url = str(hint.get("remote_url") or hint.get("url") or "").strip()
         resolved_remote_url = self._resolve_remote_url(remote_url)
+        if not resolved_remote_url:
+            return None
         self._scenario_state.remote_attempts.append(
             {
                 "asset_type": "sticker",
                 "file_name": file_name,
-                "remote_url": resolved_remote_url or remote_url,
+                "remote_url": resolved_remote_url,
             }
         )
-        if not resolved_remote_url:
-            return None
         return self._scenario_state.remote_payload_path(resolved_remote_url)
 
 
@@ -1164,6 +1176,269 @@ def default_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
     ]
 
 
+def _exhaustive_old_forward_terminal_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    signal_specs: dict[str, dict[str, Any]] = {
+        "payload_timeout": {
+            "forward_payload_state": "timeout",
+            "max_client_calls": 0,
+            "max_fast_calls": 1,
+            "max_remote_attempts": 0,
+        },
+        "payload_unavailable": {
+            "forward_payload_state": "unavailable",
+            "max_client_calls": 0,
+            "max_fast_calls": 1,
+            "max_remote_attempts": 0,
+        },
+        "materialize_empty": {
+            "forward_metadata_state": "none",
+            "forward_materialize_state": "empty",
+            "max_client_calls": 0,
+            "max_fast_calls": 2,
+            "max_remote_attempts": 0,
+        },
+        "materialize_error": {
+            "forward_metadata_state": "none",
+            "forward_materialize_state": "error",
+            "max_client_calls": 0,
+            "max_fast_calls": 2,
+            "max_remote_attempts": 0,
+        },
+        "materialize_zero_local": {
+            "forward_metadata_state": "none",
+            "forward_materialize_state": "zero_local",
+            "max_client_calls": None,
+            "max_fast_calls": 2,
+            "max_remote_attempts": 0,
+        },
+        "public_timeout": {
+            "forward_payload_state": "public_token",
+            "public_result_state": "timeout",
+            "max_client_calls": 1,
+            "max_fast_calls": 2,
+            "max_remote_attempts": 0,
+        },
+        "public_blank_payload": {
+            "forward_payload_state": "public_token",
+            "public_result_state": "blank_payload",
+            "max_client_calls": 1,
+            "max_fast_calls": 2,
+            "max_remote_attempts": 0,
+        },
+        "public_not_found": {
+            "forward_payload_state": "public_token",
+            "public_result_state": "not_found",
+            "max_client_calls": 1,
+            "max_fast_calls": 2,
+            "max_remote_attempts": 0,
+        },
+    }
+    for topology in ("forward", "nested_forward"):
+        for asset_type in ("video", "file", "speech"):
+            for source_state in ("none", "stale_missing", "existing_zero"):
+                for signal_name, spec in signal_specs.items():
+                    max_client_calls = spec["max_client_calls"]
+                    if signal_name == "materialize_zero_local" and asset_type in {"video", "file"}:
+                        max_client_calls = 1
+                    scenarios.append(
+                        AssetResolutionScenario(
+                            name=f"exhaustive_{topology}_{asset_type}_{source_state}_{signal_name}",
+                            suite="exhaustive_old_forward_terminal",
+                            asset_type=asset_type,
+                            topology=topology,
+                            age_days=260,
+                            source_path_state=source_state,
+                            expected_resolver="qq_expired_after_napcat",
+                            expected_path_kind="missing",
+                            max_client_calls=max_client_calls,
+                            max_fast_calls=spec["max_fast_calls"],
+                            max_remote_attempts=spec["max_remote_attempts"],
+                            notes=(
+                                "Bounded exhaustive old-forward terminal audit over source-state and "
+                                "terminal failure signal combinations."
+                            ),
+                            **{
+                                key: value
+                                for key, value in spec.items()
+                                if key
+                                not in {"max_client_calls", "max_fast_calls", "max_remote_attempts"}
+                            },
+                        )
+                    )
+    return scenarios
+
+
+def _exhaustive_sticker_forward_parent_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    for topology in ("forward", "nested_forward"):
+        for parent_state in (
+            "missing_element_id",
+            "missing_message_id_raw",
+            "missing_peer_uid",
+            "blank_parent_bundle",
+        ):
+            scenarios.append(
+                AssetResolutionScenario(
+                    name=f"exhaustive_{topology}_sticker_{parent_state}_no_remote",
+                    suite="exhaustive_sticker_forward_parent",
+                    asset_type="sticker",
+                    topology=topology,
+                    forward_parent_state=parent_state,
+                    age_days=20,
+                    expected_resolver=None,
+                    expected_path_kind="missing",
+                    max_client_calls=0,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                )
+            )
+            for remote_state in ("live_http", "relative_http"):
+                scenarios.append(
+                    AssetResolutionScenario(
+                        name=f"exhaustive_{topology}_sticker_{parent_state}_{remote_state}",
+                        suite="exhaustive_sticker_forward_parent",
+                        asset_type="sticker",
+                        topology=topology,
+                        forward_parent_state=parent_state,
+                        age_days=20,
+                        hint_remote_state=remote_state,
+                        expected_resolver="sticker_remote_download",
+                        expected_path_kind="remote",
+                        max_client_calls=0,
+                        max_fast_calls=1,
+                        max_remote_attempts=1,
+                    )
+                )
+    return scenarios
+
+
+def _exhaustive_local_path_state_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    for asset_type in ("image", "video", "file", "speech"):
+        scenarios.append(
+            AssetResolutionScenario(
+                name=f"exhaustive_top_level_{asset_type}_source_existing",
+                suite="exhaustive_local_path_states",
+                asset_type=asset_type,
+                topology="top_level",
+                source_path_state="existing",
+                expected_resolver="source_local_path",
+                expected_path_kind="local",
+                max_client_calls=0,
+                max_fast_calls=0,
+                max_remote_attempts=0,
+            )
+        )
+        scenarios.append(
+            AssetResolutionScenario(
+                name=f"exhaustive_top_level_{asset_type}_source_existing_zero",
+                suite="exhaustive_local_path_states",
+                asset_type=asset_type,
+                topology="top_level",
+                source_path_state="existing_zero",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1 if asset_type != "image" else 2,
+                max_remote_attempts=0,
+            )
+        )
+        scenarios.append(
+            AssetResolutionScenario(
+                name=f"exhaustive_top_level_{asset_type}_hint_path_existing",
+                suite="exhaustive_local_path_states",
+                asset_type=asset_type,
+                topology="top_level",
+                hint_local_state="path_existing",
+                expected_resolver="hint_local_path",
+                expected_path_kind="local",
+                max_client_calls=0,
+                max_fast_calls=0,
+                max_remote_attempts=0,
+            )
+        )
+        scenarios.append(
+            AssetResolutionScenario(
+                name=f"exhaustive_top_level_{asset_type}_hint_path_zero",
+                suite="exhaustive_local_path_states",
+                asset_type=asset_type,
+                topology="top_level",
+                hint_local_state="path_zero",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1 if asset_type != "image" else 2,
+                max_remote_attempts=0,
+            )
+        )
+        scenarios.append(
+            AssetResolutionScenario(
+                name=f"exhaustive_top_level_{asset_type}_hint_stale_local_url",
+                suite="exhaustive_local_path_states",
+                asset_type=asset_type,
+                topology="top_level",
+                hint_local_state="stale_local_url",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1 if asset_type != "image" else 2,
+                max_remote_attempts=0,
+            )
+        )
+    for asset_type in ("image", "video", "file", "speech", "sticker"):
+        kwargs: dict[str, Any] = {
+            "name": f"exhaustive_forward_{asset_type}_stale_http_remote_missing",
+            "suite": "exhaustive_local_path_states",
+            "asset_type": asset_type,
+            "topology": "forward",
+            "age_days": 20,
+            "hint_remote_state": "stale_http",
+            "expected_resolver": None,
+            "expected_path_kind": "missing",
+            "max_client_calls": 0,
+            "max_fast_calls": 1,
+            "max_remote_attempts": 1,
+            "notes": "Dead remote URL should fail after one bounded remote attempt, not silently count as local/hydrated.",
+        }
+        if asset_type != "sticker":
+            kwargs["source_path_state"] = "stale_missing"
+            kwargs["forward_payload_state"] = "remote_url"
+            kwargs["max_fast_calls"] = 1 if asset_type == "image" else 2
+        scenarios.append(AssetResolutionScenario(**kwargs))
+    return scenarios
+
+
+def _exhaustive_old_forward_direct_file_id_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    for topology in ("forward", "nested_forward"):
+        for asset_type in ("video", "file"):
+            for source_state in ("none", "stale_missing", "existing_zero"):
+                for direct_state in ("blank_payload", "timeout", "not_found"):
+                    scenarios.append(
+                        AssetResolutionScenario(
+                            name=f"exhaustive_{topology}_{asset_type}_{source_state}_{direct_state}_direct_file_id",
+                            suite="exhaustive_old_forward_direct_file_id",
+                            asset_type=asset_type,
+                            topology=topology,
+                            age_days=260,
+                            source_path_state=source_state,
+                            direct_file_result_state=direct_state,
+                            expected_resolver="qq_expired_after_napcat",
+                            expected_path_kind="missing",
+                            max_client_calls=1,
+                            max_fast_calls=1,
+                            max_remote_attempts=0,
+                            notes=(
+                                "Very old forward video/file assets with only direct file-id fallback "
+                                "must classify as expired on blank/timeout/not_found without spilling "
+                                "into targeted materialize."
+                            ),
+                        )
+                    )
+    return scenarios
+
+
 def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
     scenarios: list[AssetResolutionScenario] = []
 
@@ -1381,7 +1656,7 @@ def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
                         else "napcat_segment_file_id_get_file_remote_url",
                         expected_path_kind=expected_path_kind,
                         max_client_calls=2,
-                        max_fast_calls=2,
+                        max_fast_calls=1,
                         max_remote_attempts=1 if direct_mode == "valid_remote" else 0,
                     )
                 )
@@ -1397,6 +1672,112 @@ def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
                     expected_resolver="qq_expired_after_napcat",
                     expected_path_kind="missing",
                     max_client_calls=1,
+                    max_fast_calls=2,
+                    max_remote_attempts=0,
+                )
+            )
+            scenarios.append(
+                AssetResolutionScenario(
+                    name=f"{topology}_{asset_type}_very_old_blank_payload_direct_not_found",
+                    suite="classification_fast_fail",
+                    asset_type=asset_type,
+                    topology=topology,
+                    age_days=260,
+                    source_path_state="stale_missing",
+                    forward_payload_state="blank_payload",
+                    direct_file_result_state="not_found",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=2,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                )
+            )
+            scenarios.append(
+                AssetResolutionScenario(
+                    name=f"{topology}_{asset_type}_very_old_blank_payload_direct_timeout",
+                    suite="route_health",
+                    asset_type=asset_type,
+                    topology=topology,
+                    age_days=260,
+                    source_path_state="stale_missing",
+                    forward_payload_state="blank_payload",
+                    direct_file_result_state="timeout",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=2,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                )
+            )
+
+    for topology in forward_topologies:
+        for asset_type in expensive_forward_types:
+            scenarios.append(
+                AssetResolutionScenario(
+                    name=f"{topology}_{asset_type}_very_old_timeout_no_local_hint",
+                    suite="classification_fast_fail",
+                    asset_type=asset_type,
+                    topology=topology,
+                    age_days=260,
+                    source_path_state="none",
+                    forward_payload_state="timeout",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=0,
+                    max_fast_calls=2,
+                    max_remote_attempts=0,
+                )
+            )
+            scenarios.append(
+                AssetResolutionScenario(
+                    name=f"{topology}_{asset_type}_very_old_empty_no_local_hint",
+                    suite="classification_fast_fail",
+                    asset_type=asset_type,
+                    topology=topology,
+                    age_days=260,
+                    source_path_state="none",
+                    forward_metadata_state="none",
+                    forward_materialize_state="empty",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=0,
+                    max_fast_calls=2,
+                    max_remote_attempts=0,
+                )
+            )
+
+    for asset_type in ("image", "video", "file", "speech"):
+        scenarios.append(
+            AssetResolutionScenario(
+                name=f"top_level_{asset_type}_hint_local_zero_byte_rejected",
+                suite="classification_fast_fail",
+                asset_type=asset_type,
+                topology="top_level",
+                age_days=20,
+                hint_local_state="file_zero",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=2 if asset_type == "image" else 1,
+                max_remote_attempts=0,
+            )
+        )
+    for topology in forward_topologies:
+        for asset_type in ("video", "file", "speech"):
+            scenarios.append(
+                AssetResolutionScenario(
+                    name=f"{topology}_{asset_type}_materialize_zero_byte_rejected",
+                    suite="classification_fast_fail",
+                    asset_type=asset_type,
+                    topology=topology,
+                    age_days=260,
+                    source_path_state="stale_missing",
+                    forward_metadata_state="none",
+                    forward_materialize_state="zero_local",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=0 if asset_type == "speech" else 1,
                     max_fast_calls=2,
                     max_remote_attempts=0,
                 )
@@ -1424,6 +1805,11 @@ def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
                     max_remote_attempts=(1 if asset_type in {"video", "file"} else 0),
                 )
             )
+
+    scenarios.extend(_exhaustive_old_forward_terminal_scenarios())
+    scenarios.extend(_exhaustive_sticker_forward_parent_scenarios())
+    scenarios.extend(_exhaustive_local_path_state_scenarios())
+    scenarios.extend(_exhaustive_old_forward_direct_file_id_scenarios())
 
     return scenarios
 
