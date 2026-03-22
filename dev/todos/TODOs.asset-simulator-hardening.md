@@ -137,6 +137,39 @@ Current simulator coverage includes:
     - `speech`
     - ignored `image`
 
+### [2026-03-22][009] reset boundaries were not proven at the simulator level
+
+- Problem:
+  - prior simulator coverage focused on same-run cache/breaker carry-over
+  - it did not prove that `reset_export_state()` clears run-local poisoning before the next export
+- Current fix:
+  - simulator now has a bounded `cross-run-reset-matrix`
+  - it reuses the same downloader across:
+    - first-run old unresolved/timeout scenarios
+    - explicit `reset_export_state()`
+    - second-run recoverable scenarios
+  - current validated recoveries after reset include:
+    - image public-token remote
+    - video/file direct-file-id remote
+    - speech public-token remote
+    - forward remote URL
+
+### [2026-03-22][010] reset safety against late async prefetch writes was not guarded in production
+
+- Problem:
+  - `reset_export_state()` cleared logical caches
+  - but stale async prefetch work could still race and repopulate post-reset caches
+- Current fix:
+  - downloader now versions transient export state with a generation counter
+  - stale remote/public-token prefetch writes are discarded if they complete after a reset boundary
+  - future registration paths now also refuse to attach work that crossed a reset boundary
+- Current validation:
+  - downloader tests now explicitly cover:
+    - stale remote prefetch store rejection
+    - stale public-token prefetch store rejection
+    - reset-during-public-token-submit
+    - reset-during-remote-submit
+
 ## Remaining High-Value Gaps
 
 - [x] add batch / pair simulations for cross-parent cache poisoning and shared-outcome scope
@@ -152,6 +185,16 @@ Current simulator coverage includes:
   - shared outcome reuse after public timeout
   - forward timeout breaker after slow-noop materialize
   - mixed local+remote+public candidate reuse across repeats
+  - exact `public_token_action_outcomes` behavior vs request-scoped timeout cache
+- [ ] add explicit inflight / late-completion simulator coverage:
+  - late remote-prefetch completion after reset
+  - late public-token-prefetch completion after reset
+  - cross-run executor reuse pressure
+- [ ] add a bounded public-timeout poisoning matrix that checks real second-call behavior:
+  - same token same request
+  - new token same parent
+  - same token new file identity
+  - different parent same token
 - [ ] add shape-drift coverage for rarer mixed payloads:
   - share/card media hints
   - malformed nested-forward wrappers
@@ -172,6 +215,9 @@ Current simulator coverage includes:
 - `forward-candidate-matrix`: `42/42 matched`
 - `shared-scope-matrix`: `48/48 matched`
 - `public-timeout-scope-matrix`: `16/16 matched`
+- `pair-sequence-matrix`: `5/5 matched`
+- `cross-run-reset-matrix`: `5/5 matched`
+- `direct-file-id-scope-matrix`: `12/12 matched`
 - `prefetch-planning-matrix`:
   - `total=20`
   - `max_batch_size=200`
