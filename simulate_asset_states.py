@@ -21,10 +21,13 @@ from qq_data_integrations.napcat.asset_simulator import (  # noqa: E402
     default_asset_resolution_scenarios,
     default_forward_timeout_matrix,
     run_asset_resolution_matrix,
+    run_asset_resolution_sequence,
     run_asset_resolution_scenario,
     run_forward_timeout_simulation,
     write_simulation_trace,
 )
+
+RESOLUTION_SUITES = sorted({item.suite for item in all_asset_resolution_scenarios()})
 
 
 def _render_result(result: dict[str, Any]) -> str:
@@ -82,6 +85,33 @@ def _render_resolution_result(result: dict[str, Any]) -> str:
     )
 
 
+def _render_resolution_sequence_result(result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "asset_resolution_sequence:",
+            f"  name={result['name']}",
+            f"  suite={result['suite']} repeats={result['repeats']}",
+            (
+                "  expectation="
+                f"resolver={result['expected_resolver']} path_kind={result['expected_path_kind']}"
+            ),
+            (
+                "  actual="
+                f"resolver={result['actual_resolver']} path_kind={result['actual_path_kind']} matched={result['matched']}"
+            ),
+            f"  unique_resolvers={list(result['unique_resolvers'])}",
+            f"  unique_path_kinds={list(result['unique_path_kinds'])}",
+            (
+                "  calls="
+                f"public={result['client_call_count']} fast={result['fast_call_count']} remote={result['remote_attempt_count']}"
+            ),
+            f"  cost_matched={result['cost_matched']}",
+            f"  trace_status_breakdown={result['trace_status_breakdown']}",
+            f"  notes={result['notes']}",
+        ]
+    )
+
+
 def main() -> None:
     logging.getLogger("qq_data_integrations.napcat.media_downloader").setLevel(logging.CRITICAL)
     parser = argparse.ArgumentParser(
@@ -128,13 +158,7 @@ def main() -> None:
     resolution_parser.add_argument("--json", action="store_true")
     resolution_parser.add_argument(
         "--suite",
-        choices=[
-            "classification_fast_fail",
-            "route_health",
-            "forward_parent_shape",
-            "live_recovery_paths",
-            "family_diff_matrix",
-        ],
+        choices=RESOLUTION_SUITES,
         default=None,
     )
 
@@ -144,6 +168,14 @@ def main() -> None:
     )
     resolution_case_parser.add_argument("name")
     resolution_case_parser.add_argument("--json", action="store_true")
+
+    resolution_sequence_parser = subparsers.add_parser(
+        "resolution-sequence",
+        help="Run one named asset resolution scenario repeatedly with one downloader instance to inspect cache/breaker reuse.",
+    )
+    resolution_sequence_parser.add_argument("name")
+    resolution_sequence_parser.add_argument("--repeats", type=int, default=3)
+    resolution_sequence_parser.add_argument("--json", action="store_true")
 
     args = parser.parse_args()
 
@@ -206,6 +238,18 @@ def main() -> None:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         else:
             print(_render_resolution_result(result))
+        return
+
+    if args.command == "resolution-sequence":
+        scenarios = {item.name: item for item in all_asset_resolution_scenarios()}
+        scenario = scenarios.get(args.name)
+        if scenario is None:
+            raise SystemExit(f"unknown scenario: {args.name}")
+        result = run_asset_resolution_sequence(scenario, repeats=args.repeats).to_dict()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(_render_resolution_sequence_result(result))
         return
 
 
