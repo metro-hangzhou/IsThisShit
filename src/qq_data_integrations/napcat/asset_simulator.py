@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -269,6 +270,7 @@ class AssetResolutionScenario:
     forward_metadata_state: str = "inherit"
     forward_materialize_state: str = "inherit"
     public_result_state: str = "none"
+    public_fallback_result_state: str = "inherit"
     direct_file_result_state: str = "none"
     expected_resolver: str | None = None
     expected_path_kind: str = "missing"
@@ -294,6 +296,30 @@ class AssetResolutionResult:
     actual_path_kind: str
     matched: bool
     resolved_path: str | None
+    client_call_count: int
+    fast_call_count: int
+    remote_attempt_count: int
+    trace_event_count: int
+    trace_status_breakdown: dict[str, int]
+    cost_matched: bool
+    notes: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class AssetResolutionSequenceResult:
+    name: str
+    suite: str
+    repeats: int
+    expected_resolver: str | None
+    expected_path_kind: str
+    actual_resolver: str | None
+    actual_path_kind: str
+    matched: bool
+    unique_resolvers: tuple[str | None, ...]
+    unique_path_kinds: tuple[str, ...]
     client_call_count: int
     fast_call_count: int
     remote_attempt_count: int
@@ -359,6 +385,13 @@ class _ScenarioPublicClient:
         file_id = str(kwargs.get("file_id") or "").strip()
         if file_id.startswith("/"):
             mode = self._scenario.direct_file_result_state
+        elif file_id:
+            fallback_mode = str(self._scenario.public_fallback_result_state or "").strip()
+            mode = (
+                self._scenario.public_result_state
+                if fallback_mode in {"", "inherit"}
+                else fallback_mode
+            )
         else:
             mode = self._scenario.public_result_state
         return self._state.public_action_payload(
@@ -593,6 +626,10 @@ class _ScenarioRuntimeState:
             remote_url = f"https://cdn.example.invalid/{self.scenario.name}/{self.file_name}"
             self.remote_map[remote_url] = self.remote_path
             return {"url": remote_url, "file_name": self.file_name, "asset_type": self.scenario.asset_type}
+        if mode == "valid_remote_only":
+            remote_url = f"https://cdn.example.invalid/{self.scenario.name}/{self.file_name}"
+            self.remote_map[remote_url] = self.remote_path
+            return {"remote_url": remote_url, "file_name": self.file_name, "asset_type": self.scenario.asset_type}
         if mode == "blank_payload":
             return {
                 "file": "",
@@ -611,6 +648,8 @@ class _ScenarioRuntimeState:
             raise NapCatApiTimeoutError(f"NapCat action timed out: {action}")
         if mode == "not_found":
             raise NapCatApiError("file not found")
+        if mode == "opaque_error":
+            raise NapCatApiError("simulated opaque public action error")
         raise ValueError(f"unsupported public result state: {mode}")
 
     def public_action_payload(
@@ -681,6 +720,13 @@ class _ScenarioRuntimeState:
                 "public_action": action,
                 "public_file_token": f"token-{self.scenario.name}",
                 "file_name": self.file_name,
+                "asset_type": self.scenario.asset_type,
+            }
+        if state == "payload_file_id_only":
+            return {
+                "file_id": f"/payload-fileid/{self.scenario.name}",
+                "file_name": self.file_name,
+                "file_size": "2048",
                 "asset_type": self.scenario.asset_type,
             }
         if state == "remote_url":
@@ -755,6 +801,80 @@ def run_asset_resolution_scenario(
             actual_path_kind=actual_path_kind,
             matched=matched,
             resolved_path=resolved_path,
+            client_call_count=len(client.calls),
+            fast_call_count=len(fast_client.calls),
+            remote_attempt_count=len(runtime.remote_attempts),
+            trace_event_count=len(events),
+            trace_status_breakdown=trace_status_breakdown,
+            cost_matched=cost_matched,
+            notes=scenario.notes,
+        )
+    finally:
+        downloader.close()
+        runtime.close()
+
+
+def run_asset_resolution_sequence(
+    scenario: AssetResolutionScenario,
+    *,
+    repeats: int = 3,
+    trace_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> AssetResolutionSequenceResult:
+    runtime = _ScenarioRuntimeState(scenario)
+    events: list[dict[str, Any]] = []
+    client = _ScenarioPublicClient(scenario, runtime)
+    fast_client = _ScenarioFastClient(scenario, runtime)
+    downloader = _ScenarioAwareDownloader(client, fast_client=fast_client, state=runtime)
+    try:
+        sequence_results: list[tuple[str | None, str]] = []
+        repeats = max(1, int(repeats))
+        for _ in range(repeats):
+            request = copy.deepcopy(runtime.request)
+            result = downloader.resolve_for_export(
+                request,
+                trace_callback=(
+                    (lambda event: (events.append(dict(event)), trace_callback and trace_callback(dict(event))))
+                    if trace_callback is not None
+                    else events.append
+                ),
+            )
+            actual_path_kind, _resolved_path = _path_kind_for_result(result, runtime)
+            sequence_results.append((result[1], actual_path_kind))
+        unique_resolvers = tuple(dict.fromkeys(item[0] for item in sequence_results))
+        unique_path_kinds = tuple(dict.fromkeys(item[1] for item in sequence_results))
+        actual_resolver = sequence_results[-1][0]
+        actual_path_kind = sequence_results[-1][1]
+        cost_matched = True
+        if scenario.max_client_calls is not None and len(client.calls) > scenario.max_client_calls:
+            cost_matched = False
+        if scenario.max_fast_calls is not None and len(fast_client.calls) > scenario.max_fast_calls:
+            cost_matched = False
+        if scenario.max_remote_attempts is not None and len(runtime.remote_attempts) > scenario.max_remote_attempts:
+            cost_matched = False
+        matched = (
+            all(resolver == scenario.expected_resolver for resolver, _ in sequence_results)
+            and all(path_kind == scenario.expected_path_kind for _, path_kind in sequence_results)
+            and cost_matched
+        )
+        trace_status_breakdown: dict[str, int] = {}
+        for event in events:
+            if str(event.get("phase") or "").strip() != "materialize_asset_substep":
+                continue
+            status = str(event.get("status") or "").strip()
+            if not status:
+                continue
+            trace_status_breakdown[status] = trace_status_breakdown.get(status, 0) + 1
+        return AssetResolutionSequenceResult(
+            name=scenario.name,
+            suite=scenario.suite,
+            repeats=repeats,
+            expected_resolver=scenario.expected_resolver,
+            expected_path_kind=scenario.expected_path_kind,
+            actual_resolver=actual_resolver,
+            actual_path_kind=actual_path_kind,
+            matched=matched,
+            unique_resolvers=unique_resolvers,
+            unique_path_kinds=unique_path_kinds,
             client_call_count=len(client.calls),
             fast_call_count=len(fast_client.calls),
             remote_attempt_count=len(runtime.remote_attempts),
@@ -1439,6 +1559,121 @@ def _exhaustive_old_forward_direct_file_id_scenarios() -> list[AssetResolutionSc
     return scenarios
 
 
+def _exhaustive_public_token_shape_drift_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    resolver_by_asset_type = {
+        "image": "napcat_public_token_get_image",
+        "video": "napcat_public_token_get_file",
+        "file": "napcat_public_token_get_file",
+        "speech": "napcat_public_token_get_record",
+    }
+    for topology in ("top_level", "forward", "nested_forward"):
+        for asset_type in ("image", "video", "file", "speech"):
+            payload_fields: dict[str, Any]
+            if topology == "top_level":
+                payload_fields = {
+                    "context_payload_state": "public_token",
+                }
+            else:
+                payload_fields = {
+                    "forward_payload_state": "public_token",
+                }
+            for fallback_state, expected_path_kind in (
+                ("valid_local", "local"),
+                ("valid_remote", "remote"),
+                ("valid_remote_only", "remote"),
+            ):
+                scenario_kwargs = {
+                    "name": f"public_token_shape_drift_{topology}_{asset_type}_{fallback_state}",
+                    "suite": "public_token_shape_drift",
+                    "asset_type": asset_type,
+                    "topology": topology,
+                    "age_days": 20,
+                    "public_result_state": "opaque_error",
+                    "public_fallback_result_state": fallback_state,
+                    "expected_resolver": (
+                        resolver_by_asset_type[asset_type]
+                        if expected_path_kind == "local"
+                        else f"{resolver_by_asset_type[asset_type]}_remote_url"
+                    ),
+                    "expected_path_kind": expected_path_kind,
+                    "max_client_calls": 2,
+                    "max_fast_calls": 1,
+                    "max_remote_attempts": 1 if fallback_state in {"valid_remote", "valid_remote_only"} else 0,
+                    "notes": (
+                        "Bounded compatibility coverage for NapCat runtimes that only honor "
+                        "`file_id=<token>` after rejecting `file=<token>`."
+                    ),
+                    **payload_fields,
+                }
+                if topology != "top_level":
+                    scenario_kwargs["source_path_state"] = "none"
+                scenarios.append(AssetResolutionScenario(**scenario_kwargs))
+    return scenarios
+
+
+def _exhaustive_old_forward_payload_file_id_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    for topology in ("forward", "nested_forward"):
+        for asset_type in ("video", "file"):
+            for source_state in ("none", "stale_missing", "existing_zero"):
+                for direct_state in ("blank_payload", "timeout", "not_found"):
+                    scenarios.append(
+                        AssetResolutionScenario(
+                            name=f"exhaustive_{topology}_{asset_type}_{source_state}_{direct_state}_payload_file_id",
+                            suite="exhaustive_old_forward_payload_file_id",
+                            asset_type=asset_type,
+                            topology=topology,
+                            age_days=260,
+                            source_path_state=source_state,
+                            forward_metadata_state="payload_file_id_only",
+                            direct_file_result_state=direct_state,
+                            expected_resolver="qq_expired_after_napcat",
+                            expected_path_kind="missing",
+                            max_client_calls=1,
+                            max_fast_calls=1,
+                            max_remote_attempts=0,
+                            notes=(
+                                "Very old forwarded file/video assets whose only surviving direct-file-id "
+                                "arrives in the forward metadata payload should prefer direct-file-id "
+                                "before targeted materialize and classify quickly on terminal failures."
+                            ),
+                        )
+                    )
+    return scenarios
+
+
+def _exhaustive_old_public_zero_byte_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    for topology in ("top_level", "forward", "nested_forward"):
+        for asset_type in ("video", "file", "speech"):
+            for source_state in ("none", "stale_missing"):
+                scenario_kwargs: dict[str, Any] = {
+                    "name": f"exhaustive_{topology}_{asset_type}_{source_state}_public_zero_local",
+                    "suite": "exhaustive_old_public_zero_byte",
+                    "asset_type": asset_type,
+                    "topology": topology,
+                    "age_days": 260,
+                    "source_path_state": source_state,
+                    "public_result_state": "valid_zero_local",
+                    "expected_resolver": "qq_expired_after_napcat",
+                    "expected_path_kind": "missing",
+                    "max_client_calls": 1,
+                    "max_fast_calls": 1 if topology == "top_level" else 2,
+                    "max_remote_attempts": 0,
+                    "notes": (
+                        "Old public-token payloads that only expose an existing zero-byte local file "
+                        "should classify as expired instead of leaking through as ambiguous missing."
+                    ),
+                }
+                if topology == "top_level":
+                    scenario_kwargs["context_payload_state"] = "public_token"
+                else:
+                    scenario_kwargs["forward_payload_state"] = "public_token"
+                scenarios.append(AssetResolutionScenario(**scenario_kwargs))
+    return scenarios
+
+
 def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
     scenarios: list[AssetResolutionScenario] = []
 
@@ -1810,6 +2045,9 @@ def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
     scenarios.extend(_exhaustive_sticker_forward_parent_scenarios())
     scenarios.extend(_exhaustive_local_path_state_scenarios())
     scenarios.extend(_exhaustive_old_forward_direct_file_id_scenarios())
+    scenarios.extend(_exhaustive_public_token_shape_drift_scenarios())
+    scenarios.extend(_exhaustive_old_forward_payload_file_id_scenarios())
+    scenarios.extend(_exhaustive_old_public_zero_byte_scenarios())
 
     return scenarios
 

@@ -5,6 +5,7 @@ from qq_data_integrations.napcat.asset_simulator import (
     default_asset_resolution_scenarios,
     default_forward_timeout_matrix,
     run_asset_resolution_matrix,
+    run_asset_resolution_sequence,
     run_asset_resolution_scenario,
     run_forward_timeout_simulation,
 )
@@ -66,7 +67,7 @@ def test_default_matrix_includes_video_and_speech_routes() -> None:
 def test_asset_resolution_matrix_matches_expectations() -> None:
     results = run_asset_resolution_matrix()
 
-    assert len(results) >= 360
+    assert len(results) >= 450
     assert all(item.matched for item in results)
 
 
@@ -143,7 +144,7 @@ def test_asset_resolution_scenario_catalog_is_systematic() -> None:
     scenarios = all_asset_resolution_scenarios()
     names = {item.name for item in scenarios}
 
-    assert len(scenarios) >= 360
+    assert len(scenarios) >= 384
     assert len(names) == len(scenarios)
     assert any(item.topology == "nested_forward" for item in scenarios)
     assert any(item.suite == "family_diff_matrix" for item in scenarios)
@@ -151,6 +152,9 @@ def test_asset_resolution_scenario_catalog_is_systematic() -> None:
     assert any(item.suite == "exhaustive_sticker_forward_parent" for item in scenarios)
     assert any(item.suite == "exhaustive_local_path_states" for item in scenarios)
     assert any(item.suite == "exhaustive_old_forward_direct_file_id" for item in scenarios)
+    assert any(item.suite == "public_token_shape_drift" for item in scenarios)
+    assert any(item.suite == "exhaustive_old_forward_payload_file_id" for item in scenarios)
+    assert any(item.suite == "exhaustive_old_public_zero_byte" for item in scenarios)
     assert any("public_not_found" in item.name for item in scenarios)
     assert any("direct_not_found" in item.name for item in scenarios)
     assert any(item.asset_type == "sticker" and item.topology == "nested_forward" for item in scenarios)
@@ -190,3 +194,110 @@ def test_asset_resolution_exhaustive_old_forward_direct_file_id_suite_matches_ex
     assert all(item.matched for item in results)
     assert all(item.actual_resolver == "qq_expired_after_napcat" for item in results)
     assert all(item.actual_path_kind == "missing" for item in results)
+
+
+def test_asset_resolution_public_token_shape_drift_suite_matches_expectations() -> None:
+    results = run_asset_resolution_matrix(suite="public_token_shape_drift")
+
+    assert len(results) == 36
+    assert all(item.matched for item in results)
+    assert any(item.actual_path_kind == "local" for item in results)
+    assert any(item.actual_path_kind == "remote" for item in results)
+
+
+def test_asset_resolution_old_forward_payload_file_id_suite_matches_expectations() -> None:
+    results = run_asset_resolution_matrix(suite="exhaustive_old_forward_payload_file_id")
+
+    assert len(results) == 36
+    assert all(item.matched for item in results)
+    assert all(item.actual_resolver == "qq_expired_after_napcat" for item in results)
+    assert all(item.actual_path_kind == "missing" for item in results)
+
+
+def test_asset_resolution_old_public_zero_byte_suite_matches_expectations() -> None:
+    results = run_asset_resolution_matrix(suite="exhaustive_old_public_zero_byte")
+
+    assert len(results) == 18
+    assert all(item.matched for item in results)
+    assert all(item.actual_resolver == "qq_expired_after_napcat" for item in results)
+    assert all(item.actual_path_kind == "missing" for item in results)
+
+
+def test_asset_resolution_sequence_reuses_old_forward_timeout_classification() -> None:
+    scenario = {
+        item.name: item
+        for item in all_asset_resolution_scenarios()
+    }["forward_old_video_public_token_timeout"]
+
+    result = run_asset_resolution_sequence(scenario, repeats=3)
+
+    assert result.matched is True
+    assert result.actual_resolver == "qq_expired_after_napcat"
+    assert result.actual_path_kind == "missing"
+    assert result.client_call_count == 1
+    assert result.fast_call_count == 1
+    assert result.remote_attempt_count == 0
+
+
+def test_asset_resolution_sequence_reuses_route_unavailable_fast_fail() -> None:
+    scenario = {
+        item.name: item
+        for item in all_asset_resolution_scenarios()
+    }["forward_old_video_route_unavailable"]
+
+    result = run_asset_resolution_sequence(scenario, repeats=3)
+
+    assert result.matched is True
+    assert result.actual_resolver == "qq_expired_after_napcat"
+    assert result.actual_path_kind == "missing"
+    assert result.client_call_count == 0
+    assert result.fast_call_count == 1
+    assert result.remote_attempt_count == 0
+
+
+def test_asset_resolution_sequence_reuses_public_token_shape_drift_success() -> None:
+    scenario = {
+        item.name: item
+        for item in all_asset_resolution_scenarios()
+    }["public_token_shape_drift_forward_video_valid_remote"]
+
+    result = run_asset_resolution_sequence(scenario, repeats=3)
+
+    assert result.matched is True
+    assert result.actual_resolver == "napcat_public_token_get_file_remote_url"
+    assert result.actual_path_kind == "remote"
+    assert result.client_call_count == 2
+    assert result.fast_call_count == 1
+    assert result.remote_attempt_count == 1
+
+
+def test_asset_resolution_sequence_reuses_public_token_remote_url_only_success() -> None:
+    scenario = {
+        item.name: item
+        for item in all_asset_resolution_scenarios()
+    }["public_token_shape_drift_forward_video_valid_remote_only"]
+
+    result = run_asset_resolution_sequence(scenario, repeats=3)
+
+    assert result.matched is True
+    assert result.actual_resolver == "napcat_public_token_get_file_remote_url"
+    assert result.actual_path_kind == "remote"
+    assert result.client_call_count == 2
+    assert result.fast_call_count == 1
+    assert result.remote_attempt_count == 1
+
+
+def test_asset_resolution_sequence_reuses_payload_only_direct_file_id_fast_fail() -> None:
+    scenario = {
+        item.name: item
+        for item in all_asset_resolution_scenarios()
+    }["exhaustive_forward_video_stale_missing_blank_payload_payload_file_id"]
+
+    result = run_asset_resolution_sequence(scenario, repeats=3)
+
+    assert result.matched is True
+    assert result.actual_resolver == "qq_expired_after_napcat"
+    assert result.actual_path_kind == "missing"
+    assert result.client_call_count == 1
+    assert result.fast_call_count == 1
+    assert result.remote_attempt_count == 0

@@ -914,6 +914,7 @@ class NapCatMediaDownloader:
                 attempted_direct_forward_file_id = True
                 direct_forward_file_id = self._resolve_via_direct_file_id(
                     request,
+                    payload=forward_payload if isinstance(forward_payload, dict) else None,
                     trace_callback=trace_callback,
                 )
                 if direct_forward_file_id not in {None, (None, None)}:
@@ -964,6 +965,7 @@ class NapCatMediaDownloader:
             if not attempted_direct_forward_file_id:
                 direct_forward_file_id = self._resolve_via_direct_file_id(
                     request,
+                    payload=forward_payload if isinstance(forward_payload, dict) else None,
                     trace_callback=trace_callback,
                 )
                 if direct_forward_file_id not in {None, (None, None)}:
@@ -1385,14 +1387,14 @@ class NapCatMediaDownloader:
         self,
         request: dict[str, Any],
         *,
+        payload: dict[str, Any] | None = None,
         trace_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[Path | None, str | None] | None:
         asset_type = str(request.get("asset_type") or "").strip()
         if asset_type not in {"file", "video"}:
             return None
         old_bucket = self._old_context_bucket(asset_type, request)
-        hint = self._request_hint(request)
-        file_id = str(hint.get("file_id") or "").strip()
+        file_id = self._direct_forward_file_identifier(request, payload=payload)
         if not file_id or not file_id.startswith("/"):
             return None
         timeout_s = self._direct_file_id_timeout_s(request)
@@ -2938,7 +2940,7 @@ class NapCatMediaDownloader:
         asset_type = str(request_data.get("asset_type") or "").strip()
         if asset_type not in self.REMOTE_PREFETCHABLE_ASSET_TYPES:
             return None
-        remote_url = str(payload.get("url") or "").strip()
+        remote_url = self._public_payload_remote_url(payload)
         if not remote_url:
             return None
         resolved_remote_url = self._resolve_remote_url(remote_url)
@@ -3336,7 +3338,7 @@ class NapCatMediaDownloader:
             result["resolver"] = f"napcat_public_token_{action}_prefetched"
             self._record_prefetch_feedback("token_resolved")
             return result
-        remote_url = str(payload.get("url") or "").strip()
+        remote_url = self._public_payload_remote_url(payload)
         resolved_remote_url = self._resolve_remote_url(remote_url)
         if not resolved_remote_url:
             return result
@@ -4065,7 +4067,14 @@ class NapCatMediaDownloader:
         )
         if blank_public_file_missing is not None:
             return blank_public_file_missing
-        remote_url = str(data.get("url") or "").strip()
+        zero_byte_public_missing = self._classify_zero_byte_public_payload_missing(
+            data,
+            old_bucket=old_bucket,
+            request=request,
+        )
+        if zero_byte_public_missing is not None:
+            return zero_byte_public_missing
+        remote_url = self._public_payload_remote_url(data)
         if not remote_url:
             return None
         resolved_url = self._resolve_remote_url(remote_url)
@@ -4111,6 +4120,45 @@ class NapCatMediaDownloader:
                 return None
             if Path(remote_url).exists():
                 return None
+        file_name = str(
+            data.get("file_name")
+            or ((request or {}).get("file_name") if isinstance(request, dict) else "")
+            or ""
+        ).strip()
+        file_size = str(data.get("file_size") or "").strip()
+        file_id = str(data.get("file_id") or "").strip()
+        token = str(data.get("public_file_token") or "").strip()
+        if not any([file_name, file_size, file_id, token]):
+            return None
+        return "qq_expired_after_napcat"
+
+    def _classify_zero_byte_public_payload_missing(
+        self,
+        data: dict[str, Any] | None,
+        *,
+        old_bucket: tuple[str, str] | None,
+        request: dict[str, Any] | None = None,
+    ) -> str | None:
+        if old_bucket is None or not isinstance(data, dict):
+            return None
+        action = str(data.get("public_action") or "").strip().lower()
+        request_asset_type = str(
+            (request or {}).get("asset_type") if isinstance(request, dict) else ""
+        ).strip().lower()
+        payload_asset_type = str(data.get("asset_type") or "").strip().lower()
+        effective_asset_type = request_asset_type or payload_asset_type
+        if effective_asset_type == "speech":
+            if action != "get_record":
+                return None
+        elif effective_asset_type in {"file", "video"}:
+            if action != "get_file":
+                return None
+        else:
+            return None
+        if self._has_live_http_media_url(request, payload=data):
+            return None
+        if self._zero_byte_local_payload_path(data) is None:
+            return None
         file_name = str(
             data.get("file_name")
             or ((request or {}).get("file_name") if isinstance(request, dict) else "")
@@ -4393,8 +4441,7 @@ class NapCatMediaDownloader:
             return None
         if not self._is_very_old_forward_expensive_asset(request):
             return None
-        hint = self._request_hint(request)
-        file_id = str(hint.get("file_id") or "").strip()
+        file_id = self._direct_forward_file_identifier(request, payload=payload)
         if not file_id.startswith("/"):
             return None
         if self._has_live_http_media_url(request, payload=payload):
@@ -4416,6 +4463,22 @@ class NapCatMediaDownloader:
         file_size = str(payload.get("file_size") or "").strip()
         payload_file_id = str(payload.get("file_id") or "").strip()
         return "qq_expired_after_napcat" if (file_name or file_size or payload_file_id) else None
+
+    def _direct_forward_file_identifier(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> str:
+        hint = self._request_hint(request) if isinstance(request, dict) else {}
+        for value in (
+            hint.get("file_id"),
+            (payload or {}).get("file_id") if isinstance(payload, dict) else None,
+        ):
+            candidate = str(value or "").strip()
+            if candidate:
+                return candidate
+        return ""
 
     def _forward_context_empty(
         self,
@@ -4537,15 +4600,7 @@ class NapCatMediaDownloader:
         *,
         payload: dict[str, Any] | None = None,
     ) -> bool:
-        hint = self._request_hint(request) if isinstance(request, dict) else {}
-        for value in (
-            hint.get("file_id"),
-            (payload or {}).get("file_id") if isinstance(payload, dict) else None,
-        ):
-            candidate = str(value or "").strip()
-            if candidate:
-                return True
-        return False
+        return bool(self._direct_forward_file_identifier(request, payload=payload))
 
     def _allow_old_forward_missing_without_stale_local_hint(
         self,
@@ -4574,8 +4629,7 @@ class NapCatMediaDownloader:
             return False
         if not self._is_very_old_forward_expensive_asset(request):
             return False
-        hint = self._request_hint(request)
-        file_id = str(hint.get("file_id") or "").strip()
+        file_id = self._direct_forward_file_identifier(request, payload=payload)
         if not file_id.startswith("/"):
             return False
         if self._has_live_http_media_url(request, payload=payload):
@@ -4636,6 +4690,37 @@ class NapCatMediaDownloader:
                 ]
             )
         return tuple(value for value in values if value)
+
+    @staticmethod
+    def _public_payload_remote_url(payload: dict[str, Any] | None) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("remote_url") or payload.get("url") or "").strip()
+
+    @staticmethod
+    def _zero_byte_local_payload_path(data: dict[str, Any] | None) -> Path | None:
+        if not isinstance(data, dict):
+            return None
+        candidate = data.get("file") or data.get("path") or data.get("url")
+        if not candidate:
+            return None
+        path_text = str(candidate).strip()
+        if not path_text:
+            return None
+        if path_text.lower().startswith("file://"):
+            path_text = path_text[7:]
+        parsed = urlparse(path_text)
+        if parsed.scheme.lower() in {"http", "https"}:
+            return None
+        path = Path(path_text)
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            if path.stat().st_size > 0:
+                return None
+        except OSError:
+            return None
+        return path.resolve()
 
     @staticmethod
     def _looks_like_stale_local_media_path(value: object) -> bool:
