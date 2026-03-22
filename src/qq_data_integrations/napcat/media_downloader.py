@@ -83,6 +83,7 @@ class NapCatMediaDownloader:
         self._forward_context_timeout_cache: set[tuple[str, ...]] = set()
         self._forward_context_empty_cache: set[tuple[str, ...]] = set()
         self._forward_context_error_cache: set[tuple[str, ...]] = set()
+        self._forward_context_unavailable_cache: set[tuple[str, ...]] = set()
         self._forward_context_payload_cache: dict[tuple[str, ...], dict[str, Any]] = {}
         self._request_scoped_public_action_timeout_cache: set[tuple[str, ...]] = set()
         self._forward_timeout_storm_counts: dict[tuple[str, ...], int] = {}
@@ -237,6 +238,7 @@ class NapCatMediaDownloader:
             self._forward_context_timeout_cache.clear()
             self._forward_context_empty_cache.clear()
             self._forward_context_error_cache.clear()
+            self._forward_context_unavailable_cache.clear()
             self._forward_context_payload_cache.clear()
             self._request_scoped_public_action_timeout_cache.clear()
             self._forward_timeout_storm_counts.clear()
@@ -1530,6 +1532,13 @@ class NapCatMediaDownloader:
             self._prefetched_forward_media[key] = (None, None)
             self._prefetched_forward_media_payloads[key] = None
             return None
+        if (
+            timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_unavailable_cache
+        ):
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return None
         if isinstance(cached_forward_payload, dict):
             assets = cached_forward_payload.get("assets")
             assets_list = assets if isinstance(assets, list) else []
@@ -1625,6 +1634,9 @@ class NapCatMediaDownloader:
                 "Ordinary /hydrate-media remains enabled. detail=%s",
                 exc,
             )
+            if timeout_cache_key is not None:
+                self._forward_context_unavailable_cache.add(timeout_cache_key)
+                self._forward_context_payload_cache.pop(timeout_cache_key, None)
             self._prefetched_forward_media[key] = (None, None)
             self._prefetched_forward_media_payloads[key] = None
             return None
@@ -1697,6 +1709,7 @@ class NapCatMediaDownloader:
             self._forward_context_timeout_cache.discard(timeout_cache_key)
             self._forward_context_empty_cache.discard(timeout_cache_key)
             self._forward_context_error_cache.discard(timeout_cache_key)
+            self._forward_context_unavailable_cache.discard(timeout_cache_key)
             if not materialize and isinstance(payload, dict):
                 self._forward_context_payload_cache[timeout_cache_key] = payload
         assets = payload.get("assets") if isinstance(payload, dict) else None
@@ -4111,9 +4124,15 @@ class NapCatMediaDownloader:
     ) -> bool:
         if not isinstance(request, dict):
             return False
+        if self._fast_forward_context_route_disabled:
+            return True
         if self._forward_context_timed_out(request, materialize=False):
             return True
         if self._forward_context_timed_out(request, materialize=True):
+            return True
+        if self._forward_context_unavailable(request, materialize=False):
+            return True
+        if self._forward_context_unavailable(request, materialize=True):
             return True
         asset_type = str(request.get("asset_type") or "").strip().lower()
         action = "get_record" if asset_type == "speech" else "get_file"
@@ -4129,6 +4148,25 @@ class NapCatMediaDownloader:
             request,
             route="direct_file_id_get_file",
         )
+
+    def _forward_context_unavailable(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        materialize: bool,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        timeout_cache_key = self._forward_context_timeout_key(
+            request,
+            materialize=materialize,
+        )
+        if (
+            timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_unavailable_cache
+        ):
+            return True
+        return bool(self._fast_forward_context_route_disabled and self._has_forward_parent_hint(self._request_hint(request)))
 
     def _public_action_timeout_s(
         self,
@@ -4226,7 +4264,11 @@ class NapCatMediaDownloader:
     ) -> tuple[str, ...]:
         values: list[str] = []
         if isinstance(request, dict):
-            values.extend([str(request.get("source_path") or "").strip()])
+            values.extend(
+                [
+                    str(request.get("source_path") or "").strip(),
+                ]
+            )
             hint = self._request_hint(request)
             values.extend(
                 [
@@ -4254,7 +4296,10 @@ class NapCatMediaDownloader:
             return False
         if candidate.lower().startswith("file://"):
             candidate = candidate[7:]
-        if not (re.match(r"^[a-zA-Z]:[\\/]", candidate) or candidate.startswith("\\\\")):
+        if not (
+            re.match(r"^[a-zA-Z]:[\\/]", candidate)
+            or candidate.startswith("\\\\")
+        ):
             return False
         return not Path(candidate).exists()
 

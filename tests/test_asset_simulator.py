@@ -65,7 +65,7 @@ def test_default_matrix_includes_video_and_speech_routes() -> None:
 def test_asset_resolution_matrix_matches_expectations() -> None:
     results = run_asset_resolution_matrix()
 
-    assert len(results) >= 20
+    assert len(results) >= 28
     assert all(item.matched for item in results)
 
 
@@ -83,9 +83,17 @@ def test_asset_resolution_matrix_includes_core_failure_and_remote_recovery_paths
 
     assert results["forward_old_video_materialize_timeout"].actual_resolver == "qq_expired_after_napcat"
     assert results["forward_old_video_materialize_timeout"].actual_path_kind == "missing"
+    assert results["forward_old_video_materialize_timeout"].cost_matched is True
 
     assert results["forward_video_relative_remote_url"].actual_resolver == "napcat_forward_remote_url"
     assert results["forward_video_relative_remote_url"].actual_path_kind == "remote"
+
+    assert results["forward_old_video_route_unavailable"].actual_resolver == "qq_expired_after_napcat"
+    assert results["forward_old_video_route_unavailable"].actual_path_kind == "missing"
+    assert results["forward_video_missing_parent_element_id"].actual_resolver is None
+    assert results["forward_video_missing_parent_element_id"].actual_path_kind == "missing"
+    assert results["forward_video_stale_path_live_remote_url"].actual_resolver == "napcat_forward_remote_url"
+    assert results["forward_video_stale_path_live_remote_url"].actual_path_kind == "remote"
 
 
 def test_asset_resolution_case_reports_known_bad_video_token() -> None:
@@ -98,3 +106,11 @@ def test_asset_resolution_case_reports_known_bad_video_token() -> None:
 
     assert result.actual_resolver == "napcat_video_url_unavailable"
     assert result.actual_path_kind == "missing"
+
+
+def test_asset_resolution_matrix_can_filter_by_suite() -> None:
+    route_health = run_asset_resolution_matrix(suite="route_health")
+    suites = {item.suite for item in route_health}
+
+    assert route_health
+    assert suites == {"route_health"}

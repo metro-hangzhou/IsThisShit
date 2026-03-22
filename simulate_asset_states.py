@@ -60,6 +60,7 @@ def _render_resolution_result(result: dict[str, Any]) -> str:
         [
             "asset_resolution_simulation:",
             f"  name={result['name']}",
+            f"  suite={result['suite']}",
             f"  asset_type={result['asset_type']} topology={result['topology']} age_days={result['age_days']}",
             (
                 "  expectation="
@@ -73,6 +74,7 @@ def _render_resolution_result(result: dict[str, Any]) -> str:
                 "  calls="
                 f"public={result['client_call_count']} fast={result['fast_call_count']} remote={result['remote_attempt_count']}"
             ),
+            f"  cost_matched={result['cost_matched']}",
             f"  trace_status_breakdown={result['trace_status_breakdown']}",
             f"  notes={result['notes']}",
         ]
@@ -123,6 +125,11 @@ def main() -> None:
         help="Run a scenario-driven resolution matrix across asset families and states.",
     )
     resolution_parser.add_argument("--json", action="store_true")
+    resolution_parser.add_argument(
+        "--suite",
+        choices=["classification_fast_fail", "route_health", "forward_parent_shape", "live_recovery_paths"],
+        default=None,
+    )
 
     resolution_case_parser = subparsers.add_parser(
         "resolution-case",
@@ -165,7 +172,7 @@ def main() -> None:
         return
 
     if args.command == "resolution-matrix":
-        results = [item.to_dict() for item in run_asset_resolution_matrix()]
+        results = [item.to_dict() for item in run_asset_resolution_matrix(suite=args.suite)]
         if args.json:
             print(json.dumps(results, ensure_ascii=False, indent=2))
             return
@@ -174,6 +181,8 @@ def main() -> None:
             "resolution_matrix:"
             f" total={len(results)} matched={len(results) - len(mismatches)} mismatched={len(mismatches)}"
         )
+        if args.suite:
+            print(f"resolution_suite: {args.suite}")
         for index, result in enumerate(results, start=1):
             print()
             print(f"[scenario {index}]")
