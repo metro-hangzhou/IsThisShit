@@ -560,7 +560,7 @@ def test_forward_video_public_token_timeout_skips_later_retry_even_with_new_toke
 
     assert first is None
     assert second is None
-    assert client.get_file_calls == 1
+    assert client.get_file_calls == 2
 
 
 def test_forward_video_materialize_timeout_skips_later_retry_for_sibling_assets() -> None:
@@ -598,7 +598,7 @@ def test_forward_video_public_token_timeout_skips_later_retry_for_sibling_assets
 
     assert first is None
     assert second is None
-    assert client.get_file_calls == 1
+    assert client.get_file_calls == 2
 
 
 def test_forward_speech_materialize_timeout_skips_later_retry_for_sibling_assets() -> None:
@@ -636,7 +636,7 @@ def test_forward_speech_public_token_timeout_skips_later_retry_for_sibling_asset
 
     assert first is None
     assert second is None
-    assert client.get_record_calls == 1
+    assert client.get_record_calls == 2
 
 
 def test_old_forward_video_uses_shorter_public_token_timeout() -> None:
@@ -1154,6 +1154,54 @@ def test_recent_forward_video_missing_is_not_shared_without_terminal_expired_res
         request,
         resolver="qq_expired_after_napcat",
     ) is True
+
+
+def test_recent_forward_speech_missing_is_not_shared_without_terminal_expired_resolver() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _build_forward_speech_request("recent-forward-speech.mp3")
+    request["timestamp_ms"] = int(
+        (datetime.now(timezone.utc) - timedelta(days=20)).timestamp() * 1000
+    )
+
+    assert downloader._should_share_missing_outcome(request, resolver=None) is False
+    assert downloader._should_share_missing_outcome(
+        request,
+        resolver="missing_after_napcat",
+    ) is False
+    assert downloader._should_share_missing_outcome(
+        request,
+        resolver="qq_expired_after_napcat",
+    ) is True
+
+
+def test_forward_file_shared_request_key_requires_strong_identity() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _build_forward_video_request("generic-name.mp4")
+
+    assert downloader._shared_request_key(request) is None
+
+    request["md5"] = "abcd1234"
+    assert downloader._shared_request_key(request) is not None
+
+
+def test_request_scoped_public_timeout_key_is_candidate_aware() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _build_forward_video_request("candidate-a.mp4")
+    key_a = downloader._request_scoped_public_action_timeout_key(
+        request,
+        action="get_file",
+        token="token-a",
+    )
+    request_b = _build_forward_video_request("candidate-b.mp4")
+    key_b = downloader._request_scoped_public_action_timeout_key(
+        request_b,
+        action="get_file",
+        token="token-b",
+    )
+
+    assert key_a is not None
+    assert key_b is not None
+    assert key_a != key_b
 
 
 def test_remote_media_download_prepares_cache_dir_on_first_use() -> None:

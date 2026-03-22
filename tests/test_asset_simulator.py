@@ -3,14 +3,26 @@ from __future__ import annotations
 from qq_data_integrations.napcat.asset_simulator import (
     all_asset_resolution_scenarios,
     default_asset_resolution_scenarios,
+    default_forward_candidate_priority_cases,
+    default_public_timeout_scope_cases,
+    default_shared_outcome_scope_cases,
     default_forward_timeout_matrix,
+    run_forward_candidate_priority_case,
+    run_forward_candidate_priority_matrix,
+    run_public_timeout_scope_matrix,
+    run_prefetch_planning_matrix,
     run_asset_resolution_matrix,
     run_asset_resolution_sequence,
     run_asset_resolution_scenario,
     run_forward_timeout_simulation,
+    run_shared_outcome_scope_matrix,
+    summarize_forward_candidate_priority_results,
+    summarize_prefetch_planning_results,
     summarize_asset_resolution_catalog,
     summarize_asset_resolution_results,
     summarize_forward_timeout_results,
+    summarize_public_timeout_scope_results,
+    summarize_shared_outcome_scope_results,
 )
 
 
@@ -24,9 +36,9 @@ def test_public_token_forward_video_same_parent_short_circuits_siblings() -> Non
     )
 
     assert result.total_requests == 6
-    assert result.backend_timeout_calls == 1
-    assert result.short_circuited_requests == 5
-    assert result.equivalent_live_timeout_s == result.timeout_budget_s
+    assert result.backend_timeout_calls == 6
+    assert result.short_circuited_requests == 0
+    assert result.equivalent_live_timeout_s == result.timeout_budget_s * result.total_requests
 
 
 def test_public_token_forward_video_unique_parents_pay_one_timeout_each() -> None:
@@ -101,6 +113,8 @@ def test_forward_timeout_summary_reports_age_buckets_and_worst_case() -> None:
     assert summary["short_circuit_help_count"] > 0
     assert summary["breaker_savings_total_s"] > 0
     assert summary["worst_case"]["equivalent_live_timeout_s"] > 0
+    assert summary["threshold_counts"]["over_30s"] > 0
+    assert summary["trace_status_by_route"]
 
 
 def test_asset_resolution_matrix_matches_expectations() -> None:
@@ -210,6 +224,9 @@ def test_asset_resolution_summary_reports_no_mismatches_and_catalog_shape() -> N
     assert summary["asset_type_counts"]["video"] > 0
     assert summary["topology_counts"]["nested_forward"] > 0
     assert summary["age_bucket_counts"]["old_forward"] > 0
+    assert summary["call_cost_totals"]["asset_type:video"]["cases"] > 0
+    assert summary["terminal_missing_quality"]["classified_missing_count"] > 0
+    assert summary["cost_vs_result_cross_tab"]["matched_and_cheap"] == summary["total"]
     assert "<none>" in summary["resolver_counts"] or any(
         key.startswith("napcat_") or key == "qq_expired_after_napcat"
         for key in summary["resolver_counts"]
@@ -225,6 +242,78 @@ def test_asset_resolution_catalog_reports_state_coverage() -> None:
     assert summary["state_field_counts"]["public_fallback_result_state"]["valid_remote_only"] > 0
     assert summary["state_field_counts"]["forward_parent_state"]["missing_peer_uid"] > 0
     assert summary["state_field_counts"]["direct_file_result_state"]["not_found"] > 0
+    assert summary["asset_role_counts"]["<none>"] == summary["total"]
+    assert summary["terminality_flags"]["expected_terminal_missing"] > 0
+    assert summary["route_signal_flags"]["has_forward_parent"] > 0
+    assert summary["shared_cache_risk_flags"]["old_forward_forward_video"] > 0
+    assert summary["payload_shape_counts"]["forward_payload_state"]["public_token"] > 0
+
+
+def test_prefetch_planning_matrix_reports_large_window_pressure_shapes() -> None:
+    results = run_prefetch_planning_matrix()
+    summary = summarize_prefetch_planning_results(results)
+
+    assert len(results) == 20
+    assert summary["profile_counts"]["recent_image_heavy"] == 5
+    assert summary["profile_counts"]["old_forward_video_heavy"] == 5
+    assert summary["max_batch_size"] == 200
+    assert summary["large_window_case_count"] == 12
+    assert summary["large_window_batch_size_min"] == 50
+    assert summary["large_window_batch_size_max"] == 50
+    assert summary["max_remote_workers"] >= 4
+    assert summary["max_public_token_workers"] >= 2
+    assert summary["old_forward_total"] > 0
+    assert summary["duplicate_shared_key_total"] > 0
+    assert summary["worst_case"]["request_count"] >= 16384
+
+
+def test_forward_candidate_priority_matrix_matches_expectations() -> None:
+    results = run_forward_candidate_priority_matrix()
+    summary = summarize_forward_candidate_priority_results(results)
+
+    assert len(results) == 42
+    assert summary["mismatched"] == 0
+    assert summary["profile_counts"]["recoverability_tiebreak"] == 24
+    assert summary["profile_counts"]["signal_priority"] == 18
+    assert summary["asset_type_counts"]["video"] > 0
+    assert summary["resolver_counts"]["napcat_forward_hydrated"] > 0
+    assert summary["resolver_counts"]["napcat_forward_remote_url"] > 0
+    assert summary["resolver_counts"]["napcat_public_token_get_file"] > 0
+    assert summary["path_kind_counts"]["public"] > 0
+    assert summary["path_kind_counts"]["remote"] > 0
+
+
+def test_forward_candidate_priority_case_file_biz_id_beats_filename_local_decoy() -> None:
+    cases = {item.name: item for item in default_forward_candidate_priority_cases()}
+
+    result = run_forward_candidate_priority_case(cases["video_signal_file_biz_id_over_filename"])
+
+    assert result.matched is True
+    assert result.actual_winner == "primary"
+    assert result.expected_path_kind == "public"
+    assert result.resolver == "napcat_public_token_get_file"
+    assert result.path_kind == "public"
+
+
+def test_shared_outcome_scope_matrix_matches_expectations() -> None:
+    results = run_shared_outcome_scope_matrix()
+    summary = summarize_shared_outcome_scope_results(results)
+
+    assert len(results) == len(default_shared_outcome_scope_cases())
+    assert summary["mismatched"] == 0
+    assert summary["asset_type_counts"]["video"] > 0
+    assert summary["topology_counts"]["forward"] > 0
+    assert summary["identity_mode_counts"]["file_name_only"] > 0
+
+
+def test_public_timeout_scope_matrix_matches_expectations() -> None:
+    results = run_public_timeout_scope_matrix()
+    summary = summarize_public_timeout_scope_results(results)
+
+    assert len(results) == len(default_public_timeout_scope_cases())
+    assert summary["mismatched"] == 0
+    assert summary["asset_type_counts"]["video"] > 0
+    assert summary["relationship_counts"]["same_parent_new_token"] > 0
 
 
 def test_asset_resolution_exhaustive_old_forward_terminal_suite_matches_expectations() -> None:

@@ -19,14 +19,28 @@ if RUNTIME_SITE_PACKAGES.exists() and str(RUNTIME_SITE_PACKAGES) not in sys.path
 from qq_data_integrations.napcat.asset_simulator import (  # noqa: E402
     all_asset_resolution_scenarios,
     default_asset_resolution_scenarios,
+    default_forward_candidate_priority_cases,
+    default_public_timeout_scope_cases,
+    default_shared_outcome_scope_cases,
     default_forward_timeout_matrix,
+    run_forward_candidate_priority_case,
+    run_forward_candidate_priority_matrix,
+    run_public_timeout_scope_case,
+    run_public_timeout_scope_matrix,
+    run_prefetch_planning_matrix,
     run_asset_resolution_matrix,
     run_asset_resolution_sequence,
     run_asset_resolution_scenario,
     run_forward_timeout_simulation,
+    run_shared_outcome_scope_case,
+    run_shared_outcome_scope_matrix,
+    summarize_forward_candidate_priority_results,
+    summarize_prefetch_planning_results,
     summarize_asset_resolution_catalog,
     summarize_asset_resolution_results,
     summarize_forward_timeout_results,
+    summarize_public_timeout_scope_results,
+    summarize_shared_outcome_scope_results,
     write_simulation_trace,
 )
 
@@ -93,6 +107,155 @@ def _render_forward_timeout_summary(summary: dict[str, Any]) -> str:
     )
 
 
+def _render_prefetch_planning_summary(summary: dict[str, Any]) -> str:
+    worst_case = summary.get("worst_case") or {}
+    return "\n".join(
+        [
+            "prefetch_planning_summary:",
+            f"  total={summary['total']} profile_counts={summary['profile_counts']}",
+            (
+                "  demand="
+                f"total_prefetchable={summary['total_prefetchable']} "
+                f"eager_remote_total={summary['eager_remote_total']} "
+                f"context_only_total={summary['context_only_total']}"
+            ),
+            (
+                "  pressure="
+                f"old_forward_total={summary['old_forward_total']} "
+                f"duplicate_shared_key_total={summary['duplicate_shared_key_total']} "
+                f"eager_remote_skip_total={summary['eager_remote_skip_total']}"
+            ),
+            (
+                "  pools="
+                f"max_batch_size={summary['max_batch_size']} "
+                f"large_window_batch={summary['large_window_batch_size_min']}..{summary['large_window_batch_size_max']} "
+                f"max_remote_workers={summary['max_remote_workers']} "
+                f"max_public_token_workers={summary['max_public_token_workers']}"
+            ),
+            (
+                "  worst_case="
+                f"{worst_case.get('name')} request_count={worst_case.get('request_count')} "
+                f"total_prefetchable={worst_case.get('total_prefetchable')} "
+                f"context_only_prefetchable={worst_case.get('context_only_prefetchable')}"
+            ),
+        ]
+    )
+
+
+def _render_forward_candidate_summary(summary: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "forward_candidate_summary:",
+            (
+                "  totals="
+                f"total={summary['total']} matched={summary['matched']} "
+                f"mismatched={summary['mismatched']}"
+            ),
+            f"  profile_counts={summary['profile_counts']}",
+            f"  asset_type_counts={summary['asset_type_counts']}",
+            f"  resolver_counts={summary['resolver_counts']}",
+            f"  path_kind_counts={summary['path_kind_counts']}",
+            f"  mismatch_names={summary['mismatch_names']}",
+        ]
+    )
+
+
+def _render_forward_candidate_result(result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "forward_candidate_case:",
+            f"  name={result['name']} asset_type={result['asset_type']} profile={result['profile']}",
+            (
+                "  primary="
+                f"signals={list(result['primary_signals'])} recoverability={result['primary_recoverability']}"
+            ),
+            (
+                "  decoy="
+                f"signals={list(result['decoy_signals'])} recoverability={result['decoy_recoverability']}"
+            ),
+            (
+                "  outcome="
+                f"expected_winner={result['expected_winner']} actual_winner={result['actual_winner']} "
+                f"matched={result['matched']} expected_path_kind={result['expected_path_kind']} "
+                f"resolver={result['resolver']} path_kind={result['path_kind']}"
+            ),
+        ]
+    )
+
+
+def _render_shared_scope_summary(summary: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "shared_scope_summary:",
+            (
+                "  totals="
+                f"total={summary['total']} matched={summary['matched']} "
+                f"mismatched={summary['mismatched']}"
+            ),
+            f"  asset_type_counts={summary['asset_type_counts']}",
+            f"  topology_counts={summary['topology_counts']}",
+            f"  identity_mode_counts={summary['identity_mode_counts']}",
+            f"  mismatch_names={summary['mismatch_names']}",
+        ]
+    )
+
+
+def _render_shared_scope_result(result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "shared_scope_case:",
+            (
+                "  case="
+                f"{result['name']} asset_type={result['asset_type']} "
+                f"topology={result['topology']} identity_mode={result['identity_mode']}"
+            ),
+            (
+                "  outcome="
+                f"expected_same_key={result['expected_same_key']} actual_same_key={result['actual_same_key']} "
+                f"matched={result['matched']}"
+            ),
+            f"  key_a={result['key_a']}",
+            f"  key_b={result['key_b']}",
+        ]
+    )
+
+
+def _render_public_timeout_scope_summary(summary: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "public_timeout_scope_summary:",
+            (
+                "  totals="
+                f"total={summary['total']} matched={summary['matched']} "
+                f"mismatched={summary['mismatched']}"
+            ),
+            f"  asset_type_counts={summary['asset_type_counts']}",
+            f"  relationship_counts={summary['relationship_counts']}",
+            f"  mismatch_names={summary['mismatch_names']}",
+        ]
+    )
+
+
+def _render_public_timeout_scope_result(result: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            "public_timeout_scope_case:",
+            (
+                "  case="
+                f"{result['name']} asset_type={result['asset_type']} "
+                f"relationship={result['relationship']}"
+            ),
+            (
+                "  outcome="
+                f"expected_same_key={result['expected_same_key']} actual_same_key={result['actual_same_key']} "
+                f"matched={result['matched']}"
+            ),
+            f"  key_a={result['key_a']}",
+            f"  key_b={result['key_b']}",
+        ]
+    )
+
+
 def _render_resolution_result(result: dict[str, Any]) -> str:
     return "\n".join(
         [
@@ -135,6 +298,8 @@ def _render_resolution_summary(summary: dict[str, Any]) -> str:
             f"  resolver_counts={summary['resolver_counts']}",
             f"  path_kind_counts={summary['path_kind_counts']}",
             f"  trace_status_totals={summary['trace_status_totals']}",
+            f"  terminal_missing_quality={summary['terminal_missing_quality']}",
+            f"  cost_vs_result_cross_tab={summary['cost_vs_result_cross_tab']}",
         ]
     )
 
@@ -157,10 +322,24 @@ def _render_catalog_summary(summary: dict[str, Any]) -> str:
         f"  asset_type_counts={summary['asset_type_counts']}",
         f"  topology_counts={summary['topology_counts']}",
         f"  age_bucket_counts={summary['age_bucket_counts']}",
+        f"  asset_role_counts={summary['asset_role_counts']}",
+        f"  terminality_flags={summary['terminality_flags']}",
+        f"  route_signal_flags={summary['route_signal_flags']}",
+        f"  shared_cache_risk_flags={summary['shared_cache_risk_flags']}",
     ]
     state_field_counts = summary.get("state_field_counts") or {}
     for field_name in interesting_fields:
         lines.append(f"  {field_name}={state_field_counts.get(field_name, {})}")
+    payload_shape_counts = summary.get("payload_shape_counts") or {}
+    for field_name in (
+        "hint_remote_state",
+        "context_payload_state",
+        "forward_payload_state",
+        "public_result_state",
+        "public_fallback_result_state",
+        "direct_file_result_state",
+    ):
+        lines.append(f"  payload_shape[{field_name}]={payload_shape_counts.get(field_name, {})}")
     return "\n".join(lines)
 
 
@@ -230,6 +409,63 @@ def main() -> None:
     matrix_parser.add_argument("--delay-s", type=float, default=0.02)
     matrix_parser.add_argument("--json", action="store_true")
     matrix_parser.add_argument("--summary-only", action="store_true")
+
+    prefetch_parser = subparsers.add_parser(
+        "prefetch-planning-matrix",
+        help="Run bounded planning-only scenarios for prepare/prefetch pressure.",
+    )
+    prefetch_parser.add_argument("--json", action="store_true")
+
+    forward_candidate_parser = subparsers.add_parser(
+        "forward-candidate",
+        help="Run one bounded forward candidate-priority case.",
+    )
+    forward_candidate_parser.add_argument(
+        "name",
+        choices=sorted(item.name for item in default_forward_candidate_priority_cases()),
+    )
+    forward_candidate_parser.add_argument("--json", action="store_true")
+
+    forward_candidate_matrix_parser = subparsers.add_parser(
+        "forward-candidate-matrix",
+        help="Run the bounded exhaustive forward candidate-priority matrix.",
+    )
+    forward_candidate_matrix_parser.add_argument("--json", action="store_true")
+    forward_candidate_matrix_parser.add_argument("--summary-only", action="store_true")
+
+    shared_scope_parser = subparsers.add_parser(
+        "shared-scope-matrix",
+        help="Run the bounded shared-outcome cache scope matrix.",
+    )
+    shared_scope_parser.add_argument("--json", action="store_true")
+    shared_scope_parser.add_argument("--summary-only", action="store_true")
+
+    shared_scope_case_parser = subparsers.add_parser(
+        "shared-scope-case",
+        help="Run one shared-outcome cache scope case.",
+    )
+    shared_scope_case_parser.add_argument(
+        "name",
+        choices=sorted(item.name for item in default_shared_outcome_scope_cases()),
+    )
+    shared_scope_case_parser.add_argument("--json", action="store_true")
+
+    public_timeout_scope_parser = subparsers.add_parser(
+        "public-timeout-scope-matrix",
+        help="Run the bounded public-token timeout scope matrix.",
+    )
+    public_timeout_scope_parser.add_argument("--json", action="store_true")
+    public_timeout_scope_parser.add_argument("--summary-only", action="store_true")
+
+    public_timeout_scope_case_parser = subparsers.add_parser(
+        "public-timeout-scope-case",
+        help="Run one public-token timeout scope case.",
+    )
+    public_timeout_scope_case_parser.add_argument(
+        "name",
+        choices=sorted(item.name for item in default_public_timeout_scope_cases()),
+    )
+    public_timeout_scope_case_parser.add_argument("--json", action="store_true")
 
     resolution_parser = subparsers.add_parser(
         "resolution-matrix",
@@ -330,6 +566,88 @@ def main() -> None:
             print()
             print(f"[scenario {index}]")
             print(_render_resolution_result(result))
+        return
+
+    if args.command == "prefetch-planning-matrix":
+        planning_results = run_prefetch_planning_matrix()
+        results = [item.to_dict() for item in planning_results]
+        summary = summarize_prefetch_planning_results(planning_results)
+        if args.json:
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+        else:
+            print(_render_prefetch_planning_summary(summary))
+        return
+
+    if args.command == "forward-candidate":
+        cases = {item.name: item for item in default_forward_candidate_priority_cases()}
+        result = run_forward_candidate_priority_case(cases[args.name]).to_dict()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(_render_forward_candidate_result(result))
+        return
+
+    if args.command == "forward-candidate-matrix":
+        candidate_results = run_forward_candidate_priority_matrix()
+        results = [item.to_dict() for item in candidate_results]
+        summary = summarize_forward_candidate_priority_results(candidate_results)
+        if args.json:
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+        else:
+            print(_render_forward_candidate_summary(summary))
+            if not args.summary_only:
+                for index, result in enumerate(results, start=1):
+                    print()
+                    print(f"[scenario {index}]")
+                    print(_render_forward_candidate_result(result))
+        return
+
+    if args.command == "shared-scope-matrix":
+        scope_results = run_shared_outcome_scope_matrix()
+        results = [item.to_dict() for item in scope_results]
+        summary = summarize_shared_outcome_scope_results(scope_results)
+        if args.json:
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+        else:
+            print(_render_shared_scope_summary(summary))
+            if not args.summary_only:
+                for index, result in enumerate(results, start=1):
+                    print()
+                    print(f"[scenario {index}]")
+                    print(_render_shared_scope_result(result))
+        return
+
+    if args.command == "shared-scope-case":
+        cases = {item.name: item for item in default_shared_outcome_scope_cases()}
+        result = run_shared_outcome_scope_case(cases[args.name]).to_dict()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(_render_shared_scope_result(result))
+        return
+
+    if args.command == "public-timeout-scope-matrix":
+        timeout_scope_results = run_public_timeout_scope_matrix()
+        results = [item.to_dict() for item in timeout_scope_results]
+        summary = summarize_public_timeout_scope_results(timeout_scope_results)
+        if args.json:
+            print(json.dumps({"summary": summary, "results": results}, ensure_ascii=False, indent=2))
+        else:
+            print(_render_public_timeout_scope_summary(summary))
+            if not args.summary_only:
+                for index, result in enumerate(results, start=1):
+                    print()
+                    print(f"[scenario {index}]")
+                    print(_render_public_timeout_scope_result(result))
+        return
+
+    if args.command == "public-timeout-scope-case":
+        cases = {item.name: item for item in default_public_timeout_scope_cases()}
+        result = run_public_timeout_scope_case(cases[args.name]).to_dict()
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            print(_render_public_timeout_scope_result(result))
         return
 
     if args.command == "resolution-catalog":
