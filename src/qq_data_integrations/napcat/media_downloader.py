@@ -273,6 +273,7 @@ class NapCatMediaDownloader:
             "forward_context_timeout_count": 0,
             "forward_context_empty_count": 0,
             "forward_context_error_count": 0,
+            "forward_context_unavailable_count": 0,
             "forward_timeout_storm_skip_count": 0,
             "last_asset_type": None,
             "last_file_name": None,
@@ -779,7 +780,7 @@ class NapCatMediaDownloader:
                 if sticker_remote != (None, None):
                     return self._remember_shared_outcome(shared_key, request, sticker_remote)
             return self._remember_shared_outcome(shared_key, request, prefetched)
-        if self._has_forward_parent_hint(hint):
+        if self._has_forward_parent_marker(hint):
             request_forward_url = self._resolve_from_forward_remote_url(
                 {
                     "asset_type": asset_type,
@@ -792,6 +793,7 @@ class NapCatMediaDownloader:
             )
             if request_forward_url != (None, None):
                 return self._remember_shared_outcome(shared_key, request, request_forward_url)
+        if self._has_forward_parent_hint(hint):
             forward_payload = self._prefetched_forward_media_payloads.get(key)
             if isinstance(forward_payload, dict):
                 prefetched_forward_url = self._resolve_from_forward_remote_url(
@@ -884,6 +886,18 @@ class NapCatMediaDownloader:
                     request,
                     (None, classified_old_forward_missing),
                 )
+            attempted_direct_forward_file_id = False
+            if asset_type in {"video", "file"} and self._should_prefer_direct_file_id_before_targeted_materialize(
+                request,
+                payload=forward_payload if isinstance(forward_payload, dict) else None,
+            ):
+                attempted_direct_forward_file_id = True
+                direct_forward_file_id = self._resolve_via_direct_file_id(
+                    request,
+                    trace_callback=trace_callback,
+                )
+                if direct_forward_file_id not in {None, (None, None)}:
+                    return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
             if asset_type in {"video", "file", "speech"}:
                 targeted_forward_download = self._download_via_forward_context(
                     request,
@@ -892,10 +906,11 @@ class NapCatMediaDownloader:
                 )
                 if targeted_forward_download not in {None, (None, None)}:
                     return self._remember_shared_outcome(shared_key, request, targeted_forward_download)
+                forward_payload = self._prefetched_forward_media_payloads.get(key)
                 classified_old_forward_missing = self._classify_old_forward_expensive_missing(
                     request,
                     payload=forward_payload if isinstance(forward_payload, dict) else None,
-                    require_timeout_signal=True,
+                    failure_signal_mode="terminal",
                 )
                 if classified_old_forward_missing is not None:
                     self._emit_missing_classification_trace(
@@ -909,12 +924,13 @@ class NapCatMediaDownloader:
                         request,
                         (None, classified_old_forward_missing),
                     )
-            direct_forward_file_id = self._resolve_via_direct_file_id(
-                request,
-                trace_callback=trace_callback,
-            )
-            if direct_forward_file_id not in {None, (None, None)}:
-                return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
+            if not attempted_direct_forward_file_id:
+                direct_forward_file_id = self._resolve_via_direct_file_id(
+                    request,
+                    trace_callback=trace_callback,
+                )
+                if direct_forward_file_id not in {None, (None, None)}:
+                    return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
             if asset_type == "image":
                 classified_forward_missing = self._classify_forward_missing(request)
                 if classified_forward_missing is not None:
@@ -1196,6 +1212,10 @@ class NapCatMediaDownloader:
                 self._download_progress["forward_context_error_count"] = (
                     int(self._download_progress.get("forward_context_error_count") or 0) + 1
                 )
+            elif normalized_status == "unavailable" and normalized_substep == "forward_context_metadata":
+                self._download_progress["forward_context_unavailable_count"] = (
+                    int(self._download_progress.get("forward_context_unavailable_count") or 0) + 1
+                )
             elif normalized_status == "storm_skip":
                 self._download_progress["forward_timeout_storm_skip_count"] = (
                     int(self._download_progress.get("forward_timeout_storm_skip_count") or 0) + 1
@@ -1409,7 +1429,7 @@ class NapCatMediaDownloader:
                 detail=str(exc),
             )
             if (
-                asset_type == "file"
+                asset_type in {"file", "video"}
                 and old_bucket is not None
                 and "file not found" in str(exc).strip().lower()
             ):
@@ -1628,6 +1648,7 @@ class NapCatMediaDownloader:
                 elapsed_s=elapsed_s,
                 detail=str(exc),
             )
+            self._note_remote_substep_progress(substep=substep, status="unavailable")
             self._fast_forward_context_route_disabled = True
             self._logger.info(
                 "fast_forward_hydration_unavailable; disabling only /hydrate-forward-media for this process. "
@@ -1725,9 +1746,10 @@ class NapCatMediaDownloader:
                     request,
                     route=substep,
                 )
-            if timeout_cache_key is not None and not materialize:
+            if timeout_cache_key is not None:
                 self._forward_context_empty_cache.add(timeout_cache_key)
-                self._forward_context_payload_cache.pop(timeout_cache_key, None)
+                if not materialize:
+                    self._forward_context_payload_cache.pop(timeout_cache_key, None)
             self._note_remote_substep_progress(substep=substep, status="empty")
             self._prefetched_forward_media[key] = (None, None)
             self._prefetched_forward_media_payloads[key] = None
@@ -2139,6 +2161,12 @@ class NapCatMediaDownloader:
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
             known_missing = self._classify_known_public_action_error(normalized_action, exc)
+            if known_missing is None:
+                known_missing = self._classify_public_action_missing_from_error(
+                    normalized_action,
+                    exc,
+                    request=request,
+                )
             if request is not None:
                 self._emit_asset_substep_trace(
                     trace_callback,
@@ -2242,6 +2270,12 @@ class NapCatMediaDownloader:
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
             known_missing = self._classify_known_public_action_error(normalized_action, exc)
+            if known_missing is None:
+                known_missing = self._classify_public_action_missing_from_error(
+                    normalized_action,
+                    exc,
+                    request=request,
+                )
             if request is not None:
                 self._emit_asset_substep_trace(
                     trace_callback,
@@ -2351,6 +2385,28 @@ class NapCatMediaDownloader:
             return "napcat_record_url_unavailable"
         if "获取文件url失败" in message and action == "get_file":
             return "napcat_file_url_unavailable"
+        return None
+
+    def _classify_public_action_missing_from_error(
+        self,
+        action: str,
+        exc: Exception,
+        *,
+        request: dict[str, Any] | None = None,
+    ) -> str | None:
+        if not isinstance(exc, NapCatApiError):
+            return None
+        message = str(exc).strip().lower()
+        if "file not found" not in message:
+            return None
+        old_bucket = self._old_context_bucket(
+            str(request.get("asset_type") or "").strip() if isinstance(request, dict) else "",
+            request or {},
+        )
+        if old_bucket is None:
+            return None
+        if action in {"get_file", "get_record"}:
+            return "qq_expired_after_napcat"
         return None
 
     def _resolve_from_fast_payload(
@@ -2678,6 +2734,11 @@ class NapCatMediaDownloader:
             return None
         path = Path(str(value))
         if not path.exists() or not path.is_file():
+            return None
+        try:
+            if path.stat().st_size <= 0:
+                return None
+        except OSError:
             return None
         return path.resolve()
 
@@ -4103,6 +4164,7 @@ class NapCatMediaDownloader:
         *,
         payload: dict[str, Any] | None = None,
         require_timeout_signal: bool = False,
+        failure_signal_mode: str = "strict",
     ) -> str | None:
         if not self._is_very_old_forward_expensive_asset(request):
             return None
@@ -4110,10 +4172,24 @@ class NapCatMediaDownloader:
             return None
         if self._has_direct_forward_file_identifier(request, payload=payload):
             return None
+        normalized_mode = str(failure_signal_mode or "strict").strip().lower()
+        if require_timeout_signal:
+            normalized_mode = "strict"
+        if normalized_mode == "strict":
+            if not self._has_old_forward_timeout_signal(request, payload=payload):
+                return None
+        elif normalized_mode == "terminal":
+            if not self._has_old_forward_terminal_signal(request, payload=payload):
+                return None
+        elif normalized_mode not in {"", "none"}:
+            raise ValueError(f"unsupported failure_signal_mode: {failure_signal_mode}")
         if not self._has_stale_forward_local_media_hint(request, payload=payload):
-            return None
-        if require_timeout_signal and not self._has_old_forward_timeout_signal(request, payload=payload):
-            return None
+            if not self._allow_old_forward_missing_without_stale_local_hint(
+                request,
+                payload=payload,
+                failure_signal_mode=normalized_mode,
+            ):
+                return None
         return "qq_expired_after_napcat"
 
     def _has_old_forward_timeout_signal(
@@ -4147,6 +4223,54 @@ class NapCatMediaDownloader:
         ) or self._should_skip_forward_timeout_storm(
             request,
             route="direct_file_id_get_file",
+        )
+
+    def _has_old_forward_terminal_signal(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if self._has_old_forward_timeout_signal(request, payload=payload):
+            return True
+        if self._forward_context_empty(request, materialize=True):
+            return True
+        if self._forward_context_error(request, materialize=True):
+            return True
+        return False
+
+    def _forward_context_empty(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        materialize: bool,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        timeout_cache_key = self._forward_context_timeout_key(
+            request,
+            materialize=materialize,
+        )
+        return bool(
+            timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_empty_cache
+        )
+
+    def _forward_context_error(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        materialize: bool,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        timeout_cache_key = self._forward_context_timeout_key(
+            request,
+            materialize=materialize,
+        )
+        return bool(
+            timeout_cache_key is not None
+            and timeout_cache_key in self._forward_context_error_cache
         )
 
     def _forward_context_unavailable(
@@ -4244,6 +4368,41 @@ class NapCatMediaDownloader:
             if candidate:
                 return True
         return False
+
+    def _allow_old_forward_missing_without_stale_local_hint(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+        failure_signal_mode: str = "strict",
+    ) -> bool:
+        if not self._is_very_old_forward_expensive_asset(request):
+            return False
+        normalized_mode = str(failure_signal_mode or "strict").strip().lower()
+        if normalized_mode not in {"strict", "terminal"}:
+            return False
+        return not self._has_live_http_media_url(request, payload=payload)
+
+    def _should_prefer_direct_file_id_before_targeted_materialize(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type not in {"video", "file"}:
+            return False
+        if not self._is_very_old_forward_expensive_asset(request):
+            return False
+        hint = self._request_hint(request)
+        file_id = str(hint.get("file_id") or "").strip()
+        if not file_id.startswith("/"):
+            return False
+        if self._has_live_http_media_url(request, payload=payload):
+            return False
+        return True
 
     def _has_stale_forward_local_media_hint(
         self,
@@ -4443,6 +4602,11 @@ class NapCatMediaDownloader:
         if not isinstance(parent, dict):
             return False
         return NapCatMediaDownloader._has_context_hint(parent)
+
+    @staticmethod
+    def _has_forward_parent_marker(hint: dict[str, Any]) -> bool:
+        parent = hint.get("_forward_parent")
+        return isinstance(parent, dict)
 
     @staticmethod
     def _forward_context_timeout_key(

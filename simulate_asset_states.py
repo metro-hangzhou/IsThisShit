@@ -17,6 +17,7 @@ if RUNTIME_SITE_PACKAGES.exists() and str(RUNTIME_SITE_PACKAGES) not in sys.path
     sys.path.insert(0, str(RUNTIME_SITE_PACKAGES))
 
 from qq_data_integrations.napcat.asset_simulator import (  # noqa: E402
+    all_asset_resolution_scenarios,
     default_asset_resolution_scenarios,
     default_forward_timeout_matrix,
     run_asset_resolution_matrix,
@@ -127,7 +128,13 @@ def main() -> None:
     resolution_parser.add_argument("--json", action="store_true")
     resolution_parser.add_argument(
         "--suite",
-        choices=["classification_fast_fail", "route_health", "forward_parent_shape", "live_recovery_paths"],
+        choices=[
+            "classification_fast_fail",
+            "route_health",
+            "forward_parent_shape",
+            "live_recovery_paths",
+            "family_diff_matrix",
+        ],
         default=None,
     )
 
@@ -190,7 +197,7 @@ def main() -> None:
         return
 
     if args.command == "resolution-case":
-        scenarios = {item.name: item for item in default_asset_resolution_scenarios()}
+        scenarios = {item.name: item for item in all_asset_resolution_scenarios()}
         scenario = scenarios.get(args.name)
         if scenario is None:
             raise SystemExit(f"unknown scenario: {args.name}")

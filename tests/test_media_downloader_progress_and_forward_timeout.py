@@ -49,6 +49,24 @@ class _MissingDirectFileClient:
         raise NapCatApiError("file not found")
 
 
+class _MissingPublicFileClient:
+    def __init__(self) -> None:
+        self.get_file_calls = 0
+
+    def get_file(self, *args, **kwargs):
+        self.get_file_calls += 1
+        raise NapCatApiError("file not found")
+
+
+class _MissingPublicRecordClient:
+    def __init__(self) -> None:
+        self.get_record_calls = 0
+
+    def get_record(self, *args, **kwargs):
+        self.get_record_calls += 1
+        raise NapCatApiError("file not found")
+
+
 class _BlankPublicFileClient:
     def __init__(self) -> None:
         self.get_file_calls = 0
@@ -261,6 +279,15 @@ class _OldForwardMaterializeOnlyTimeoutClient:
         self.calls.append(kwargs)
         if kwargs.get("materialize"):
             raise NapCatFastHistoryTimeoutError("timed out")
+        return {"assets": []}
+
+
+class _OldForwardEmptyClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
         return {"assets": []}
 
 
@@ -679,6 +706,65 @@ def test_old_forward_video_materialize_timeout_is_classified_as_expired() -> Non
     assert fast_client.calls[1].get("materialize") is True
 
 
+def test_old_forward_video_materialize_empty_is_classified_as_expired() -> None:
+    fast_client = _OldForwardEmptyClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-materialize-empty.mp4"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-materialize-empty.mp4",
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert len(fast_client.calls) == 2
+    assert fast_client.calls[0].get("materialize") is False
+    assert fast_client.calls[1].get("materialize") is True
+
+
+def test_old_forward_video_public_not_found_is_classified_as_expired() -> None:
+    client = _MissingPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-public-not-found.mp4"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-public-not-found.mp4",
+    )
+    request["download_hint"]["file_id"] = "/fileid/old-forward-public-not-found"
+    payload = {
+        "public_action": "get_file",
+        "public_file_token": "old-forward-public-not-found-token",
+        "file_name": "old-forward-public-not-found.mp4",
+        "asset_type": "video",
+        "file_id": "/fileid/old-forward-public-not-found",
+    }
+
+    resolved = downloader._resolve_from_public_token(payload, request=request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert client.get_file_calls == 1
+
+
+def test_old_forward_speech_public_not_found_is_classified_as_expired() -> None:
+    client = _MissingPublicRecordClient()
+    downloader = NapCatMediaDownloader(client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_request("old-forward-public-not-found.mp3"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Audio\2025-05\Ori\old-forward-public-not-found.mp3",
+    )
+    request["asset_type"] = "speech"
+    payload = {
+        "public_action": "get_record",
+        "public_file_token": "old-forward-public-not-found-token",
+        "file_name": "old-forward-public-not-found.mp3",
+        "asset_type": "speech",
+    }
+
+    resolved = downloader._resolve_from_public_token(payload, request=request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert client.get_record_calls == 1
+
+
 def test_old_forward_video_route_unavailable_is_classified_as_expired() -> None:
     fast_client = _UnavailableForwardClient()
     downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
@@ -691,6 +777,46 @@ def test_old_forward_video_route_unavailable_is_classified_as_expired() -> None:
 
     assert resolved == (None, "qq_expired_after_napcat")
     assert len(fast_client.forward_calls) == 1
+
+
+def test_old_forward_video_direct_file_not_found_is_classified_as_expired() -> None:
+    downloader = NapCatMediaDownloader(_MissingDirectFileClient())
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("old-forward-direct-not-found.mp4"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-direct-not-found.mp4",
+    )
+    request["download_hint"]["file_id"] = "/fileid/old-forward-direct-not-found"
+
+    resolved = downloader._resolve_via_direct_file_id(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+
+
+def test_malformed_forward_parent_with_live_remote_url_still_recovers() -> None:
+    remote_root = _workspace_temp_dir()
+    try:
+        downloader = _RemoteMediaDownloader(remote_root)
+        request = _set_forward_stale_local_path(
+            _mark_request_old(_build_forward_video_request("malformed-forward-live-remote.mp4"), days=240),
+            r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\malformed-forward-live-remote.mp4",
+        )
+        hint = dict(request.get("download_hint") or {})
+        hint["_forward_parent"] = {
+            "message_id_raw": "7617760641125573795",
+            "element_id": "",
+            "peer_uid": "u_example",
+            "chat_type_raw": "2",
+        }
+        hint["remote_url"] = "https://assets.example.invalid/malformed-forward-live-remote.mp4"
+        request["download_hint"] = hint
+
+        resolved_path, resolver = downloader.resolve_for_export(request)
+
+        assert resolver == "napcat_forward_remote_url"
+        assert resolved_path is not None
+        assert Path(resolved_path).exists()
+    finally:
+        shutil.rmtree(remote_root, ignore_errors=True)
 
 
 def test_forward_video_public_token_timeout_breaker_skips_distinct_old_parents_after_limit() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from qq_data_integrations.napcat.asset_simulator import (
+    all_asset_resolution_scenarios,
     default_asset_resolution_scenarios,
     default_forward_timeout_matrix,
     run_asset_resolution_matrix,
@@ -65,7 +66,7 @@ def test_default_matrix_includes_video_and_speech_routes() -> None:
 def test_asset_resolution_matrix_matches_expectations() -> None:
     results = run_asset_resolution_matrix()
 
-    assert len(results) >= 28
+    assert len(results) >= 170
     assert all(item.matched for item in results)
 
 
@@ -77,6 +78,8 @@ def test_asset_resolution_matrix_includes_core_failure_and_remote_recovery_paths
 
     assert results["top_level_speech_public_token_remote"].actual_resolver == "napcat_public_token_get_record_remote_url"
     assert results["top_level_speech_public_token_remote"].actual_path_kind == "remote"
+    assert results["top_level_sticker_relative_remote_gif"].actual_resolver == "sticker_remote_download"
+    assert results["top_level_sticker_relative_remote_gif"].actual_path_kind == "remote"
 
     assert results["forward_old_video_public_token_timeout"].actual_resolver == "qq_expired_after_napcat"
     assert results["forward_old_video_public_token_timeout"].actual_path_kind == "missing"
@@ -94,6 +97,26 @@ def test_asset_resolution_matrix_includes_core_failure_and_remote_recovery_paths
     assert results["forward_video_missing_parent_element_id"].actual_path_kind == "missing"
     assert results["forward_video_stale_path_live_remote_url"].actual_resolver == "napcat_forward_remote_url"
     assert results["forward_video_stale_path_live_remote_url"].actual_path_kind == "remote"
+    assert results["nested_forward_video_missing_peer_uid_live_http"].actual_resolver == "napcat_forward_remote_url"
+    assert results["nested_forward_video_missing_peer_uid_live_http"].actual_path_kind == "remote"
+    assert results["forward_video_very_old_empty_terminal"].actual_resolver == "qq_expired_after_napcat"
+    assert results["forward_video_very_old_empty_terminal"].actual_path_kind == "missing"
+    assert results["forward_video_very_old_materialize_error"].actual_resolver == "qq_expired_after_napcat"
+    assert results["forward_video_very_old_materialize_error"].actual_path_kind == "missing"
+    assert results["forward_video_very_old_public_not_found"].actual_resolver == "qq_expired_after_napcat"
+    assert results["forward_video_very_old_public_not_found"].actual_path_kind == "missing"
+    assert results["forward_video_very_old_direct_not_found"].actual_resolver == "qq_expired_after_napcat"
+    assert results["forward_video_very_old_direct_not_found"].actual_path_kind == "missing"
+    assert results["nested_forward_speech_very_old_timeout"].actual_resolver == "qq_expired_after_napcat"
+    assert results["nested_forward_speech_very_old_timeout"].actual_path_kind == "missing"
+    assert results["nested_forward_speech_very_old_materialize_error"].actual_resolver == "qq_expired_after_napcat"
+    assert results["nested_forward_speech_very_old_materialize_error"].actual_path_kind == "missing"
+    assert results["nested_forward_file_recent_relative_http_remote_recovery"].actual_resolver == "napcat_forward_remote_url"
+    assert results["nested_forward_file_recent_relative_http_remote_recovery"].actual_path_kind == "remote"
+    assert results["nested_forward_sticker_relative_http_remote_recovery"].actual_resolver == "sticker_remote_download"
+    assert results["nested_forward_sticker_relative_http_remote_recovery"].actual_path_kind == "remote"
+    assert results["forward_sticker_missing_peer_uid_live_http"].actual_resolver == "sticker_remote_download"
+    assert results["forward_sticker_missing_peer_uid_live_http"].actual_path_kind == "remote"
 
 
 def test_asset_resolution_case_reports_known_bad_video_token() -> None:
@@ -114,3 +137,16 @@ def test_asset_resolution_matrix_can_filter_by_suite() -> None:
 
     assert route_health
     assert suites == {"route_health"}
+
+
+def test_asset_resolution_scenario_catalog_is_systematic() -> None:
+    scenarios = all_asset_resolution_scenarios()
+    names = {item.name for item in scenarios}
+
+    assert len(scenarios) >= 170
+    assert len(names) == len(scenarios)
+    assert any(item.topology == "nested_forward" for item in scenarios)
+    assert any(item.suite == "family_diff_matrix" for item in scenarios)
+    assert any("public_not_found" in item.name for item in scenarios)
+    assert any("direct_not_found" in item.name for item in scenarios)
+    assert any(item.asset_type == "sticker" and item.topology == "nested_forward" for item in scenarios)
