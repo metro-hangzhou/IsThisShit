@@ -1355,3 +1355,33 @@
 - 当前修正：
   - 对 `>=180d` 的 old forward `video/file/speech`，expensive route breaker 现在改为跨月共享
   - `forward_context_materialize` 若耗时足够长且最终没命中，也会被算进 breaker
+
+### [2026-03-22][046] simulator 已从样例覆盖扩到 bounded exhaustive，补出 `direct_file_id` 老 forward 漏口
+
+- 本轮不再只靠朋友现场导出撞问题，新增了更系统的 simulator 覆盖：
+  - `exhaustive_old_forward_terminal`
+  - `exhaustive_sticker_forward_parent`
+  - `exhaustive_local_path_states`
+  - `exhaustive_old_forward_direct_file_id`
+- 新发现并已修复的真实漏口：
+  - old forward `video/file` 如果只有 `file_id` 可用，且 `direct_file_id_get_file`：
+    - `timeout`
+    - `blank payload`
+    - `not_found`
+  - 旧逻辑仍可能继续跑：
+    - targeted `forward_context_materialize`
+  - 这会把单资产恢复路径继续拖长
+- 当前修正：
+  - `source_path` 对非 `image` 资产现在也能直接短路成：
+    - `source_local_path`
+  - zero-byte image `source_path` 不再把“自己本身”误认成可复用 stale neighbor
+  - old forward `video/file` 的 `direct_file_id` 路线：
+    - `timeout`
+    - `blank payload`
+    - `not_found`
+    现在都会更早归到：
+    - `qq_expired_after_napcat`
+  - 并且会在 direct-file-id 失败后立刻分类，不再继续 spill into targeted materialize
+- 本地当前回归基线：
+  - `tests/test_asset_simulator.py` -> `13 passed`
+  - `tests/test_media_downloader_progress_and_forward_timeout.py` -> `54 passed`
