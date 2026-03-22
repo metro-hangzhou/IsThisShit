@@ -66,6 +66,23 @@
 
 ## 4. 里程碑日志
 
+### [2026-03-23][034] forward terminal classification no longer relies primarily on asset age
+
+- exporter-side forward `video/file/speech` terminal handling has been shifted from "very old asset" heuristics toward terminal evidence:
+  - no unexhausted live HTTP URL
+  - stale / zero-byte local hints
+  - direct-file-id presence
+  - forward-route timeout / unavailable / empty / error signals
+- the same evidence now activates:
+  - shorter timeout budgets
+  - direct-file-id-before-materialize ordering
+  - timeout-driven `qq_expired_after_napcat` classification
+- simulator coverage now includes explicit `terminal_evidence_age_invariance` checks so recent and old forward assets with the same terminal evidence resolve the same way
+- current maintainer-side validation:
+  - targeted downloader regressions passed
+  - terminal-evidence age-invariance matrix matched `22/22`
+  - full asset resolution matrix had `0` mismatches after the catalog was updated to the new semantics
+
 ### [2026-03-20][033] `/login` quick-login completion and `start_cli` launcher update handoff hardened
 
 - `/login` quick-login completion in classic Windows console no longer auto-applies the first QQ candidate during menu navigation
@@ -1385,3 +1402,34 @@
 - 本地当前回归基线：
   - `tests/test_asset_simulator.py` -> `13 passed`
   - `tests/test_media_downloader_progress_and_forward_timeout.py` -> `54 passed`
+
+### [2026-03-23][047] 全量导出剩余的 `1 actionable missing` 已钉成 targeted forward metadata cache poisoning，并已收敛到 `0`
+
+- maintainer 侧全量 live export on group `922065597`（`limit=20000`）先出现：
+  - `records=12593`
+  - `elapsed=84.755s`
+  - `actionable_missing=1`
+  - 唯一 actionable missing 位于：
+    - `2025-12-14 19:10:26 -> 19:10:56`
+- targeted retest 证据表明：
+  - 同一条 forward 内的 GIF 先走 `forward_context_metadata`
+  - NapCat 返回的是 `targeted=true`, `metadata_only` 的单资产 payload
+  - 旧导出器却把这份 payload 缓存在 parent/type 级共享缓存里
+  - 导致同一 parent 下后续 JPG 兄弟资产复用了错误 metadata，直接落成 `missing_after_napcat`
+- 当前修正：
+  - targeted forward metadata payload 不再进入 parent 级 `_forward_context_payload_cache`
+  - second-pass public-token recovery 成功后，会清空旧的 `missing_kind`
+- 当前验证：
+  - targeted retest `2025-12-14_19-10-26 -> 2025-12-14_19-10-56`：
+    - `records=3`
+    - `missing=0`
+    - `actionable_missing=0`
+  - 全量 live export rerun：
+    - `records=12593`
+    - `elapsed=84.641s`
+    - `actionable_missing=0`
+    - `background_missing=1155`
+    - `final_missing_reason=[qq_expired_after_napcat:1152, qq_not_downloaded_local_placeholder:3]`
+  - simulator / matrix rerun：
+    - `resolution-matrix`: `592/592 matched`
+    - `shared-scope-matrix`: `48/48 matched`

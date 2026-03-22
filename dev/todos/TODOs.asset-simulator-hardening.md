@@ -78,6 +78,28 @@ Current simulator coverage includes:
     - overall match rate
     - cost-overrun count
     - state coverage distribution
+
+### [2026-03-23][006] forward terminal classification was still partially age-gated
+
+- Problem:
+  - recent forward `video/file/speech` with strong terminal evidence could still avoid:
+    - shorter timeout budgets
+    - direct-file-id-first ordering
+    - terminal classification after timeout / not-found
+  - simulator also lacked an explicit same-evidence-different-age suite for timeout-heavy forward cases
+- Current fix:
+  - downloader now uses a terminal-evidence candidate gate instead of age alone for:
+    - shorter timeout budgets
+    - direct-file-id preference
+    - timeout-driven terminal classification
+  - simulator now includes `terminal_evidence_age_invariance` coverage for:
+    - public-token timeout
+    - metadata timeout
+    - blank public payload
+    - direct-file-id not-found
+    - forward image dead-remote plus public-timeout
+- Follow-up:
+  - keep expanding invariance coverage toward nested-forward and route-empty / route-error terminal families
     - worst timeout-risk shapes
 - Current fix:
   - simulator now exposes:
@@ -165,10 +187,24 @@ Current simulator coverage includes:
   - future registration paths now also refuse to attach work that crossed a reset boundary
 - Current validation:
   - downloader tests now explicitly cover:
-    - stale remote prefetch store rejection
-    - stale public-token prefetch store rejection
-    - reset-during-public-token-submit
-    - reset-during-remote-submit
+  - stale remote prefetch store rejection
+  - stale public-token prefetch store rejection
+  - reset-during-public-token-submit
+  - reset-during-remote-submit
+
+### [2026-03-23][011] forward metadata cache could poison sibling assets when NapCat returned targeted metadata
+
+- Problem:
+  - `_forward_context_payload_cache` was keyed at parent/type scope
+  - but real NapCat `metadata_only` payloads can be `targeted=true` and contain only the requested sibling asset
+- Old effect:
+  - the first sibling image could populate the parent cache
+  - the next sibling image would reuse the wrong metadata payload and fall through to `missing_after_napcat`
+- Current fix:
+  - targeted forward metadata payloads are no longer cached at the shared parent scope
+  - downloader regression now covers sibling requests with distinct `file_name/md5`
+- Current validation:
+  - targeted retest for `2025-12-14_19-10-26 -> 2025-12-14_19-10-56` now returns `missing=0 actionable_missing=0`
 
 ## Remaining High-Value Gaps
 

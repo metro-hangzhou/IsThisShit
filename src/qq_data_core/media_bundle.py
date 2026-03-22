@@ -574,6 +574,7 @@ def materialize_snapshot_media(
                 exported_rel_path, resolved_source_path, reused_resolver = identity_reuse
                 asset.resolved_source_path = resolved_source_path
                 asset.resolver = reused_resolver or "bundle_identity_reuse"
+                asset.missing_kind = None
                 asset.note = None
                 asset.status = "reused"
                 asset.exported_rel_path = exported_rel_path
@@ -601,6 +602,7 @@ def materialize_snapshot_media(
                 dedupe_key = str(resolved_path).lower()
                 asset.resolved_source_path = str(resolved_path)
                 asset.resolver = resolver
+                asset.missing_kind = None
                 asset.note = None
                 if dedupe_key in copied_map:
                     asset.status = "reused"
