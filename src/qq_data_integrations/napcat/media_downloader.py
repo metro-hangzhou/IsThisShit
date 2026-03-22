@@ -33,6 +33,7 @@ class NapCatMediaDownloader:
     OLD_CONTEXT_BUCKET_MIN_AGE_DAYS = 120
     OLD_CONTEXT_BUCKET_FAILURE_LIMIT = 5
     SHARED_MISS_CACHE_MIN_AGE_DAYS = 30
+    OLD_FORWARD_IMAGE_EXPIRED_MIN_AGE_DAYS = 45
     FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS = 45
     FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS = 180
     FORWARD_TIMEOUT_STORM_LIMIT = 6
@@ -856,7 +857,10 @@ class NapCatMediaDownloader:
                 has_forward_payload = isinstance(forward_payload, dict)
                 has_hint_file_id = bool(str(hint.get("file_id") or "").strip())
                 if not has_forward_payload and not has_hint_file_id:
-                    classified_forward_missing = self._classify_forward_missing(request)
+                    classified_forward_missing = self._classify_forward_missing(
+                        request,
+                        payload=forward_payload if isinstance(forward_payload, dict) else None,
+                    )
                     if classified_forward_missing is not None:
                         self._emit_missing_classification_trace(
                             trace_callback,
@@ -973,7 +977,10 @@ class NapCatMediaDownloader:
                 if direct_forward_file_id not in {None, (None, None)}:
                     return self._remember_shared_outcome(shared_key, request, direct_forward_file_id)
             if asset_type == "image":
-                classified_forward_missing = self._classify_forward_missing(request)
+                classified_forward_missing = self._classify_forward_missing(
+                    request,
+                    payload=forward_payload if isinstance(forward_payload, dict) else None,
+                )
                 if classified_forward_missing is not None:
                     self._emit_missing_classification_trace(
                         trace_callback,
@@ -4320,7 +4327,12 @@ class NapCatMediaDownloader:
                 return "forward_meta"
         return normalized
 
-    def _classify_forward_missing(self, request: dict[str, Any]) -> str | None:
+    def _classify_forward_missing(
+        self,
+        request: dict[str, Any],
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> str | None:
         if str(request.get("asset_type") or "").strip() != "image":
             return None
         hint = self._request_hint(request)
@@ -4329,9 +4341,53 @@ class NapCatMediaDownloader:
         source_path = str(request.get("source_path") or "").strip()
         if source_path:
             return None
+        local_placeholder_missing = self._classify_image_local_placeholder_missing(request)
+        if local_placeholder_missing is not None:
+            return local_placeholder_missing
+        asset_age = self._request_asset_age(request)
+        has_terminal_failure_signal = (
+            self._has_failed_forward_remote_url(request, payload=payload)
+            or self._public_action_failed(
+                request,
+                action="get_image",
+                payload=payload,
+            )
+        )
+        if (
+            asset_age is not None
+            and asset_age >= timedelta(days=self.OLD_FORWARD_IMAGE_EXPIRED_MIN_AGE_DAYS)
+            and has_terminal_failure_signal
+        ):
+            return "qq_expired_after_napcat"
         if self._old_context_bucket("image", request) is None:
             return None
         return "qq_expired_after_napcat"
+
+    def _has_failed_forward_remote_url(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        asset_type = str(request.get("asset_type") or "").strip()
+        if asset_type not in self.REMOTE_PREFETCHABLE_ASSET_TYPES:
+            return False
+        hint = self._request_hint(request)
+        remote_url = str(
+            (payload or {}).get("remote_url")
+            or (payload or {}).get("url")
+            or hint.get("remote_url")
+            or hint.get("url")
+            or ""
+        ).strip()
+        resolved_remote_url = self._resolve_remote_url(remote_url)
+        if not resolved_remote_url:
+            return False
+        cache_key = (asset_type, self._normalized_match_url(resolved_remote_url))
+        prefetched_resolution = self._peek_remote_media_prefetch(cache_key)
+        return prefetched_resolution is None
 
     def _classify_old_forward_expensive_missing(
         self,
@@ -4832,6 +4888,31 @@ class NapCatMediaDownloader:
         return (
             request_timeout_scope_key is not None
             and request_timeout_scope_key in self._request_scoped_public_action_timeout_cache
+        )
+
+    def _public_action_failed(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        action: str,
+        payload: dict[str, Any] | None = None,
+        token: str | None = None,
+    ) -> bool:
+        if self._public_action_timed_out(
+            request,
+            action=action,
+            payload=payload,
+            token=token,
+        ):
+            return True
+        effective_token = str(token or "").strip()
+        if not effective_token and isinstance(payload, dict):
+            effective_token = str(payload.get("public_file_token") or "").strip()
+        if not effective_token:
+            return False
+        return (str(action or "").strip().lower(), effective_token) in self._public_token_action_outcomes and (
+            self._public_token_action_outcomes[(str(action or "").strip().lower(), effective_token)]
+            is None
         )
 
     def _forward_context_timed_out(

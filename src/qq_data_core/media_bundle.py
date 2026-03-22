@@ -231,6 +231,7 @@ def materialize_snapshot_media(
                     }
                 )
     copied_map: dict[str, str] = {}
+    image_identity_reuse_map: dict[tuple[Any, ...], tuple[str, str | None, str | None]] = {}
     occupied_export_paths: dict[str, str] = {}
     resolution_cache: dict[tuple[Any, ...], tuple[Path | None, str]] = {}
     assets: list[MaterializedAsset] = []
@@ -358,7 +359,7 @@ def materialize_snapshot_media(
                 media_resolution_mode == "napcat_only"
                 and media_download_manager is not None
                 and candidate.asset_type == "image"
-                and resolver == "missing_after_napcat"
+                and resolver in {"missing_after_napcat", "qq_expired_after_napcat"}
                 and hasattr(media_download_manager, "resolve_via_public_token_route")
             ):
                 second_pass_candidates.append((asset, candidate))
@@ -404,6 +405,13 @@ def materialize_snapshot_media(
         if dedupe_key in copied_map:
             asset.status = "reused"
             asset.exported_rel_path = copied_map[dedupe_key]
+            identity_key = _asset_recent_identity_key(candidate)
+            if identity_key is not None:
+                image_identity_reuse_map[identity_key] = (
+                    asset.exported_rel_path,
+                    asset.resolved_source_path,
+                    asset.resolver,
+                )
             assets.append(asset)
             reused_count += 1
             step_elapsed_s = round(monotonic() - step_started, 4)
@@ -500,6 +508,13 @@ def materialize_snapshot_media(
         asset.exported_rel_path = rel_path.as_posix()
         copied_map[dedupe_key] = asset.exported_rel_path
         occupied_export_paths[asset.exported_rel_path.casefold()] = dedupe_key
+        identity_key = _asset_recent_identity_key(candidate)
+        if identity_key is not None:
+            image_identity_reuse_map[identity_key] = (
+                asset.exported_rel_path,
+                asset.resolved_source_path,
+                asset.resolver,
+            )
         assets.append(asset)
         copied_count += 1
         step_elapsed_s = round(monotonic() - step_started, 4)
@@ -549,6 +564,25 @@ def materialize_snapshot_media(
             )
         recovered_count = 0
         for asset, candidate in second_pass_candidates:
+            identity_key = _asset_recent_identity_key(candidate)
+            identity_reuse = (
+                image_identity_reuse_map.get(identity_key)
+                if identity_key is not None
+                else None
+            )
+            if identity_reuse is not None:
+                exported_rel_path, resolved_source_path, reused_resolver = identity_reuse
+                asset.resolved_source_path = resolved_source_path
+                asset.resolver = reused_resolver or "bundle_identity_reuse"
+                asset.note = None
+                asset.status = "reused"
+                asset.exported_rel_path = exported_rel_path
+                missing_count -= 1
+                reused_count += 1
+                recovered_count += 1
+                continue
+            if asset.resolver != "missing_after_napcat":
+                continue
             request_payload = {
                 "asset_type": candidate.asset_type,
                 "asset_role": candidate.asset_role,
@@ -634,6 +668,24 @@ def _asset_resolution_cache_key(candidate: _AssetCandidate) -> tuple[Any, ...]:
         _normalize_identity_string(hint.get("url")),
         _normalize_identity_string(hint.get("emoji_id")),
         _normalize_identity_string(hint.get("emoji_package_id")),
+    )
+
+
+def _asset_recent_identity_key(candidate: _AssetCandidate) -> tuple[Any, ...] | None:
+    if candidate.asset_type != "image":
+        return None
+    file_name = _normalize_identity_string(candidate.file_name)
+    md5 = _normalize_identity_string(candidate.md5)
+    source_leaf = ""
+    if candidate.source_path:
+        source_leaf = _normalize_identity_string(PureWindowsPath(candidate.source_path).name)
+    preferred_name = file_name or source_leaf
+    if not any([preferred_name, md5]):
+        return None
+    return (
+        candidate.asset_type,
+        preferred_name,
+        md5,
     )
 
 
