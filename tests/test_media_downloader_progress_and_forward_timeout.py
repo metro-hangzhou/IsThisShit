@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 import uuid
@@ -288,6 +289,23 @@ class _OldForwardEmptyClient:
 
     def hydrate_forward_media(self, **kwargs):
         self.calls.append(kwargs)
+        return {"assets": []}
+
+
+class _OldForwardZeroLocalClient:
+    def __init__(self, zero_path: str) -> None:
+        self.zero_path = zero_path
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            return {
+                "asset_type": "video",
+                "asset_role": "forward_media",
+                "file_name": "old-forward-zero-local.mp4",
+                "file": self.zero_path,
+            }
         return {"assets": []}
 
 
@@ -722,6 +740,29 @@ def test_old_forward_video_materialize_empty_is_classified_as_expired() -> None:
     assert fast_client.calls[1].get("materialize") is True
 
 
+def test_old_forward_video_materialize_zero_local_is_classified_as_expired() -> None:
+    temp_root = _workspace_temp_dir()
+    try:
+        zero_path = temp_root / "zero" / "old-forward-zero-local.mp4"
+        zero_path.parent.mkdir(parents=True, exist_ok=True)
+        zero_path.write_bytes(b"")
+        fast_client = _OldForwardZeroLocalClient(str(zero_path))
+        downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+        request = _set_forward_stale_local_path(
+            _mark_request_old(_build_forward_video_request("old-forward-zero-local.mp4"), days=240),
+            r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-05\Ori\old-forward-zero-local.mp4",
+        )
+
+        resolved = downloader.resolve_for_export(request)
+
+        assert resolved == (None, "qq_expired_after_napcat")
+        assert len(fast_client.calls) == 2
+        assert fast_client.calls[0].get("materialize") is False
+        assert fast_client.calls[1].get("materialize") is True
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def test_old_forward_video_public_not_found_is_classified_as_expired() -> None:
     client = _MissingPublicFileClient()
     downloader = NapCatMediaDownloader(client)
@@ -1063,6 +1104,58 @@ def test_forward_match_prefers_remote_url_before_public_token() -> None:
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def test_forward_match_prefers_local_path_before_public_token() -> None:
+    temp_root = _workspace_temp_dir()
+    downloader = NapCatMediaDownloader(_DummyClient())
+    local_path = temp_root / "forward-local-first.jpg"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    local_path.write_bytes(b"local")
+    request = _build_forward_request("forward-local-first.jpg")
+
+    try:
+        resolved, matched = downloader._pick_forward_asset_match(
+            request,
+            [
+                {
+                    "asset_type": "image",
+                    "asset_role": "forward_media",
+                    "file_name": "forward-local-first.jpg",
+                    "public_action": "get_image",
+                    "public_file_token": "public-token",
+                },
+                {
+                    "asset_type": "image",
+                    "asset_role": "forward_media",
+                    "file_name": "forward-local-first.jpg",
+                    "file": str(local_path),
+                },
+            ],
+        )
+        assert matched is not None
+        assert resolved[0] == local_path.resolve()
+        assert resolved[1] == "napcat_forward_hydrated"
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_recent_forward_video_missing_is_not_shared_without_terminal_expired_resolver() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _build_forward_video_request("recent-forward-video.mp4")
+    request["timestamp_ms"] = int(
+        (datetime.now(timezone.utc) - timedelta(days=20)).timestamp() * 1000
+    )
+
+    assert downloader._should_share_missing_outcome(request, resolver=None) is False
+    assert downloader._should_share_missing_outcome(
+        request,
+        resolver="missing_after_napcat",
+    ) is False
+    assert downloader._should_share_missing_outcome(
+        request,
+        resolver="qq_expired_after_napcat",
+    ) is True
+
+
 def test_remote_media_download_prepares_cache_dir_on_first_use() -> None:
     temp_root = _workspace_temp_dir()
     downloader = _RemoteMediaDownloader(temp_root / "remote_cache")
@@ -1220,6 +1313,53 @@ def test_resolve_via_context_only_skips_old_placeholder_image_before_context_hyd
         resolved, resolver = downloader._resolve_via_context_only(request)
         assert resolved is None
         assert resolver == "qq_not_downloaded_local_placeholder"
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_resolve_for_export_prefers_existing_source_path_for_non_image_assets() -> None:
+    temp_root = _workspace_temp_dir()
+    downloader = NapCatMediaDownloader(_DummyClient())
+    try:
+        for asset_type, suffix in (
+            ("video", "mp4"),
+            ("file", "bin"),
+            ("speech", "mp3"),
+        ):
+            source_path = temp_root / asset_type / f"existing-source.{suffix}"
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(f"{asset_type}-bytes".encode("utf-8"))
+
+            resolved, resolver = downloader.resolve_for_export(
+                {
+                    "asset_type": asset_type,
+                    "file_name": source_path.name,
+                    "source_path": str(source_path),
+                    "download_hint": {},
+                }
+            )
+
+            assert resolved == source_path.resolve()
+            assert resolver == "source_local_path"
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_stale_image_neighbor_does_not_accept_zero_byte_source_self() -> None:
+    temp_root = _workspace_temp_dir()
+    source_path = temp_root / "nt_qq" / "nt_data" / "Pic" / "2025-09" / "Ori" / "ZERO_SELF.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"")
+    downloader = NapCatMediaDownloader(_DummyClient())
+    try:
+        resolved = downloader._resolve_from_stale_local_neighbors(
+            {
+                "asset_type": "image",
+                "file_name": source_path.name,
+                "source_path": str(source_path),
+            }
+        )
+        assert resolved == (None, None)
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
