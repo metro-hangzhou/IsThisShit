@@ -41,6 +41,9 @@ class NapCatMetadataDirectory:
     def count(self, chat_type: ChatType) -> int:
         return len(self.get_targets(chat_type, refresh=False))
 
+    def count_cached(self, chat_type: ChatType) -> int:
+        return len(self.get_cached_targets(chat_type))
+
     def get_targets(self, chat_type: ChatType, *, refresh: bool = False) -> list[ChatTarget]:
         if refresh:
             self._cache[chat_type] = self._refresh(chat_type)
@@ -55,6 +58,11 @@ class NapCatMetadataDirectory:
                 self._cache[chat_type] = with_refresh_fallback
         return list(self._cache[chat_type].targets if self._cache[chat_type] is not None else [])
 
+    def get_cached_targets(self, chat_type: ChatType) -> list[ChatTarget]:
+        if self._cache[chat_type] is None:
+            self._cache[chat_type] = self._load_cache(chat_type)
+        return list(self._cache[chat_type].targets if self._cache[chat_type] is not None else [])
+
     def search(
         self,
         chat_type: ChatType,
@@ -64,6 +72,16 @@ class NapCatMetadataDirectory:
         refresh: bool = False,
     ) -> list[ChatTarget]:
         targets = self.get_targets(chat_type, refresh=refresh)
+        return self._rank_targets(targets, keyword, limit=limit)
+
+    def search_cached(
+        self,
+        chat_type: ChatType,
+        keyword: str | None = None,
+        *,
+        limit: int = 8,
+    ) -> list[ChatTarget]:
+        targets = self.get_cached_targets(chat_type)
         return self._rank_targets(targets, keyword, limit=limit)
 
     def resolve(

@@ -16,7 +16,7 @@ from qq_data_cli.repl import (
     _should_select_first_completion,
 )
 from qq_data_cli.terminal_compat import CliUiProfile, TerminalProbe
-from qq_data_integrations.napcat.models import NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
+from qq_data_integrations.napcat.models import ChatTarget, NapCatLoginInfo, NapCatLoginStatus, NapCatQuickLoginAccount
 from qq_data_integrations.napcat.runtime import NapCatStartResult
 
 
@@ -299,7 +299,7 @@ def test_repl_prime_target_cache_reuses_existing_targets_without_forced_refresh(
     calls: list[tuple[bool, int]] = []
 
     class _Gateway:
-        def count_targets(self, _chat_type: str) -> int:
+        def count_cached_targets(self, _chat_type: str) -> int:
             return 3
 
         def list_targets(self, _chat_type: str, *, refresh: bool = False, limit: int = 8):
@@ -313,6 +313,80 @@ def test_repl_prime_target_cache_reuses_existing_targets_without_forced_refresh(
     repl._prime_target_cache("group", quiet=False, endpoint_ready=True)
 
     assert calls == [(False, 32)]
+
+
+def test_repl_target_completion_uses_cached_targets_and_background_prime(monkeypatch) -> None:
+    repl = SlashRepl()
+    kicked: list[str] = []
+    target = ChatTarget(chat_type="group", chat_id="922065597", name="蕾米二次元萌萌群")
+
+    class _Gateway:
+        def count_cached_targets(self, _chat_type: str) -> int:
+            return 3
+
+        def list_cached_targets(self, _chat_type: str, _keyword: str | None = None, *, limit: int = 8):
+            assert limit == 6
+            return [target]
+
+    monkeypatch.setattr(repl, "_require_gateway", lambda: _Gateway())
+    monkeypatch.setattr(repl, "_kickoff_target_cache_prime_if_needed", lambda chat_type: kicked.append(chat_type))
+    monkeypatch.setattr(
+        repl,
+        "_prime_target_cache",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("should not sync prime")),
+    )
+
+    results = repl._lookup_targets_for_completion("group", "蕾米", 6)
+
+    assert [item.chat_id for item in results] == ["922065597"]
+    assert kicked == ["group"]
+
+
+def test_repl_target_completion_sync_primes_when_no_cached_targets(monkeypatch) -> None:
+    repl = SlashRepl()
+    prime_calls: list[tuple[str, bool, bool]] = []
+    list_calls: list[tuple[str | None, int]] = []
+    target = ChatTarget(chat_type="group", chat_id="922065597", name="蕾米二次元萌萌群")
+
+    class _Gateway:
+        def count_cached_targets(self, _chat_type: str) -> int:
+            return 0
+
+        def list_targets(self, _chat_type: str, keyword: str | None = None, *, limit: int = 8):
+            list_calls.append((keyword, limit))
+            return [target]
+
+    monkeypatch.setattr(repl, "_require_gateway", lambda: _Gateway())
+    monkeypatch.setattr(
+        repl,
+        "_prime_target_cache",
+        lambda chat_type, *, quiet, endpoint_ready=False: prime_calls.append((chat_type, quiet, endpoint_ready)),
+    )
+
+    results = repl._lookup_targets_for_completion("group", "蕾米", 6)
+
+    assert [item.chat_id for item in results] == ["922065597"]
+    assert prime_calls == [("group", True, False)]
+    assert list_calls == [("蕾米", 6)]
+
+
+def test_repl_completion_runtime_warm_initializes_gateway_in_background(monkeypatch) -> None:
+    repl = SlashRepl()
+    calls: list[str] = []
+
+    class _Gateway:
+        def count_cached_targets(self, chat_type: str) -> int:
+            calls.append(chat_type)
+            return 1
+
+    monkeypatch.setattr(repl, "_require_gateway", lambda: _Gateway())
+
+    repl._kickoff_target_completion_runtime_warm()
+    thread = repl._target_completion_runtime_warm_thread
+    assert thread is not None
+    thread.join(timeout=2.0)
+
+    assert calls == ["group", "private"]
 
 
 def test_completion_menu_reserve_lines_grows_in_compat_mode() -> None:

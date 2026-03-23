@@ -94,6 +94,21 @@ class NapCatGateway:
                 limit=limit,
             )
 
+    def list_cached_targets(
+        self,
+        chat_type: str,
+        keyword: str | None = None,
+        *,
+        limit: int = 8,
+    ) -> list[ChatTarget]:
+        normalized_chat_type = self._normalize_chat_type(chat_type)
+        with self._sync_lock:
+            return self._metadata_directory.search_cached(
+                normalized_chat_type,
+                keyword,
+                limit=limit,
+            )
+
     def resolve_target(
         self,
         chat_type: str,
@@ -112,6 +127,10 @@ class NapCatGateway:
     def count_targets(self, chat_type: str) -> int:
         with self._sync_lock:
             return self._metadata_directory.count(self._normalize_chat_type(chat_type))
+
+    def count_cached_targets(self, chat_type: str) -> int:
+        with self._sync_lock:
+            return self._metadata_directory.count_cached(self._normalize_chat_type(chat_type))
 
     def fetch_snapshot(self, request: ExportRequest) -> SourceChatSnapshot:
         with self._sync_lock:
