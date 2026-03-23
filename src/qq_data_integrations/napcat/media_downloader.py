@@ -3948,10 +3948,28 @@ class NapCatMediaDownloader:
         payload = response.content
         return payload if payload else None
 
+    def _download_remote_payload_sync(self, remote_url: str) -> bytes | None:
+        resolved_url = self._resolve_remote_url(remote_url)
+        if not resolved_url:
+            return None
+        try:
+            with httpx.Client(
+                timeout=self.REMOTE_MEDIA_FETCH_TIMEOUT_S,
+                transport=self._remote_transport,
+                trust_env=self._use_system_proxy,
+                follow_redirects=True,
+            ) as client:
+                response = client.get(resolved_url)
+                response.raise_for_status()
+        except httpx.HTTPError:
+            return None
+        payload = response.content
+        return payload if payload else None
+
     def _download_remote_payload(self, remote_url: str) -> bytes | None:
         loop = self._remote_loop
         if loop is None:
-            return None
+            return self._download_remote_payload_sync(remote_url)
         future = asyncio.run_coroutine_threadsafe(
             self._download_remote_payload_async(remote_url),
             loop,
@@ -3997,6 +4015,41 @@ class NapCatMediaDownloader:
             return None, False
         return str(target_path), False
 
+    def _download_remote_media_sync(
+        self,
+        *,
+        asset_type: str,
+        file_name: str | None,
+        hint: dict[str, Any],
+    ) -> str | None:
+        remote_url = str(hint.get("url") or "").strip()
+        cache_dir = self._remote_cache_dir or self._prepare_remote_cache_dir()
+        if not remote_url or cache_dir is None:
+            return None
+
+        remote_name = self._remote_file_name(remote_url, file_name=file_name)
+        if not remote_name:
+            return None
+        cache_root = cache_dir / "remote_media" / asset_type
+        target_path = cache_root / self._remote_cache_file_name(
+            remote_url,
+            file_name=remote_name,
+        )
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+
+        if target_path.exists() and target_path.is_file() and target_path.stat().st_size > 0:
+            return str(target_path)
+
+        payload = self._download_remote_payload_sync(remote_url)
+        if payload is None:
+            return None
+        if not self._write_bytes(target_path, payload):
+            return None
+        return str(target_path)
+
     def _download_remote_media(
         self,
         *,
@@ -4018,7 +4071,13 @@ class NapCatMediaDownloader:
             resolved_remote_url=resolved_remote_url,
         )
         if future is None:
-            return None
+            resolved = self._download_remote_media_sync(
+                asset_type=asset_type,
+                file_name=file_name,
+                hint={"url": resolved_remote_url},
+            )
+            self._store_remote_prefetch_result(cache_key, resolved)
+            return resolved
         try:
             return future.result(timeout=self.REMOTE_MEDIA_FETCH_TIMEOUT_S + 2.0)
         except Exception:

@@ -99,6 +99,16 @@ class _BrokenRemoteRuntimeDownloader(NapCatMediaDownloader):
         raise RuntimeError("remote media async runtime failed to start")
 
 
+class _BrokenRemoteRuntimeWithSyncFallbackDownloader(_BrokenRemoteRuntimeDownloader):
+    def __init__(self, remote_cache_dir: Path) -> None:
+        super().__init__(_DummyClient(), remote_cache_dir=remote_cache_dir)
+        self.sync_remote_calls: list[str] = []
+
+    def _download_remote_payload_sync(self, remote_url: str) -> bytes | None:  # type: ignore[override]
+        self.sync_remote_calls.append(str(remote_url))
+        return b"sync-fallback-bytes" if remote_url else None
+
+
 class _ResettingExecutor:
     def __init__(self, downloader: NapCatMediaDownloader) -> None:
         self.downloader = downloader
@@ -491,6 +501,57 @@ def test_remote_prefetch_runtime_disabled_process_still_rebuilds_safely() -> Non
 
     assert downloader._remote_prefetch_runtime_disabled is True
     assert downloader._public_token_executor is not None
+
+
+def test_remote_media_download_falls_back_to_sync_when_async_runtime_disabled() -> None:
+    temp_root = _workspace_temp_dir()
+    downloader = _BrokenRemoteRuntimeWithSyncFallbackDownloader(temp_root / "remote_cache")
+
+    try:
+        resolved = downloader._download_remote_media(
+            asset_type="image",
+            file_name="fallback.jpg",
+            hint={"url": "https://example.invalid/fallback.jpg"},
+        )
+
+        assert resolved is not None
+        resolved_path = Path(resolved)
+        assert resolved_path.exists()
+        assert resolved_path.read_bytes() == b"sync-fallback-bytes"
+        assert downloader.sync_remote_calls == ["https://example.invalid/fallback.jpg"]
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_public_token_remote_url_recovers_via_sync_fallback_when_async_runtime_disabled() -> None:
+    temp_root = _workspace_temp_dir()
+    downloader = _BrokenRemoteRuntimeWithSyncFallbackDownloader(temp_root / "remote_cache")
+    downloader._call_public_action_with_token = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: {
+            "url": "https://example.invalid/public-token-fallback.jpg",
+        }
+    )
+
+    try:
+        resolved = downloader._resolve_from_public_token(
+            {
+                "asset_type": "image",
+                "public_action": "get_image",
+                "public_file_token": "token-sync-fallback",
+                "file_name": "public-token-fallback.jpg",
+            },
+            request={
+                "asset_type": "image",
+                "file_name": "public-token-fallback.jpg",
+            },
+        )
+
+        assert resolved is not None
+        assert resolved[0] is not None
+        assert resolved[1] == "napcat_public_token_get_image_remote_url"
+        assert downloader.sync_remote_calls == ["https://example.invalid/public-token-fallback.jpg"]
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def test_forward_metadata_timeout_is_short_circuited_for_sibling_assets() -> None:
