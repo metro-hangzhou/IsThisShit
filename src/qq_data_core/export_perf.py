@@ -46,6 +46,11 @@ class ExportPerfTraceWriter:
         self._materialize_step_time_sum = 0.0
         self._slowest_materialize_step_s = 0.0
         self._slowest_materialize_step: dict[str, Any] | None = None
+        self._prefetch_chunk_count = 0
+        self._prefetch_chunk_time_sum = 0.0
+        self._slowest_prefetch_chunk_s = 0.0
+        self._prefetch_timeout_count = 0
+        self._prefetch_degraded = False
         self._closed = False
 
     def write_event(self, kind: str, payload: dict[str, Any]) -> None:
@@ -85,6 +90,19 @@ class ExportPerfTraceWriter:
         if kind == "page_retry":
             self._retry_events += 1
             return
+        if kind == "prefetch_media_chunk":
+            stage = str(payload.get("stage") or "")
+            if stage in {"done", "error"}:
+                chunk_elapsed_s = float(payload.get("elapsed_s") or 0.0)
+                self._prefetch_chunk_count += 1
+                self._prefetch_chunk_time_sum += chunk_elapsed_s
+                self._slowest_prefetch_chunk_s = max(self._slowest_prefetch_chunk_s, chunk_elapsed_s)
+                if str(payload.get("reason") or "") == "chunk_timeout":
+                    self._prefetch_timeout_count += 1
+            return
+        if kind == "prefetch_media" and str(payload.get("stage") or "") == "error":
+            self._prefetch_degraded = True
+            return
         if kind == "materialize_asset_step" and str(payload.get("stage") or "") == "done":
             step_elapsed_s = float(payload.get("step_elapsed_s") or 0.0)
             self._materialize_step_count += 1
@@ -96,9 +114,17 @@ class ExportPerfTraceWriter:
                     "asset_type": payload.get("asset_type"),
                     "asset_role": payload.get("asset_role"),
                     "file_name": payload.get("file_name"),
+                    "timestamp_iso": payload.get("timestamp_iso"),
+                    "message_id_raw": payload.get("message_id_raw"),
+                    "element_id": payload.get("element_id"),
                     "status": payload.get("status"),
                     "resolver": payload.get("resolver"),
                     "missing_kind": payload.get("missing_kind"),
+                    "md5": payload.get("md5"),
+                    "source_path": payload.get("source_path"),
+                    "source_path_kind": payload.get("source_path_kind"),
+                    "hint_url": payload.get("hint_url"),
+                    "hint_url_kind": payload.get("hint_url_kind"),
                     "resolved_source_path": payload.get("resolved_source_path"),
                 }
 
@@ -132,6 +158,11 @@ class ExportPerfTraceWriter:
                 if self._materialize_step_count
                 else 0.0
             )
+            average_prefetch_chunk_s = (
+                self._prefetch_chunk_time_sum / self._prefetch_chunk_count
+                if self._prefetch_chunk_count
+                else 0.0
+            )
             return {
                 "started_at": self._started_at.isoformat(),
                 "elapsed_s": round(elapsed_s, 3),
@@ -139,6 +170,11 @@ class ExportPerfTraceWriter:
                 "retry_events": self._retry_events,
                 "average_page_s": round(average_page_s, 4),
                 "slowest_page_s": round(self._slowest_page_s, 4),
+                "prefetch_chunk_count": self._prefetch_chunk_count,
+                "average_prefetch_chunk_s": round(average_prefetch_chunk_s, 4),
+                "slowest_prefetch_chunk_s": round(self._slowest_prefetch_chunk_s, 4),
+                "prefetch_timeout_count": self._prefetch_timeout_count,
+                "prefetch_degraded": self._prefetch_degraded,
                 "materialize_step_count": self._materialize_step_count,
                 "average_materialize_step_s": round(average_materialize_step_s, 4),
                 "slowest_materialize_step_s": round(self._slowest_materialize_step_s, 4),

@@ -970,6 +970,10 @@ def _emit_materialization_step_trace(
         "hint_url": hint.get("url"),
         "forward_parent_message_id_raw": forward_parent.get("message_id_raw"),
         "forward_parent_element_id": forward_parent.get("element_id"),
+        "timestamp_ms": candidate.timestamp_ms,
+        "timestamp_iso": _timestamp_iso_from_ms(candidate.timestamp_ms),
+        "source_path_kind": _bundle_asset_location_kind(candidate.source_path),
+        "hint_url_kind": _bundle_asset_location_kind(hint.get("remote_url") or hint.get("url")),
     }
     if status:
         payload["status"] = status
@@ -987,6 +991,38 @@ def _emit_materialization_step_trace(
         if step_elapsed_s >= MATERIALIZE_SLOW_STEP_WARN_S:
             payload["slow_step"] = True
     progress_callback(payload)
+
+
+def _timestamp_iso_from_ms(timestamp_ms: int) -> str | None:
+    if timestamp_ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).astimezone().isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _bundle_asset_location_kind(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        host = parsed.netloc.lower()
+        if host in {"127.0.0.1:3000", "localhost:3000", "127.0.0.1:6099", "localhost:6099"}:
+            return "napcat_local_download"
+        if host.endswith("multimedia.nt.qq.com.cn"):
+            return "qq_multimedia"
+        return f"{parsed.scheme.lower()}_url"
+    path = Path(text)
+    if path.exists() and path.is_file():
+        try:
+            if path.stat().st_size > 0:
+                return "local_file"
+        except OSError:
+            return "local_path"
+        return "zero_byte_local"
+    return "missing_local"
 
 
 def _iter_asset_candidates(message: NormalizedMessage) -> Iterable[_AssetCandidate]:
