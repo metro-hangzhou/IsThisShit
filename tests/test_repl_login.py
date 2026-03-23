@@ -63,6 +63,17 @@ class _BrokenQuickLookupService(_QuickLoginOnlyService):
         return NapCatLoginInfo(uin="3956020260", nick="wiki", online=True)
 
 
+class _AlreadyLoggedInButQuickLookupExplodes(_QuickLoginOnlyService):
+    def check_status(self) -> NapCatLoginStatus:
+        return NapCatLoginStatus(is_login=True)
+
+    def get_ready_login_info(self):
+        return NapCatLoginInfo(uin="3956020260", nick="wiki", online=True)
+
+    def resolve_desired_quick_login_uin(self, *, preferred_uin: str | None = None):
+        raise RuntimeError("quick lookup should not run for already logged-in session")
+
+
 def test_repl_login_accepts_positional_quick_login_uin(monkeypatch) -> None:
     repl = SlashRepl()
     service = _QuickLoginOnlyService()
@@ -91,6 +102,25 @@ def test_repl_login_reports_session_mismatch_for_requested_quick_uin(monkeypatch
     repl._handle_login(["3956020260"])
 
     assert any("QQ session mismatch." in message for message in messages)
+
+
+def test_repl_login_skips_quick_lookup_when_session_is_already_logged_in(monkeypatch) -> None:
+    repl = SlashRepl()
+    repl._settings = repl._settings.model_copy(update={"quick_login_uin": None})
+    service = _AlreadyLoggedInButQuickLookupExplodes()
+    messages: list[str] = []
+
+    monkeypatch.setattr(repl, "_ensure_endpoint_ready", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_refresh_settings", lambda: None)
+    monkeypatch.setattr(repl, "_require_login_service", lambda: service)
+    monkeypatch.setattr(repl, "_print_login_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_prime_target_cache", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl._console, "print", lambda message, *args, **kwargs: messages.append(str(message)))
+
+    repl._handle_login([])
+
+    assert any("QQ already logged in." in message for message in messages)
+    assert not any("quick login unavailable" in message for message in messages)
 
 
 def test_repl_login_falls_back_to_qr_when_quick_lookup_errors(monkeypatch) -> None:
@@ -262,6 +292,27 @@ def test_repl_quick_login_completion_empty_prime_does_not_mark_cache_fresh(monke
     thread.join(timeout=2.0)
 
     assert repl._quick_login_candidates_cache == []
+
+
+def test_repl_prime_target_cache_reuses_existing_targets_without_forced_refresh(monkeypatch) -> None:
+    repl = SlashRepl()
+    calls: list[tuple[bool, int]] = []
+
+    class _Gateway:
+        def count_targets(self, _chat_type: str) -> int:
+            return 3
+
+        def list_targets(self, _chat_type: str, *, refresh: bool = False, limit: int = 8):
+            calls.append((refresh, limit))
+            return []
+
+    monkeypatch.setattr(repl, "_require_gateway", lambda: _Gateway())
+    monkeypatch.setattr(repl, "_ensure_endpoint_ready", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("should not be called")))
+    monkeypatch.setattr(repl, "_mark_completion_primed", lambda *_args, **_kwargs: None)
+
+    repl._prime_target_cache("group", quiet=False, endpoint_ready=True)
+
+    assert calls == [(False, 32)]
 
 
 def test_completion_menu_reserve_lines_grows_in_compat_mode() -> None:

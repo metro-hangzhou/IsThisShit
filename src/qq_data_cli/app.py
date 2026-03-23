@@ -266,20 +266,15 @@ def login(
                 typer.echo(f"login_status={status.login_error}")
 
         initial_status = service.check_status()
-        desired_quick_uin = None
-        if not refresh and not no_quick:
-            try:
-                desired_quick_uin = service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
-            except Exception:
-                desired_quick_uin = None
+        expected_quick_uin = quick_uin or str(settings.quick_login_uin or "").strip() or None
         if initial_status.effectively_logged_in():
             info = service.get_ready_login_info()
             if info is not None:
-                if desired_quick_uin and info.uin and info.uin != desired_quick_uin:
+                if expected_quick_uin and info.uin and info.uin != expected_quick_uin:
                     typer.echo(
                         build_session_mismatch_message(
                             current_uin=info.uin,
-                            requested_uin=desired_quick_uin,
+                            requested_uin=expected_quick_uin,
                         )
                     )
                     return
@@ -290,7 +285,13 @@ def login(
                 return
 
         quick_candidate_label: str | None = None
+        desired_quick_uin = None
         if not refresh and not no_quick:
+            typer.echo("login_status=QQ not logged in; attempting quick login...")
+            try:
+                desired_quick_uin = service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
+            except Exception:
+                desired_quick_uin = expected_quick_uin
             try:
                 candidates = service.get_quick_login_candidates()
             except Exception:
@@ -318,6 +319,7 @@ def login(
                     typer.echo(f"nick={quick_info.nick or ''}")
                     typer.echo(f"online={quick_info.online}")
                     return
+            typer.echo("login_status=quick login unavailable; preparing QR login...")
 
         info = service.login_until_success(
             timeout_seconds=timeout,
@@ -826,6 +828,7 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
         forward_context_timeouts = int(update.get("forward_context_timeout_count") or 0)
         forward_context_empty = int(update.get("forward_context_empty_count") or 0)
         forward_context_errors = int(update.get("forward_context_error_count") or 0)
+        forward_context_unavailable = int(update.get("forward_context_unavailable_count") or 0)
         forward_timeout_storm_skips = int(update.get("forward_timeout_storm_skip_count") or 0)
         last_asset_type = str(update.get("last_asset_type") or "").strip()
         last_file_name = str(update.get("last_file_name") or "").strip()
@@ -861,6 +864,8 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
             diag_parts.append(f"forward_meta_empty={forward_context_empty}")
         if forward_context_errors > 0:
             diag_parts.append(f"forward_meta_error={forward_context_errors}")
+        if forward_context_unavailable > 0:
+            diag_parts.append(f"forward_meta_unavailable={forward_context_unavailable}")
         if forward_timeout_storm_skips > 0:
             diag_parts.append(f"forward_timeout_breaker={forward_timeout_storm_skips}")
         if diag_parts:

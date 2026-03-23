@@ -276,24 +276,19 @@ class SlashRepl:
             or (positionals[0].strip() if positionals else "")
             or None
         )
+        expected_quick_uin = quick_uin or str(self._settings.quick_login_uin or "").strip() or None
 
         self._ensure_endpoint_ready("webui", quick_login_uin=quick_uin)
         self._refresh_settings()
         login_service = self._require_login_service()
         initial_status = login_service.check_status()
-        desired_quick_uin = None
-        if not refresh and use_quick_login:
-            try:
-                desired_quick_uin = login_service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
-            except Exception:
-                desired_quick_uin = None
         if initial_status.effectively_logged_in():
             ready_info = login_service.get_ready_login_info()
             if ready_info is not None:
-                if desired_quick_uin and ready_info.uin and ready_info.uin != desired_quick_uin:
+                if expected_quick_uin and ready_info.uin and ready_info.uin != expected_quick_uin:
                     self._console.print(
                         "QQ session mismatch. "
-                        f"current_uin={ready_info.uin} requested_uin={desired_quick_uin}. "
+                        f"current_uin={ready_info.uin} requested_uin={expected_quick_uin}. "
                         "Close the current NapCat/QQ session or switch the QQ account, then retry /login."
                     )
                     return
@@ -303,8 +298,8 @@ class SlashRepl:
                 try:
                     self._ensure_endpoint_ready("onebot_http")
                     self._ensure_endpoint_ready("onebot_ws")
-                    self._prime_target_cache("group", quiet=True)
-                    self._prime_target_cache("private", quiet=True)
+                    self._prime_target_cache("group", quiet=True, endpoint_ready=True)
+                    self._prime_target_cache("private", quiet=True, endpoint_ready=True)
                 except Exception as exc:
                     log_path = get_cli_log_path()
                     self._console.print(
@@ -317,7 +312,13 @@ class SlashRepl:
                         )
                     )
                 return
+        desired_quick_uin = None
         if use_quick_login and not refresh:
+            self._console.print("login_status=QQ not logged in; attempting quick login...")
+            try:
+                desired_quick_uin = login_service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
+            except Exception:
+                desired_quick_uin = expected_quick_uin
             try:
                 quick_candidates = login_service.get_quick_login_candidates()
             except Exception:
@@ -350,8 +351,8 @@ class SlashRepl:
                     try:
                         self._ensure_endpoint_ready("onebot_http")
                         self._ensure_endpoint_ready("onebot_ws")
-                        self._prime_target_cache("group", quiet=True)
-                        self._prime_target_cache("private", quiet=True)
+                        self._prime_target_cache("group", quiet=True, endpoint_ready=True)
+                        self._prime_target_cache("private", quiet=True, endpoint_ready=True)
                     except Exception as exc:
                         log_path = get_cli_log_path()
                         self._console.print(
@@ -361,9 +362,10 @@ class SlashRepl:
                                     "note: 群/好友补全依赖 onebot_http；当前不可用时，像 /export group ssj 这样的目标补全不会弹出。",
                                     f"note: 如需排查，请把 CLI 日志发回来：{log_path or ''}",
                                 ]
-                            )
                         )
+                    )
                     return
+            self._console.print("login_status=quick login unavailable; preparing QR login...")
         info = login_service.login_until_success(
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval,
@@ -379,8 +381,8 @@ class SlashRepl:
         try:
             self._ensure_endpoint_ready("onebot_http")
             self._ensure_endpoint_ready("onebot_ws")
-            self._prime_target_cache("group", quiet=True)
-            self._prime_target_cache("private", quiet=True)
+            self._prime_target_cache("group", quiet=True, endpoint_ready=True)
+            self._prime_target_cache("private", quiet=True, endpoint_ready=True)
         except Exception as exc:
             log_path = get_cli_log_path()
             self._console.print(
@@ -567,7 +569,7 @@ class SlashRepl:
         self._ensure_endpoint_ready("onebot_http")
         assert parsed.chat_type is not None
         chat_type = _normalize_chat_type(parsed.chat_type)
-        self._prime_target_cache(chat_type, quiet=False)
+        self._prime_target_cache(chat_type, quiet=False, endpoint_ready=True)
         if parsed.batch_target_queries:
             self._handle_batch_export(parsed, chat_type=chat_type)
             return
@@ -591,7 +593,7 @@ class SlashRepl:
         self._ensure_endpoint_ready("onebot_http")
         self._ensure_endpoint_ready("onebot_ws")
         chat_type = _normalize_chat_type(positionals[0])
-        self._prime_target_cache(chat_type, quiet=False)
+        self._prime_target_cache(chat_type, quiet=False, endpoint_ready=True)
         target = self._resolve_target(chat_type, positionals[1], refresh=bool(options.get("refresh")))
         request = WatchRequest(
             chat_type=chat_type,
@@ -1175,6 +1177,7 @@ class SlashRepl:
         forward_context_timeouts = int(update.get("forward_context_timeout_count") or 0)
         forward_context_empty = int(update.get("forward_context_empty_count") or 0)
         forward_context_errors = int(update.get("forward_context_error_count") or 0)
+        forward_context_unavailable = int(update.get("forward_context_unavailable_count") or 0)
         forward_timeout_storm_skips = int(update.get("forward_timeout_storm_skip_count") or 0)
         last_asset_type = str(update.get("last_asset_type") or "").strip()
         last_file_name = str(update.get("last_file_name") or "").strip()
@@ -1210,6 +1213,8 @@ class SlashRepl:
             diag_parts.append(f"forward_meta_empty={forward_context_empty}")
         if forward_context_errors > 0:
             diag_parts.append(f"forward_meta_error={forward_context_errors}")
+        if forward_context_unavailable > 0:
+            diag_parts.append(f"forward_meta_unavailable={forward_context_unavailable}")
         if forward_timeout_storm_skips > 0:
             diag_parts.append(f"forward_timeout_breaker={forward_timeout_storm_skips}")
         if diag_parts:
@@ -1435,7 +1440,7 @@ class SlashRepl:
         if mismatch_message:
             raise RuntimeError(mismatch_message)
 
-    def _prime_target_cache(self, chat_type: str, *, quiet: bool) -> None:
+    def _prime_target_cache(self, chat_type: str, *, quiet: bool, endpoint_ready: bool = False) -> None:
         if self._completion_cache_is_fresh(
             self._completion_primed_at,
             chat_type,
@@ -1453,9 +1458,13 @@ class SlashRepl:
         has_cached_targets = gateway.count_targets(chat_type) > 0
 
         try:
-            self._ensure_endpoint_ready("onebot_http")
+            if not endpoint_ready:
+                self._ensure_endpoint_ready("onebot_http")
             gateway = self._require_gateway()
-            gateway.list_targets(chat_type, refresh=True, limit=32)
+            if not quiet and not has_cached_targets:
+                label = "群聊" if chat_type == "group" else "好友"
+                self._console.print(f"runtime_note: 正在从 NapCat 预加载{label}缓存...")
+            gateway.list_targets(chat_type, refresh=not has_cached_targets, limit=32)
         except Exception as exc:
             self._logger.warning(
                 "completion_prime_failed chat_type=%s quiet=%s has_cached_targets=%s error=%s",
