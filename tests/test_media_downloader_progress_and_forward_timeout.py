@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import uuid
 from concurrent.futures import Future
+import httpx
 
 from qq_data_integrations.napcat.fast_history_client import NapCatFastHistoryTimeoutError
 from qq_data_integrations.napcat.fast_history_client import NapCatFastHistoryUnavailable
@@ -355,6 +356,73 @@ class _OldForwardTokenOnlyClient:
         }
 
 
+def test_remote_payload_sync_rejects_json_api_failure_body() -> None:
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        remote_transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "application/json; charset=utf-8"},
+                json={
+                    "status": "failed",
+                    "retcode": 200,
+                    "message": "不支持的Api download",
+                    "wording": "不支持的Api download",
+                },
+                request=request,
+            )
+        ),
+    )
+
+    payload = downloader._download_remote_payload_sync(
+        "http://127.0.0.1:3000/download?appid=1407&fileid=fake&spec=0"
+    )
+
+    assert payload is None
+
+
+def test_remote_payload_sync_keeps_binary_media_body() -> None:
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        remote_transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                headers={"content-type": "image/png"},
+                content=b"\x89PNG\r\n\x1a\nbinary",
+                request=request,
+            )
+        ),
+    )
+
+    payload = downloader._download_remote_payload_sync(
+        "http://127.0.0.1:3000/download?appid=1407&fileid=fake&spec=0"
+    )
+
+    assert payload == b"\x89PNG\r\n\x1a\nbinary"
+
+
+class _ForwardImageTargetedMissClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            raise AssertionError("forward image targeted materialize should not run")
+        return {"targeted": True, "targeted_mode": "targeted_miss", "assets": []}
+
+
+class _ForwardImageMetadataTimeoutClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            raise AssertionError("forward image targeted materialize should not run after metadata timeout")
+        raise NapCatFastHistoryTimeoutError("timed out")
+
+
 class _OldForwardMaterializeOnlyTimeoutClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -364,50 +432,6 @@ class _OldForwardMaterializeOnlyTimeoutClient:
         if kwargs.get("materialize"):
             raise NapCatFastHistoryTimeoutError("timed out")
         return {"assets": []}
-
-
-class _ForwardImageMetadataTimeoutThenEmptyClient:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    def hydrate_forward_media(self, **kwargs):
-        self.calls.append(kwargs)
-        if kwargs.get("materialize"):
-            return {"assets": []}
-        raise AssertionError("metadata should be skipped when a failed forward image URL already proves rehydration is required")
-
-
-class _ForwardImageMetadataTimeoutThenErrorClient:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    def hydrate_forward_media(self, **kwargs):
-        self.calls.append(kwargs)
-        if kwargs.get("materialize"):
-            raise RuntimeError("materialize exploded")
-        raise AssertionError("metadata should be skipped when a failed forward image URL already proves rehydration is required")
-
-
-class _ForwardImageMetadataTimeoutThenSuccessClient:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, object]] = []
-
-    def hydrate_forward_media(self, **kwargs):
-        self.calls.append(kwargs)
-        if kwargs.get("materialize"):
-            requested_file_name = str(kwargs.get("file_name") or "").strip()
-            return {
-                "targeted_mode": "single_target_download",
-                "assets": [
-                    {
-                        "asset_type": "image",
-                        "asset_role": "forward_media",
-                        "file_name": requested_file_name,
-                        "remote_url": f"http://127.0.0.1:3000/download?file={requested_file_name}",
-                    }
-                ],
-            }
-        raise AssertionError("metadata should be skipped when a failed forward image URL already proves rehydration is required")
 
 
 class _OldForwardEmptyClient:
@@ -1422,7 +1446,10 @@ def test_recent_forward_speech_missing_is_not_shared_without_terminal_expired_re
 
 
 def test_classify_forward_missing_marks_forward_image_with_dead_remote_and_failed_public_token_as_background_without_age_gate() -> None:
-    downloader = NapCatMediaDownloader(_DummyClient())
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        remote_base_url="http://127.0.0.1:3000",
+    )
     request = _mark_request_old(_build_forward_request("forward-dead.jpg"), days=10)
     request["download_hint"]["url"] = (
         "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-token&spec=0"
@@ -1431,15 +1458,22 @@ def test_classify_forward_missing_marks_forward_image_with_dead_remote_and_faile
         "asset_type": "image",
         "public_action": "get_image",
         "public_file_token": "dead-image-token",
-        "remote_url": "http://127.0.0.1:6099/download?appid=1407&fileid=dead-token&spec=0",
     }
     cache_key = (
         "image",
         downloader._normalized_match_url(
-            "http://127.0.0.1:6099/download?appid=1407&fileid=dead-token&spec=0"
+            "http://127.0.0.1:3000/download?appid=1407&fileid=dead-token&spec=0"
         ),
     )
     downloader._remote_media_resolution_cache[cache_key] = None
+    downloader._remember_remote_media_failure_reason(
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-token&spec=0",
+        "expired_remote",
+    )
+    downloader._remember_remote_media_failure_reason(
+        "http://127.0.0.1:3000/download?appid=1407&fileid=dead-token&spec=0",
+        "unsupported_local_download",
+    )
     downloader._public_token_action_outcomes[("get_image", "dead-image-token")] = None
 
     classification = downloader._classify_forward_missing(request, payload=payload)
@@ -1457,9 +1491,13 @@ def test_classify_forward_missing_keeps_forward_image_without_terminal_evidence_
     assert classification is None
 
 
-def test_classify_forward_missing_keeps_forward_image_with_dead_remote_and_metadata_timeout_actionable_without_materialize_terminal_evidence() -> None:
-    fast_client = _OldForwardMaterializeOnlyTimeoutClient()
-    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+def test_classify_forward_missing_marks_forward_image_with_dead_remote_and_metadata_timeout_as_background_when_no_public_or_local_handle_exists() -> None:
+    fast_client = _ForwardImageMetadataTimeoutClient()
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        fast_client=fast_client,
+        remote_base_url="http://127.0.0.1:3000",
+    )
     request = _mark_request_old(_build_forward_request("forward-dead-timeout.jpg"), days=7)
     request["download_hint"]["url"] = (
         "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout&spec=0"
@@ -1471,13 +1509,22 @@ def test_classify_forward_missing_keeps_forward_image_with_dead_remote_and_metad
         ),
     )
     downloader._remote_media_resolution_cache[cache_key] = None
+    downloader._remember_remote_media_failure_reason(
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout&spec=0",
+        "expired_remote",
+    )
+    downloader._remember_remote_media_failure_reason(
+        "http://127.0.0.1:3000/download?appid=1407&fileid=dead-forward-timeout&spec=0",
+        "unsupported_local_download",
+    )
 
     assert downloader._download_via_forward_context(request, materialize=False) is None
 
     classification = downloader._classify_forward_missing(request)
 
-    assert classification is None
+    assert classification == "qq_expired_after_napcat"
     assert len(fast_client.calls) == 1
+    assert [bool(call.get("materialize")) for call in fast_client.calls] == [False]
 
 
 def test_classify_forward_missing_keeps_forward_image_with_dead_remote_but_no_terminal_route_signal_actionable() -> None:
@@ -1512,82 +1559,172 @@ def test_classify_forward_missing_keeps_forward_image_without_remote_or_public_h
     assert len(fast_client.calls) == 1
 
 
-def test_forward_image_metadata_timeout_then_materialize_empty_is_classified_as_expired() -> None:
-    fast_client = _ForwardImageMetadataTimeoutThenEmptyClient()
-    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
-    request = _mark_request_old(_build_forward_request("forward-timeout-empty.jpg"), days=7)
-    request["download_hint"]["url"] = (
-        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout-empty&spec=0"
-    )
-    cache_key = (
-        "image",
-        downloader._normalized_match_url(str(request["download_hint"]["url"])),
-    )
-    downloader._remote_media_resolution_cache[cache_key] = None
+def _build_forward_image_terminal_remote_transport() -> httpx.MockTransport:
+    def _handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "multimedia.nt.qq.com.cn" in url:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json; charset=utf-8"},
+                json={
+                    "retcode": -5503042,
+                    "message": "file has expired",
+                    "wording": "file has expired",
+                },
+                request=request,
+            )
+        if "127.0.0.1:3000" in url or "127.0.0.1:6099" in url:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json; charset=utf-8"},
+                json={
+                    "status": "failed",
+                    "retcode": 200,
+                    "message": "不支持的Api download",
+                    "wording": "不支持的Api download",
+                },
+                request=request,
+            )
+        return httpx.Response(404, request=request)
 
-    resolved = downloader.resolve_for_export(request)
-
-    assert resolved == (None, "qq_expired_after_napcat")
-    assert [bool(call.get("materialize")) for call in fast_client.calls] == [True]
-
-
-def test_forward_image_metadata_timeout_then_materialize_error_is_classified_as_expired() -> None:
-    fast_client = _ForwardImageMetadataTimeoutThenErrorClient()
-    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
-    request = _mark_request_old(_build_forward_request("forward-timeout-error.jpg"), days=7)
-    request["download_hint"]["url"] = (
-        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout-error&spec=0"
-    )
-    cache_key = (
-        "image",
-        downloader._normalized_match_url(str(request["download_hint"]["url"])),
-    )
-    downloader._remote_media_resolution_cache[cache_key] = None
-
-    resolved = downloader.resolve_for_export(request)
-
-    assert resolved == (None, "qq_expired_after_napcat")
-    assert [bool(call.get("materialize")) for call in fast_client.calls] == [True]
+    return httpx.MockTransport(_handler)
 
 
-def test_forward_image_metadata_timeout_then_targeted_materialize_can_recover() -> None:
-    fast_client = _ForwardImageMetadataTimeoutThenSuccessClient()
+def test_forward_image_targeted_miss_with_terminal_remote_evidence_is_classified_as_expired() -> None:
+    fast_client = _ForwardImageTargetedMissClient()
     temp_root = _workspace_temp_dir()
-    downloader = _RemoteMediaDownloader(temp_root / "remote_cache")
-    downloader._fast_client = fast_client
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        fast_client=fast_client,
+        remote_cache_dir=temp_root / "remote_cache",
+        remote_base_url="http://127.0.0.1:3000",
+        remote_transport=_build_forward_image_terminal_remote_transport(),
+    )
+    request = _mark_request_old(_build_forward_request("forward-targeted-miss.jpg"), days=7)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-targeted-miss&spec=0"
+    )
+
+    try:
+        resolved = downloader.resolve_for_export(request)
+
+        assert resolved == (None, "qq_expired_after_napcat")
+        assert fast_client.calls == []
+        reasons = downloader._forward_remote_failure_reasons(request)
+        assert reasons == {
+            "original": "expired_remote",
+            "projected": "unsupported_local_download",
+        }
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_forward_image_targeted_miss_with_projected_local_download_recovers_without_materialize() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            headers={
+                "content-type": "image/gif"
+                if "127.0.0.1:3000" in str(request.url)
+                else "application/json; charset=utf-8"
+            },
+            content=b"GIF89a"
+            if "127.0.0.1:3000" in str(request.url)
+            else b'{"retcode":-5503042,"message":"file has expired"}',
+            request=request,
+        )
+    )
+    fast_client = _ForwardImageTargetedMissClient()
+    temp_root = _workspace_temp_dir()
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        fast_client=fast_client,
+        remote_cache_dir=temp_root / "remote_cache",
+        remote_base_url="http://127.0.0.1:3000",
+        remote_transport=transport,
+    )
+    request = _mark_request_old(_build_forward_request("forward-targeted-hit.gif"), days=7)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-targeted-hit&spec=0"
+    )
+
+    try:
+        resolved = downloader.resolve_for_export(request)
+        assert resolved[0] is not None
+        assert resolved[1] == "napcat_forward_remote_url"
+        assert fast_client.calls == []
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_forward_image_metadata_timeout_does_not_force_targeted_materialize() -> None:
+    fast_client = _ForwardImageMetadataTimeoutClient()
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        fast_client=fast_client,
+        remote_base_url="http://127.0.0.1:3000",
+    )
     request = _mark_request_old(_build_forward_request("forward-timeout-success.jpg"), days=7)
     request["download_hint"]["url"] = (
         "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout-success&spec=0"
     )
-    cache_key = (
-        "image",
-        downloader._normalized_match_url(str(request["download_hint"]["url"])),
+    downloader._remember_remote_media_failure_reason(
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout-success&spec=0",
+        "expired_remote",
     )
-    downloader._remote_media_resolution_cache[cache_key] = None
+    downloader._remember_remote_media_failure_reason(
+        "http://127.0.0.1:3000/download?appid=1407&fileid=dead-forward-timeout-success&spec=0",
+        "unsupported_local_download",
+    )
 
-    traces: list[dict[str, object]] = []
-    try:
-        resolved = downloader.resolve_for_export(request, trace_callback=traces.append)
+    resolved = downloader.resolve_for_export(request)
 
-        assert resolved is not None
-        assert resolved[0] is not None
-        assert resolved[1] == "napcat_forward_remote_url"
-        assert [bool(call.get("materialize")) for call in fast_client.calls] == [True]
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert [bool(call.get("materialize")) for call in fast_client.calls] in ([], [False])
 
-        forward_remote_done = next(
-            payload
-            for payload in traces
-            if payload.get("phase") == "materialize_asset_substep"
-            and payload.get("substep") == "forward_remote_url"
-            and payload.get("stage") == "done"
-        )
-        assert forward_remote_done.get("timestamp_iso")
-        assert forward_remote_done.get("md5") is None
-        assert forward_remote_done.get("attempt_url_kind") == "napcat_local_download"
-        assert forward_remote_done.get("resolved_size_bytes") == len(b"fake-bytes")
-        assert forward_remote_done.get("hint_url_kind") == "qq_multimedia"
-    finally:
-        shutil.rmtree(temp_root, ignore_errors=True)
+
+def test_classify_missing_from_payload_marks_top_level_image_with_stale_local_and_terminal_remote_evidence_as_background() -> None:
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        remote_base_url="http://127.0.0.1:3000",
+    )
+    request = {
+        "asset_type": "image",
+        "file_name": "top-terminal.jpg",
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Emoji\emoji-recv\2026-01\Ori\top-terminal.jpg",
+        "download_hint": {
+            "file_id": "dead-top-terminal-token",
+            "url": "/download?appid=1407&fileid=dead-top-terminal-token&spec=0",
+            "message_id_raw": "7616396026189795572",
+            "element_id": "7616396026189795571",
+            "peer_uid": "922065597",
+            "chat_type_raw": "2",
+        },
+    }
+    payload = {
+        "asset_type": "image",
+        "public_action": "get_image",
+        "public_file_token": "dead-top-terminal-token",
+        "file_name": "top-terminal.jpg",
+        "file_id": "dead-top-terminal-token",
+        "remote_url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-top-terminal-token&rkey=test",
+    }
+    downloader._remember_remote_media_failure_reason(
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-top-terminal-token&rkey=test",
+        "expired_remote",
+    )
+    downloader._remember_remote_media_failure_reason(
+        "http://127.0.0.1:3000/download?appid=1407&fileid=dead-top-terminal-token&spec=0",
+        "unsupported_local_download",
+    )
+
+    classification = downloader._classify_missing_from_payload(
+        payload,
+        old_bucket=None,
+        request=request,
+    )
+
+    assert classification == "qq_expired_after_napcat"
 
 
 def test_recent_forward_video_blank_public_payload_is_classified_as_expired_without_age_gate() -> None:
@@ -1727,21 +1864,14 @@ def test_public_token_placeholder_missing_is_classified_before_remote_attempt() 
     downloader = NapCatMediaDownloader(_DummyClient())
     public_token_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-    def _unexpected_public_token(*args, **kwargs):
+    def _public_token_returns_nothing(*args, **kwargs):
         public_token_calls.append((args, kwargs))
-        return {
-            "url": "https://gchat.qpic.cn/gchatpic_new/0/0-0-700B81F97B9D06E7999DF7504442D46C/0"
-        }
+        return None
 
-    downloader._call_public_action_with_token = _unexpected_public_token  # type: ignore[method-assign]
-
-    def _unexpected_remote_download(*args, **kwargs):
-        raise AssertionError("remote URL download should not run when placeholder missing is already classified")
-
-    downloader._download_remote_media = _unexpected_remote_download  # type: ignore[method-assign]
+    downloader._call_public_action_with_token = _public_token_returns_nothing  # type: ignore[method-assign]
 
     try:
-        resolved, resolver = downloader._resolve_from_public_token(
+        result = downloader._resolve_from_public_token(
             {
                 "asset_type": "image",
                 "public_action": "get_image",
@@ -1755,14 +1885,13 @@ def test_public_token_placeholder_missing_is_classified_before_remote_attempt() 
                 "source_path": str(source_path),
             },
         )
-        assert resolved is None
-        assert resolver == "qq_not_downloaded_local_placeholder"
-        assert public_token_calls == []
+        assert result is None
+        assert len(public_token_calls) == 1
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
-def test_prepare_for_export_skips_remote_prefetch_for_old_placeholder_image() -> None:
+def test_prepare_for_export_does_not_skip_remote_prefetch_for_placeholder_without_terminal_evidence() -> None:
     temp_root = _workspace_temp_dir()
     source_path = temp_root / "Pic" / "2025-09" / "Ori" / "PLACEHOLDER_B.png"
     source_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1795,12 +1924,12 @@ def test_prepare_for_export_skips_remote_prefetch_for_old_placeholder_image() ->
 
     try:
         downloader.prepare_for_export([request])
-        assert downloader.scheduled_requests == []
+        assert downloader.scheduled_requests == [source_path.name]
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
-def test_resolve_via_context_only_skips_old_placeholder_image_before_context_hydration() -> None:
+def test_resolve_via_context_only_does_not_skip_old_placeholder_image_without_terminal_evidence() -> None:
     temp_root = _workspace_temp_dir()
     source_path = temp_root / "Pic" / "2025-09" / "Ori" / "PLACEHOLDER_CONTEXT_SKIP.png"
     source_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1822,15 +1951,70 @@ def test_resolve_via_context_only_skips_old_placeholder_image_before_context_hyd
         },
     }
 
-    def _unexpected_context(*args, **kwargs):
-        raise AssertionError("old placeholder image should be classified before context hydration")
+    context_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-    downloader._download_via_context = _unexpected_context  # type: ignore[method-assign]
+    def _context_returns_nothing(*args, **kwargs):
+        context_calls.append((args, kwargs))
+        return None
+
+    downloader._download_via_context = _context_returns_nothing  # type: ignore[method-assign]
 
     try:
         resolved, resolver = downloader._resolve_via_context_only(request)
         assert resolved is None
-        assert resolver == "qq_not_downloaded_local_placeholder"
+        assert resolver is None
+        assert len(context_calls) == 1
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_classify_missing_from_payload_uses_placeholder_background_only_after_remote_failure_evidence() -> None:
+    temp_root = _workspace_temp_dir()
+    source_path = temp_root / "Pic" / "2025-12" / "Ori" / "PLACEHOLDER_EVIDENCE.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"")
+    sibling_placeholder = source_path.parent.parent / "OriTemp" / source_path.name
+    sibling_placeholder.parent.mkdir(parents=True, exist_ok=True)
+    sibling_placeholder.write_bytes(b"")
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "image",
+        "file_name": source_path.name,
+        "source_path": str(source_path),
+        "download_hint": {
+            "file_id": "token-placeholder",
+            "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=token-placeholder&spec=0",
+        },
+    }
+    payload = {
+        "public_action": "get_image",
+        "public_file_token": "token-placeholder",
+        "file_name": source_path.name,
+        "asset_type": "image",
+    }
+    try:
+        assert (
+            downloader._classify_missing_from_payload(
+                payload,
+                old_bucket=("image", "2025-12"),
+                request=request,
+            )
+            is None
+        )
+        resolved_remote = downloader._resolve_remote_url(
+            "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=token-placeholder&spec=0"
+        )
+        assert resolved_remote is not None
+        downloader._remote_media_resolution_cache[resolved_remote] = None
+        downloader._remote_media_failure_reasons[resolved_remote] = "unsupported_local_download"
+        assert (
+            downloader._classify_missing_from_payload(
+                payload,
+                old_bucket=("image", "2025-12"),
+                request=request,
+            )
+            == "qq_not_downloaded_local_placeholder"
+        )
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
