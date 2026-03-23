@@ -185,6 +185,7 @@ class WatchConversationView:
         self._oldest_history_anchor: str | None = None
         self._history_exhausted = False
         self._download_notice_text = ""
+        self._reserve_timeline_scrollbar_column = True
         self._message_area = TextArea(
             text="",
             read_only=True,
@@ -1196,7 +1197,7 @@ class WatchConversationView:
     def _timeline_content_width(self) -> int:
         return _watch_content_width(
             terminal_columns=self._terminal_width(),
-            reserve_scrollbar=bool(self._message_area.scrollbar),
+            reserve_scrollbar=self._reserve_timeline_scrollbar_column,
         )
 
     def _wrap_lines(self, lines: list[str]) -> list[str]:
