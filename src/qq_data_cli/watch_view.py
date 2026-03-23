@@ -257,6 +257,7 @@ class WatchConversationView:
             style=app_style,
             input=application_input,
             output=application_output,
+            before_render=self._before_render,
         )
         self._pump_task: asyncio.Task[None] | None = None
         self._export_task: asyncio.Task[None] | None = None
@@ -410,6 +411,9 @@ class WatchConversationView:
             self._scroll_top = previous_scroll_top
             self._clamp_scroll_top()
             self._sync_cursor_to_view()
+
+    def _before_render(self, _app: Application[Any]) -> None:
+        self._refresh_message_area_for_resize()
 
     def _scroll_to_end(self) -> None:
         line_count = max(1, self._message_area.buffer.document.line_count)
@@ -1252,7 +1256,6 @@ class WatchConversationView:
         self._message_area.buffer.cursor_position = target_index
 
     def _invalidate(self) -> None:
-        self._refresh_message_area_for_resize()
         self._app.invalidate()
 
 
