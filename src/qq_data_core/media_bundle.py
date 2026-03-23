@@ -580,6 +580,8 @@ def materialize_snapshot_media(
                 continue
             if asset.status != "missing":
                 continue
+            if not _asset_missing_kind_allows_second_pass_public_retry(asset.missing_kind):
+                continue
             if not _candidate_has_second_pass_public_retry_evidence(candidate):
                 continue
             request_payload = {
@@ -749,6 +751,13 @@ def _candidate_has_second_pass_public_retry_evidence(candidate: _AssetCandidate)
         ]
     )
     return has_locator_evidence
+
+
+def _asset_missing_kind_allows_second_pass_public_retry(missing_kind: str | None) -> bool:
+    normalized = str(missing_kind or "").strip().lower()
+    if not normalized:
+        return True
+    return normalized in {"missing", "missing_after_napcat"}
 
 
 def _record_forensic_incident(
