@@ -89,12 +89,20 @@ class SlashRepl:
         self._logger = get_cli_logger("repl")
         self._runtime_starter = None
         self._bootstrapper = None
+        self._gateway_init_lock = threading.Lock()
+        self._target_completion_runtime_warm_lock = threading.Lock()
+        self._target_completion_runtime_warm_thread: threading.Thread | None = None
         self._gateway: NapCatGateway | None = None
         self._webui_client: NapCatWebUiClient | None = None
         self._login_service: NapCatQrLoginService | None = None
         self._last_qr_url: str | None = None
         self._completion_primed_at: dict[str, float] = {}
         self._completion_prime_failed_at: dict[str, float] = {}
+        self._target_cache_prime_lock = threading.Lock()
+        self._target_cache_prime_threads: dict[str, threading.Thread | None] = {
+            "group": None,
+            "private": None,
+        }
         self._quick_login_candidates_cache: list[tuple[str, str | None]] = []
         self._quick_login_candidates_cached_at: float | None = None
         self._quick_login_candidates_prime_failed_at: float | None = None
@@ -135,6 +143,7 @@ class SlashRepl:
         self._kickoff_startup_capture_if_needed()
         self._warm_napcat_service_for_startup()
         self._kickoff_quick_login_candidates_prime_if_needed(announce=True)
+        self._kickoff_target_completion_runtime_warm()
         self._wait_briefly_for_quick_login_candidates_prime()
         self._console.print("Slash REPL ready. 输入 /help 查看命令；常用有 /friends、/watch、/export。")
         ui_notice = render_cli_ui_mode_notice(self._ui_decision)
@@ -1303,15 +1312,69 @@ class SlashRepl:
         keyword: str | None,
         limit: int,
     ) -> list[ChatTarget]:
-        self._prime_target_cache(chat_type, quiet=True)
+        lookup_started = monotonic()
+        gateway_started = monotonic()
         gateway = self._require_gateway()
-        return gateway.list_targets(chat_type, keyword, limit=limit)
+        gateway_elapsed_ms = (monotonic() - gateway_started) * 1000.0
+        cached_count_started = monotonic()
+        cached_target_count = gateway.count_cached_targets(chat_type)
+        cached_count_elapsed_ms = (monotonic() - cached_count_started) * 1000.0
+        if cached_target_count > 0:
+            cached_search_started = monotonic()
+            targets = gateway.list_cached_targets(chat_type, keyword, limit=limit)
+            cached_search_elapsed_ms = (monotonic() - cached_search_started) * 1000.0
+            self._kickoff_target_cache_prime_if_needed(chat_type)
+            total_elapsed_ms = (monotonic() - lookup_started) * 1000.0
+            self._logger.info(
+                "completion_target_lookup chat_type=%s keyword=%r mode=cached cached_targets=%s "
+                "gateway_ms=%.1f cached_count_ms=%.1f cached_search_ms=%.1f total_ms=%.1f result_count=%s",
+                chat_type,
+                keyword,
+                cached_target_count,
+                gateway_elapsed_ms,
+                cached_count_elapsed_ms,
+                cached_search_elapsed_ms,
+                total_elapsed_ms,
+                len(targets),
+            )
+            return targets
+
+        prime_started = monotonic()
+        self._prime_target_cache(chat_type, quiet=True)
+        prime_elapsed_ms = (monotonic() - prime_started) * 1000.0
+        gateway = self._require_gateway()
+        lookup_search_started = monotonic()
+        targets = gateway.list_targets(chat_type, keyword, limit=limit)
+        lookup_search_elapsed_ms = (monotonic() - lookup_search_started) * 1000.0
+        total_elapsed_ms = (monotonic() - lookup_started) * 1000.0
+        self._logger.info(
+            "completion_target_lookup chat_type=%s keyword=%r mode=sync_prime cached_targets=0 "
+            "gateway_ms=%.1f cached_count_ms=%.1f prime_ms=%.1f lookup_ms=%.1f total_ms=%.1f result_count=%s",
+            chat_type,
+            keyword,
+            gateway_elapsed_ms,
+            cached_count_elapsed_ms,
+            prime_elapsed_ms,
+            lookup_search_elapsed_ms,
+            total_elapsed_ms,
+            len(targets),
+        )
+        return targets
 
     def _require_gateway(self) -> NapCatGateway:
         from qq_data_integrations.napcat.gateway import NapCatGateway
 
         if self._gateway is None:
-            self._gateway = NapCatGateway(self._settings)
+            with self._gateway_init_lock:
+                if self._gateway is None:
+                    started = monotonic()
+                    self._gateway = NapCatGateway(self._settings)
+                    self._logger.info(
+                        "gateway_initialized duration_ms=%.1f http_url=%s fast_history_mode=%s",
+                        (monotonic() - started) * 1000.0,
+                        self._settings.http_url,
+                        self._settings.fast_history_mode,
+                    )
         return self._gateway
 
     def _require_service(self) -> "ChatExportService":
@@ -1394,6 +1457,13 @@ class SlashRepl:
         self._login_service = None
         self._completion_primed_at.clear()
         self._completion_prime_failed_at.clear()
+        with self._target_completion_runtime_warm_lock:
+            self._target_completion_runtime_warm_thread = None
+        with self._target_cache_prime_lock:
+            self._target_cache_prime_threads = {
+                "group": None,
+                "private": None,
+            }
         with self._quick_login_candidates_lock:
             self._quick_login_candidates_cache.clear()
             self._quick_login_candidates_cached_at = None
@@ -1441,36 +1511,59 @@ class SlashRepl:
             raise RuntimeError(mismatch_message)
 
     def _prime_target_cache(self, chat_type: str, *, quiet: bool, endpoint_ready: bool = False) -> None:
+        total_started = monotonic()
         if self._completion_cache_is_fresh(
             self._completion_primed_at,
             chat_type,
             ttl_s=self.COMPLETION_PRIMED_TTL_S,
         ):
+            self._logger.info(
+                "completion_prime_skipped chat_type=%s reason=fresh_cache quiet=%s total_ms=%.1f",
+                chat_type,
+                quiet,
+                (monotonic() - total_started) * 1000.0,
+            )
             return
         if quiet and self._completion_cache_is_fresh(
             self._completion_prime_failed_at,
             chat_type,
             ttl_s=self.COMPLETION_PRIME_RETRY_COOLDOWN_S,
         ):
+            self._logger.info(
+                "completion_prime_skipped chat_type=%s reason=retry_cooldown quiet=%s total_ms=%.1f",
+                chat_type,
+                quiet,
+                (monotonic() - total_started) * 1000.0,
+            )
             return
 
         gateway = self._require_gateway()
-        has_cached_targets = gateway.count_targets(chat_type) > 0
+        count_started = monotonic()
+        has_cached_targets = gateway.count_cached_targets(chat_type) > 0
+        cached_count_elapsed_ms = (monotonic() - count_started) * 1000.0
 
         try:
+            ensure_elapsed_ms = 0.0
             if not endpoint_ready:
+                ensure_started = monotonic()
                 self._ensure_endpoint_ready("onebot_http")
+                ensure_elapsed_ms = (monotonic() - ensure_started) * 1000.0
             gateway = self._require_gateway()
             if not quiet and not has_cached_targets:
                 label = "群聊" if chat_type == "group" else "好友"
                 self._console.print(f"runtime_note: 正在从 NapCat 预加载{label}缓存...")
-            gateway.list_targets(chat_type, refresh=not has_cached_targets, limit=32)
+            list_started = monotonic()
+            targets = gateway.list_targets(chat_type, refresh=not has_cached_targets, limit=32)
+            list_elapsed_ms = (monotonic() - list_started) * 1000.0
         except Exception as exc:
             self._logger.warning(
-                "completion_prime_failed chat_type=%s quiet=%s has_cached_targets=%s error=%s",
+                "completion_prime_failed chat_type=%s quiet=%s has_cached_targets=%s cached_count_ms=%.1f "
+                "total_ms=%.1f error=%s",
                 chat_type,
                 quiet,
                 has_cached_targets,
+                cached_count_elapsed_ms,
+                (monotonic() - total_started) * 1000.0,
                 str(exc or "").strip() or exc.__class__.__name__,
             )
             if has_cached_targets:
@@ -1482,10 +1575,98 @@ class SlashRepl:
             return
 
         self._mark_completion_primed(chat_type)
+        self._logger.info(
+            "completion_prime_ready chat_type=%s quiet=%s has_cached_targets=%s cached_count_ms=%.1f "
+            "ensure_ms=%.1f list_ms=%.1f total_ms=%.1f result_count=%s",
+            chat_type,
+            quiet,
+            has_cached_targets,
+            cached_count_elapsed_ms,
+            ensure_elapsed_ms,
+            list_elapsed_ms,
+            (monotonic() - total_started) * 1000.0,
+            len(targets),
+        )
 
     def _mark_completion_primed(self, chat_type: str) -> None:
         self._completion_primed_at[chat_type] = monotonic()
         self._completion_prime_failed_at.pop(chat_type, None)
+
+    def _kickoff_target_cache_prime_if_needed(self, chat_type: str) -> None:
+        if self._completion_cache_is_fresh(
+            self._completion_primed_at,
+            chat_type,
+            ttl_s=self.COMPLETION_PRIMED_TTL_S,
+        ):
+            return
+        if self._completion_cache_is_fresh(
+            self._completion_prime_failed_at,
+            chat_type,
+            ttl_s=self.COMPLETION_PRIME_RETRY_COOLDOWN_S,
+        ):
+            return
+        with self._target_cache_prime_lock:
+            thread = self._target_cache_prime_threads.get(chat_type)
+            if thread is not None and thread.is_alive():
+                return
+
+            def _worker() -> None:
+                started = monotonic()
+                try:
+                    self._prime_target_cache(chat_type, quiet=True)
+                except Exception:
+                    self._logger.exception(
+                        "completion_prime_background_failed chat_type=%s",
+                        chat_type,
+                    )
+                finally:
+                    self._logger.info(
+                        "completion_prime_background_done chat_type=%s total_ms=%.1f",
+                        chat_type,
+                        (monotonic() - started) * 1000.0,
+                    )
+                    with self._target_cache_prime_lock:
+                        self._target_cache_prime_threads[chat_type] = None
+
+            thread = threading.Thread(
+                target=_worker,
+                name=f"target-prime-{chat_type}",
+                daemon=True,
+            )
+            self._target_cache_prime_threads[chat_type] = thread
+            thread.start()
+
+    def _kickoff_target_completion_runtime_warm(self) -> None:
+        with self._target_completion_runtime_warm_lock:
+            thread = self._target_completion_runtime_warm_thread
+            if thread is not None and thread.is_alive():
+                return
+
+            def _worker() -> None:
+                started = monotonic()
+                try:
+                    gateway = self._require_gateway()
+                    group_cached = gateway.count_cached_targets("group")
+                    private_cached = gateway.count_cached_targets("private")
+                    self._logger.info(
+                        "completion_runtime_warm_ready total_ms=%.1f cached_groups=%s cached_friends=%s",
+                        (monotonic() - started) * 1000.0,
+                        group_cached,
+                        private_cached,
+                    )
+                except Exception:
+                    self._logger.exception("completion_runtime_warm_failed")
+                finally:
+                    with self._target_completion_runtime_warm_lock:
+                        self._target_completion_runtime_warm_thread = None
+
+            thread = threading.Thread(
+                target=_worker,
+                name="completion-runtime-warm",
+                daemon=True,
+            )
+            self._target_completion_runtime_warm_thread = thread
+            thread.start()
 
     @staticmethod
     def _completion_cache_is_fresh(
