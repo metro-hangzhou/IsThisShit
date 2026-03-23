@@ -95,6 +95,15 @@ class _GhostLoggedInService(_QuickLoginService):
         return NapCatLoginInfo(uin=None, nick=None, online=None)
 
 
+class _AlreadyLoggedInButQuickLookupExplodes(_QuickLoginService):
+    def check_status(self) -> NapCatLoginStatus:
+        self.status_checks += 1
+        return NapCatLoginStatus(is_login=True)
+
+    def resolve_desired_quick_login_uin(self, *, preferred_uin: str | None = None) -> str | None:
+        raise RuntimeError("quick lookup should not run for already logged-in session")
+
+
 def _patch_login_stack(monkeypatch, service_cls) -> None:
     settings = NapCatSettings.from_env()
     monkeypatch.setattr(NapCatSettings, "from_env", classmethod(lambda cls: settings))
@@ -136,6 +145,16 @@ def test_cli_login_reports_existing_session_without_claiming_quick_login(monkeyp
     output = capsys.readouterr().out
     assert "QQ already logged in." in output
     assert "QQ quick login succeeded." not in output
+    assert "quick_login_candidate=" not in output
+
+
+def test_cli_login_skips_quick_lookup_when_already_logged_in(monkeypatch, capsys) -> None:
+    _patch_login_stack(monkeypatch, _AlreadyLoggedInButQuickLookupExplodes)
+
+    cli_app.login(timeout=10.0, poll=1.0, refresh=False, no_quick=False, quick_uin=None)
+
+    output = capsys.readouterr().out
+    assert "QQ already logged in." in output
     assert "quick_login_candidate=" not in output
 
 
