@@ -186,6 +186,7 @@ class WatchConversationView:
         self._history_exhausted = False
         self._download_notice_text = ""
         self._reserve_timeline_scrollbar_column = True
+        self._last_timeline_content_width: int | None = None
         self._message_area = TextArea(
             text="",
             read_only=True,
@@ -387,6 +388,7 @@ class WatchConversationView:
         self._sync_cursor_to_view()
 
     def _refresh_message_area(self) -> None:
+        self._last_timeline_content_width = self._timeline_content_width()
         transcript = self._get_timeline_text()
         self._message_area.buffer.set_document(
             Document(text=transcript, cursor_position=0),
@@ -394,6 +396,20 @@ class WatchConversationView:
         )
         self._clamp_scroll_top()
         self._sync_cursor_to_view()
+
+    def _refresh_message_area_for_resize(self) -> None:
+        width = self._timeline_content_width()
+        if self._last_timeline_content_width == width:
+            return
+
+        previous_follow_tail = self._follow_tail
+        previous_scroll_top = self._scroll_top
+        self._refresh_message_area()
+        if not previous_follow_tail:
+            self._follow_tail = False
+            self._scroll_top = previous_scroll_top
+            self._clamp_scroll_top()
+            self._sync_cursor_to_view()
 
     def _scroll_to_end(self) -> None:
         line_count = max(1, self._message_area.buffer.document.line_count)
@@ -1236,6 +1252,7 @@ class WatchConversationView:
         self._message_area.buffer.cursor_position = target_index
 
     def _invalidate(self) -> None:
+        self._refresh_message_area_for_resize()
         self._app.invalidate()
 
 
