@@ -11,6 +11,78 @@ Goal:
 - make skip/breaker/cache scope evidence-first
 - reduce long-running exports caused by proxy-based decisions that keep expensive routes alive after terminal evidence already exists
 
+## Current Main Panel
+
+This file is now the primary execution panel for the evidence-first exporter pass.
+
+The turn-level contract is:
+
+1. remove remaining correctness-impacting proxy decisions
+2. extend simulator coverage for the removed proxy families
+3. run simulator/regression checks
+4. run a full live export on group `922065597`
+5. only call the turn complete when `actionable_missing=0` and benchmark has not materially regressed
+
+## Current Audit Snapshot
+
+The latest strict audit found the remaining non-evidence decisions concentrated in four areas:
+
+- `media_downloader.py`
+  - month-bucket old-context skip
+  - resolver-string-driven shared missing cache
+  - timeout/breaker scopes that still mix retry suppression with terminal classification
+  - topology/shape-first route ordering on some forward `video/file/speech` paths
+- `media_bundle.py`
+  - second-pass retry gating still partially keyed by asset family/result label instead of retry evidence
+  - recent identity reuse was too weak/image-specific
+- `provider.py`
+  - source-based skip of parse-mult hydration
+  - global “three strikes” disablement for forward/history enrichment
+  - single-message fallback without positive identity proof
+- `asset_simulator.py`
+  - missing first-class matrices for targeted forward metadata payloads
+  - missing multi-step slow-success / useless-success forward-expense coverage
+
+## [2026-03-23] Completed In This Pass
+
+- `media_bundle.py`
+  - second-pass public retry gating is now evidence-first rather than image/result-label gated
+  - recent identity reuse is no longer image-only and now keys off:
+    - public token
+    - direct `file_id`
+    - normalized `remote_url`
+    - `md5 + preferred_name`
+- `provider.py`
+  - removed source-based skip of parse-mult hydration for fast-history snapshots
+  - removed global “three strikes” disablement for forward/history enrichment
+  - removed blind single-message fallback without positive identity proof
+- full live export validation on group `922065597`
+  - `records=12593`
+  - `elapsed=111.664s`
+  - `history_source=napcat_fast_history_bulk`
+  - `actionable_missing=0`
+  - `background_missing=1207`
+  - `final_missing_reason=[qq_expired_after_napcat:1204, qq_not_downloaded_local_placeholder:3]`
+
+## Remaining Non-Evidence Decisions After This Pass
+
+The main remaining non-evidence control-flow is now concentrated in downloader route planning and pool shaping:
+
+- placeholder classification still partly uses path-shape proxy before enough authoritative failure proof is assembled
+- timeout/breaker/cache scope still carries legacy bucket-style memory in some code paths
+- forward route ordering still uses topology/shape hints more than explicit recoverability proof on some branches
+- prefetch pool/batch shaping still keys mainly off request volume rather than actionable unresolved composition
+
+## Exit Criteria
+
+- evidence-first matrices green
+- no new simulator mismatch or cost overrun
+- release-focused regression green
+- full live export on group `922065597` completes with:
+  - `actionable_missing=0`
+  - stable `history_source`
+  - no material benchmark regression vs current baseline
+
 ## Track 1. Evidence-First Terminal Classification
 
 Current direction already landed:
@@ -192,3 +264,5 @@ To support the tracks above, extend simulator coverage with:
 3. `topology_equivalence_matrix`
 4. `prefetch_actionable_work_matrix`
 5. `forward_match_recoverability_matrix`
+6. `provider_identity_and_reason_scope`
+7. `full_live_export_validation_922065597`

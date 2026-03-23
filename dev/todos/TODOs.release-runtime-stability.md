@@ -557,6 +557,18 @@ Recent field failures showed that the project has two separate but related stabi
   - still missing from simulator:
     - `file=<token>` vs `file_id=<token>` compatibility branches
     - mixed blank payload vs remote URL vs local path return shapes under the same token family
+- [x] Ship evidence-first provider / bundle hardening as one release bundle and verify it does not reintroduce actionable missing
+  - bundle scope:
+    - `src/qq_data_integrations/napcat/provider.py`
+    - `src/qq_data_core/media_bundle.py`
+    - simulator / boundary / reuse tests
+    - `dev/todos/TODOs.evidence-first-exporter.md`
+  - current maintainer full export validation:
+    - `export-history group 922065597 --limit 20000 --format jsonl`
+    - `records=12593`
+    - `actionable_missing=0`
+    - `background_missing=1207`
+    - `history_source=napcat_fast_history_bulk`
 
 ## Related Files
 
