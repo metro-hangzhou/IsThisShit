@@ -53,3 +53,12 @@ def test_refresh_message_area_for_resize_rewraps_and_restores_manual_scroll() ->
     assert view._scroll_top == 7
     view._clamp_scroll_top.assert_called_once_with()
     view._sync_cursor_to_view.assert_called_once_with()
+
+
+def test_before_render_refreshes_message_area_for_resize() -> None:
+    view = object.__new__(WatchConversationView)
+    view._refresh_message_area_for_resize = Mock()
+
+    WatchConversationView._before_render(view, Mock())
+
+    view._refresh_message_area_for_resize.assert_called_once_with()
