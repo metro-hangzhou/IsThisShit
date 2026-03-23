@@ -180,6 +180,14 @@ def test_asset_resolution_matrix_includes_core_failure_and_remote_recovery_paths
     assert results["nested_forward_sticker_relative_http_remote_recovery"].actual_path_kind == "remote"
     assert results["forward_sticker_missing_peer_uid_live_http"].actual_resolver == "sticker_remote_download"
     assert results["forward_sticker_missing_peer_uid_live_http"].actual_path_kind == "remote"
+    assert results["exhaustive_forward_image_recent_none_dead_remote_metadata_timeout_materialize_empty"].actual_resolver == "qq_expired_after_napcat"
+    assert results["exhaustive_forward_image_recent_none_dead_remote_metadata_timeout_materialize_empty"].actual_path_kind == "missing"
+    assert results["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_empty"].actual_resolver == "qq_expired_after_napcat"
+    assert results["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_empty"].actual_path_kind == "missing"
+    assert results["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_resolver == "qq_expired_after_napcat"
+    assert results["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_path_kind == "missing"
+    assert results["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"].actual_resolver == "napcat_forward_remote_url"
+    assert results["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"].actual_path_kind == "remote"
 
 
 def test_asset_resolution_case_reports_known_bad_video_token() -> None:
@@ -217,6 +225,7 @@ def test_asset_resolution_scenario_catalog_is_systematic() -> None:
     assert any(item.suite == "public_token_shape_drift" for item in scenarios)
     assert any(item.suite == "exhaustive_old_forward_payload_file_id" for item in scenarios)
     assert any(item.suite == "exhaustive_old_public_zero_byte" for item in scenarios)
+    assert any(item.suite == "exhaustive_forward_image_terminal" for item in scenarios)
     assert any(item.suite == "terminal_evidence_age_invariance" for item in scenarios)
     assert any("public_not_found" in item.name for item in scenarios)
     assert any("direct_not_found" in item.name for item in scenarios)
@@ -231,6 +240,7 @@ def test_asset_resolution_summary_reports_no_mismatches_and_catalog_shape() -> N
     assert summary["mismatched"] == 0
     assert summary["cost_overruns"] == 0
     assert summary["suite_counts"]["route_health"] > 0
+    assert summary["suite_counts"]["exhaustive_forward_image_terminal"] == 60
     assert summary["asset_type_counts"]["video"] > 0
     assert summary["topology_counts"]["nested_forward"] > 0
     assert summary["age_bucket_counts"]["old_forward"] > 0
@@ -248,6 +258,7 @@ def test_asset_resolution_catalog_reports_state_coverage() -> None:
 
     assert summary["total"] >= 450
     assert summary["suite_counts"]["public_token_shape_drift"] == 36
+    assert summary["suite_counts"]["exhaustive_forward_image_terminal"] == 60
     assert summary["state_field_counts"]["hint_remote_state"]["live_http"] > 0
     assert summary["state_field_counts"]["public_fallback_result_state"]["valid_remote_only"] > 0
     assert summary["state_field_counts"]["forward_parent_state"]["missing_peer_uid"] > 0
@@ -268,7 +279,7 @@ def test_terminal_evidence_age_invariance_suite_matches_recent_and_old_results()
 
     for stem in (
         "forward_image_dead_remote_public_timeout",
-        "forward_image_no_payload_unresolved",
+        "forward_image_no_payload_terminal",
         "forward_video_blank_public_payload",
         "forward_video_direct_not_found",
         "forward_speech_blank_public_payload",
@@ -442,6 +453,22 @@ def test_asset_resolution_old_public_zero_byte_suite_matches_expectations() -> N
     assert all(item.actual_path_kind == "missing" for item in results)
 
 
+def test_asset_resolution_exhaustive_forward_image_terminal_suite_matches_expectations() -> None:
+    results = run_asset_resolution_matrix(suite="exhaustive_forward_image_terminal")
+    by_name = {item.name: item for item in results}
+
+    assert len(results) == 60
+    assert all(item.matched for item in results)
+    assert by_name["exhaustive_forward_image_recent_none_dead_remote_metadata_timeout_materialize_empty"].actual_resolver == "qq_expired_after_napcat"
+    assert by_name["exhaustive_forward_image_recent_none_dead_remote_metadata_timeout_materialize_empty"].actual_path_kind == "missing"
+    assert by_name["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_error"].actual_resolver == "qq_expired_after_napcat"
+    assert by_name["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_error"].actual_path_kind == "missing"
+    assert by_name["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_resolver == "qq_expired_after_napcat"
+    assert by_name["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_path_kind == "missing"
+    assert by_name["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"].actual_resolver == "napcat_forward_remote_url"
+    assert by_name["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"].actual_path_kind == "remote"
+
+
 def test_asset_resolution_sequence_reuses_old_forward_timeout_classification() -> None:
     scenario = {
         item.name: item
@@ -520,3 +547,19 @@ def test_asset_resolution_sequence_reuses_payload_only_direct_file_id_fast_fail(
     assert result.client_call_count == 1
     assert result.fast_call_count == 1
     assert result.remote_attempt_count == 0
+
+
+def test_asset_resolution_sequence_reuses_forward_image_dead_remote_terminal_classification() -> None:
+    scenario = {
+        item.name: item
+        for item in all_asset_resolution_scenarios()
+    }["exhaustive_forward_image_recent_none_dead_remote_metadata_timeout_materialize_empty"]
+
+    result = run_asset_resolution_sequence(scenario, repeats=3)
+
+    assert result.matched is True
+    assert result.actual_resolver == "qq_expired_after_napcat"
+    assert result.actual_path_kind == "missing"
+    assert result.client_call_count == 0
+    assert result.fast_call_count == 1
+    assert result.remote_attempt_count == 1

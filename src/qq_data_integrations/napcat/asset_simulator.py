@@ -1607,6 +1607,73 @@ def default_asset_resolution_pair_cases() -> list[AssetResolutionPairCase]:
         )
     )
 
+    shared_forward_image_terminal_name = "pair_forward_image_terminal_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="forward_image_terminal_then_top_level_public_remote",
+            first=AssetResolutionScenario(
+                name=shared_forward_image_terminal_name,
+                suite="pair_sequence",
+                asset_type="image",
+                topology="forward",
+                age_days=20,
+                hint_remote_state="stale_http",
+                forward_metadata_state="timeout",
+                forward_materialize_state="empty",
+                expected_resolver="qq_expired_after_napcat",
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=2,
+                max_remote_attempts=1,
+                notes="Forward image should classify terminally only after metadata timeout is followed by materialize-empty proof.",
+            ),
+            second=replace(
+                scenarios["top_level_image_public_token_remote"],
+                name=shared_forward_image_terminal_name,
+                age_days=20,
+            ),
+            expected_second_resolver="napcat_public_token_get_image_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=3,
+            max_remote_attempts=2,
+            notes="A prior terminal forward-image miss must not poison later top-level public-token recovery under the same logical identity.",
+        )
+    )
+
+    shared_forward_image_unresolved_name = "pair_forward_image_unresolved_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="forward_image_unresolved_then_top_level_public_remote",
+            first=AssetResolutionScenario(
+                name=shared_forward_image_unresolved_name,
+                suite="pair_sequence",
+                asset_type="image",
+                topology="forward",
+                age_days=20,
+                hint_remote_state="stale_http",
+                forward_metadata_state="timeout",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=2,
+                max_remote_attempts=1,
+                notes="Dead remote plus metadata timeout alone is not terminal proof for forward image.",
+            ),
+            second=replace(
+                scenarios["top_level_image_public_token_remote"],
+                name=shared_forward_image_unresolved_name,
+                age_days=20,
+            ),
+            expected_second_resolver="napcat_public_token_get_image_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=3,
+            max_remote_attempts=2,
+            notes="An unresolved forward-image miss must not poison later top-level public-token recovery under the same logical identity.",
+        )
+    )
+
     return cases
 
 
@@ -2983,16 +3050,17 @@ def default_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
             max_remote_attempts=1,
         ),
         AssetResolutionScenario(
-            name="forward_old_image_unresolved_without_payload",
+            name="forward_old_image_terminal_without_payload",
             asset_type="image",
             suite="classification_fast_fail",
             topology="forward",
             age_days=240,
-            expected_resolver=None,
+            expected_resolver="qq_expired_after_napcat",
             expected_path_kind="missing",
             max_client_calls=0,
-            max_fast_calls=1,
+            max_fast_calls=2,
             max_remote_attempts=0,
+            notes="A forward image that yields no metadata payload and no targeted materialize payload has exhausted its route evidence and should classify terminally.",
         ),
         AssetResolutionScenario(
             name="forward_recent_video_public_token_local",
@@ -3382,17 +3450,17 @@ def _terminal_evidence_age_invariance_scenarios() -> list[AssetResolutionScenari
                     notes="Dead remote URL plus failed public token should classify terminally regardless of age.",
                 ),
                 AssetResolutionScenario(
-                    name=f"forward_image_no_payload_unresolved_{age_label}",
+                    name=f"forward_image_no_payload_terminal_{age_label}",
                     suite="terminal_evidence_age_invariance",
                     asset_type="image",
                     topology="forward",
                     age_days=age_days,
-                    expected_resolver=None,
+                    expected_resolver="qq_expired_after_napcat",
                     expected_path_kind="missing",
                     max_client_calls=0,
-                    max_fast_calls=1,
+                    max_fast_calls=2,
                     max_remote_attempts=0,
-                    notes="No terminal evidence should stay unresolved regardless of age.",
+                    notes="When both metadata and targeted materialize return no payload, forward image should classify terminally regardless of age.",
                 ),
                 AssetResolutionScenario(
                     name=f"forward_video_blank_public_payload_{age_label}",
@@ -3765,6 +3833,143 @@ def _exhaustive_old_public_zero_byte_scenarios() -> list[AssetResolutionScenario
                 else:
                     scenario_kwargs["forward_payload_state"] = "public_token"
                 scenarios.append(AssetResolutionScenario(**scenario_kwargs))
+    return scenarios
+
+
+def _exhaustive_forward_image_terminal_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    terminal_signal_specs: tuple[tuple[str, dict[str, Any]], ...] = (
+        (
+            "metadata_empty_materialize_empty",
+            {
+                "forward_metadata_state": "empty",
+                "forward_materialize_state": "empty",
+                "max_client_calls": 0,
+                "max_fast_calls": 2,
+                "max_remote_attempts": 1,
+            },
+        ),
+        (
+            "metadata_error_materialize_error",
+            {
+                "forward_metadata_state": "error",
+                "forward_materialize_state": "error",
+                "max_client_calls": 0,
+                "max_fast_calls": 2,
+                "max_remote_attempts": 1,
+            },
+        ),
+        (
+            "metadata_unavailable_terminal",
+            {
+                "forward_metadata_state": "unavailable",
+                "forward_materialize_state": "unavailable",
+                "max_client_calls": 0,
+                "max_fast_calls": 1,
+                "max_remote_attempts": 1,
+            },
+        ),
+        (
+            "metadata_timeout_materialize_empty",
+            {
+                "forward_metadata_state": "timeout",
+                "forward_materialize_state": "empty",
+                "max_client_calls": 0,
+                "max_fast_calls": 1,
+                "max_remote_attempts": 1,
+            },
+        ),
+        (
+            "metadata_timeout_materialize_error",
+            {
+                "forward_metadata_state": "timeout",
+                "forward_materialize_state": "error",
+                "max_client_calls": 0,
+                "max_fast_calls": 1,
+                "max_remote_attempts": 1,
+            },
+        ),
+        (
+            "metadata_timeout_materialize_unavailable",
+            {
+                "forward_metadata_state": "timeout",
+                "forward_materialize_state": "unavailable",
+                "max_client_calls": 0,
+                "max_fast_calls": 1,
+                "max_remote_attempts": 1,
+            },
+        ),
+    )
+    for topology in ("forward", "nested_forward"):
+        for age_label, age_days in (("recent", 7), ("old", 260)):
+            for source_state in ("none", "stale_missing"):
+                for signal_name, spec in terminal_signal_specs:
+                    scenarios.append(
+                        AssetResolutionScenario(
+                            name=f"exhaustive_{topology}_image_{age_label}_{source_state}_dead_remote_{signal_name}",
+                            suite="exhaustive_forward_image_terminal",
+                            asset_type="image",
+                            topology=topology,
+                            age_days=age_days,
+                            source_path_state=source_state,
+                            hint_remote_state="stale_http",
+                            expected_resolver="qq_expired_after_napcat",
+                            expected_path_kind="missing",
+                            notes=(
+                                "Dead forward remote URL plus terminal forward metadata evidence, "
+                                "with no public-token handle, must classify as expired without age gating."
+                            ),
+                            **spec,
+                        )
+                    )
+            for signal_name, signal_state, signal_kwargs in (
+                ("metadata_timeout_terminal", "timeout", {"max_fast_calls": 2}),
+                ("metadata_unavailable_terminal", "unavailable", {"max_fast_calls": 2}),
+            ):
+                scenarios.append(
+                    AssetResolutionScenario(
+                        name=f"exhaustive_{topology}_image_{age_label}_no_remote_{signal_name}",
+                        suite="exhaustive_forward_image_terminal",
+                        asset_type="image",
+                        topology=topology,
+                        age_days=age_days,
+                        source_path_state="none",
+                        forward_metadata_state=signal_state,
+                        expected_resolver="qq_expired_after_napcat",
+                        expected_path_kind="missing",
+                        max_client_calls=0,
+                        max_remote_attempts=0,
+                        notes=(
+                            "With no local path, no public-token handle, and metadata failure followed by "
+                            "targeted-materialize empty fallback, forward image should classify terminally."
+                        ),
+                        **signal_kwargs,
+                    )
+                )
+        for remote_state, signal_state in (
+            ("live_http", "timeout"),
+            ("relative_http", "unavailable"),
+        ):
+            scenarios.append(
+                AssetResolutionScenario(
+                    name=f"exhaustive_{topology}_image_{remote_state}_{signal_state}_remote_wins",
+                    suite="exhaustive_forward_image_terminal",
+                    asset_type="image",
+                    topology=topology,
+                    age_days=20,
+                    source_path_state="none",
+                    hint_remote_state=remote_state,
+                    forward_metadata_state=signal_state,
+                    expected_resolver="napcat_forward_remote_url",
+                    expected_path_kind="remote",
+                    max_client_calls=0,
+                    max_fast_calls=0,
+                    max_remote_attempts=1,
+                    notes=(
+                        "Live forward remote URL remains stronger evidence than a metadata timeout/unavailable signal."
+                    ),
+                )
+            )
     return scenarios
 
 
@@ -4143,6 +4348,7 @@ def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
     scenarios.extend(_exhaustive_public_token_shape_drift_scenarios())
     scenarios.extend(_exhaustive_old_forward_payload_file_id_scenarios())
     scenarios.extend(_exhaustive_old_public_zero_byte_scenarios())
+    scenarios.extend(_exhaustive_forward_image_terminal_scenarios())
 
     return scenarios
 

@@ -818,23 +818,13 @@ class NapCatMediaDownloader:
         if self._has_forward_parent_hint(hint):
             forward_payload = self._prefetched_forward_media_payloads.get(key)
             if isinstance(forward_payload, dict):
-                prefetched_forward_url = self._resolve_from_forward_remote_url(
-                    forward_payload,
-                    request=request,
+                resolved_from_forward_payload = self._resolve_from_forward_payload_candidate(
+                    request,
+                    payload=forward_payload,
                     trace_callback=trace_callback,
                 )
-                if prefetched_forward_url != (None, None):
-                    return self._remember_shared_outcome(shared_key, request, prefetched_forward_url)
-                public_resolved = self._resolve_from_public_token(
-                    forward_payload,
-                    request=request,
-                    trace_callback=trace_callback,
-                )
-                if public_resolved not in {None, (None, None)}:
-                    return self._remember_shared_outcome(shared_key, request, public_resolved)
-                fast_resolved = self._resolve_from_fast_payload(forward_payload)
-                if fast_resolved != (None, None):
-                    return self._remember_shared_outcome(shared_key, request, fast_resolved)
+                if resolved_from_forward_payload not in {None, (None, None)}:
+                    return self._remember_shared_outcome(shared_key, request, resolved_from_forward_payload)
                 classified_old_forward_missing = self._classify_old_forward_expensive_missing(
                     request,
                     payload=forward_payload,
@@ -868,32 +858,64 @@ class NapCatMediaDownloader:
                             classification=classified_forward_missing,
                         )
                         return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
-            passive_forward_resolved = self._download_via_forward_context(
+            targeted_before_metadata = asset_type == "image" and self._should_prefer_targeted_forward_image_materialize_before_metadata(
                 request,
-                materialize=False,
-                trace_callback=trace_callback,
+                payload=forward_payload if isinstance(forward_payload, dict) else None,
             )
-            if passive_forward_resolved not in {None, (None, None)}:
-                return self._remember_shared_outcome(shared_key, request, passive_forward_resolved)
-            forward_payload = self._prefetched_forward_media_payloads.get(key)
-            if isinstance(forward_payload, dict):
-                forward_remote_url = self._resolve_from_forward_remote_url(
-                    forward_payload,
-                    request=request,
+            if targeted_before_metadata:
+                targeted_forward_download = self._download_via_forward_context(
+                    request,
+                    materialize=True,
                     trace_callback=trace_callback,
                 )
-                if forward_remote_url != (None, None):
-                    return self._remember_shared_outcome(shared_key, request, forward_remote_url)
-                public_resolved = self._resolve_from_public_token(
-                    forward_payload,
-                    request=request,
+                if targeted_forward_download not in {None, (None, None)}:
+                    return self._remember_shared_outcome(shared_key, request, targeted_forward_download)
+                forward_payload = self._prefetched_forward_media_payloads.get(key)
+                if isinstance(forward_payload, dict):
+                    resolved_from_forward_payload = self._resolve_from_forward_payload_candidate(
+                        request,
+                        payload=forward_payload,
+                        trace_callback=trace_callback,
+                    )
+                    if resolved_from_forward_payload not in {None, (None, None)}:
+                        return self._remember_shared_outcome(shared_key, request, resolved_from_forward_payload)
+            else:
+                passive_forward_resolved = self._download_via_forward_context(
+                    request,
+                    materialize=False,
                     trace_callback=trace_callback,
                 )
-                if public_resolved not in {None, (None, None)}:
-                    return self._remember_shared_outcome(shared_key, request, public_resolved)
-                fast_resolved = self._resolve_from_fast_payload(forward_payload)
-                if fast_resolved != (None, None):
-                    return self._remember_shared_outcome(shared_key, request, fast_resolved)
+                if passive_forward_resolved not in {None, (None, None)}:
+                    return self._remember_shared_outcome(shared_key, request, passive_forward_resolved)
+                forward_payload = self._prefetched_forward_media_payloads.get(key)
+                if isinstance(forward_payload, dict):
+                    resolved_from_forward_payload = self._resolve_from_forward_payload_candidate(
+                        request,
+                        payload=forward_payload,
+                        trace_callback=trace_callback,
+                    )
+                    if resolved_from_forward_payload not in {None, (None, None)}:
+                        return self._remember_shared_outcome(shared_key, request, resolved_from_forward_payload)
+                if asset_type == "image" and self._should_attempt_targeted_forward_image_materialize(
+                    request,
+                    payload=forward_payload if isinstance(forward_payload, dict) else None,
+                ):
+                    targeted_forward_download = self._download_via_forward_context(
+                        request,
+                        materialize=True,
+                        trace_callback=trace_callback,
+                    )
+                    if targeted_forward_download not in {None, (None, None)}:
+                        return self._remember_shared_outcome(shared_key, request, targeted_forward_download)
+                    forward_payload = self._prefetched_forward_media_payloads.get(key)
+                    if isinstance(forward_payload, dict):
+                        resolved_from_forward_payload = self._resolve_from_forward_payload_candidate(
+                            request,
+                            payload=forward_payload,
+                            trace_callback=trace_callback,
+                        )
+                        if resolved_from_forward_payload not in {None, (None, None)}:
+                            return self._remember_shared_outcome(shared_key, request, resolved_from_forward_payload)
             classified_old_forward_missing = self._classify_old_forward_expensive_missing(
                 request,
                 payload=forward_payload if isinstance(forward_payload, dict) else None,
@@ -1143,6 +1165,7 @@ class NapCatMediaDownloader:
         status: str | None = None,
         elapsed_s: float | None = None,
         detail: str | None = None,
+        extra_fields: dict[str, Any] | None = None,
     ) -> None:
         if trace_callback is None:
             return
@@ -1162,6 +1185,7 @@ class NapCatMediaDownloader:
             "forward_parent_message_id_raw": forward_parent.get("message_id_raw"),
             "forward_parent_element_id": forward_parent.get("element_id"),
         }
+        payload.update(self._asset_trace_context(request))
         if timeout_s is not None:
             payload["timeout_s"] = timeout_s
             payload["timeout_ms"] = int(round(timeout_s * 1000))
@@ -1172,6 +1196,11 @@ class NapCatMediaDownloader:
             payload["elapsed_ms"] = int(round(elapsed_s * 1000))
         if detail:
             payload["detail"] = detail
+        if isinstance(extra_fields, dict):
+            for key, value in extra_fields.items():
+                if value is None or value == "" or value == [] or value == {}:
+                    continue
+                payload[key] = value
         trace_callback(payload)
 
     def _emit_missing_classification_trace(
@@ -1201,6 +1230,7 @@ class NapCatMediaDownloader:
         timeout_s: float | None = None,
         elapsed_s: float | None = None,
         detail: str | None = None,
+        extra_fields: dict[str, Any] | None = None,
     ) -> None:
         self._note_remote_substep_progress(substep=substep, status=status)
         asset_type = str(request.get("asset_type") or "").strip()
@@ -1223,14 +1253,88 @@ class NapCatMediaDownloader:
             fields.append(f"element_id={hint.get('element_id')}")
         if forward_parent.get("message_id_raw"):
             fields.append(f"forward_parent_message_id_raw={forward_parent.get('message_id_raw')}")
+        for key, value in self._asset_trace_context(request).items():
+            if value is None or value == "" or value == [] or value == {}:
+                continue
+            fields.append(f"{key}={value}")
         if detail:
             fields.append(f"detail={detail}")
+        if isinstance(extra_fields, dict):
+            for key, value in extra_fields.items():
+                if value is None or value == "" or value == [] or value == {}:
+                    continue
+                fields.append(f"{key}={value}")
         message = "media_resolution_substep " + " ".join(fields)
         if status == "timeout":
             self._logger.warning(message)
             return
         if elapsed_s is not None and elapsed_s >= self.SLOW_REMOTE_SUBSTEP_WARN_S:
             self._logger.info(message)
+
+    def _asset_trace_context(self, request: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(request, dict):
+            return {}
+        hint = self._request_hint(request)
+        payload: dict[str, Any] = {}
+        raw_timestamp = request.get("timestamp_ms")
+        if isinstance(raw_timestamp, (int, float)):
+            payload["timestamp_ms"] = int(raw_timestamp)
+            try:
+                payload["timestamp_iso"] = datetime.fromtimestamp(
+                    float(raw_timestamp) / 1000.0,
+                    tz=timezone.utc,
+                ).astimezone(timezone(timedelta(hours=8))).isoformat()
+            except (OverflowError, OSError, ValueError):
+                pass
+        md5 = str(request.get("md5") or "").strip().lower()
+        if md5:
+            payload["md5"] = md5
+        source_path = str(request.get("source_path") or "").strip()
+        if source_path:
+            payload["source_path"] = source_path
+            payload["source_path_kind"] = self._asset_location_kind(source_path)
+        hint_url = str(hint.get("remote_url") or hint.get("url") or "").strip()
+        if hint_url:
+            payload["hint_url_kind"] = self._asset_location_kind(hint_url)
+            payload["hint_url_host"] = self._asset_location_host(hint_url)
+        return payload
+
+    def _asset_location_kind(self, value: object) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        resolved_url = self._resolve_remote_url(text)
+        if resolved_url:
+            parsed = urlparse(resolved_url)
+            host = parsed.netloc.lower()
+            if host in {"127.0.0.1:3000", "localhost:3000", "127.0.0.1:6099", "localhost:6099"}:
+                return "napcat_local_download"
+            if host.endswith("multimedia.nt.qq.com.cn"):
+                return "qq_multimedia"
+            return f"{parsed.scheme.lower()}_url"
+        if self._looks_like_zero_byte_local_media_path(text):
+            return "zero_byte_local"
+        if self._looks_like_stale_local_media_path(text):
+            return "stale_local"
+        path = Path(text)
+        if path.exists() and path.is_file():
+            try:
+                if path.stat().st_size > 0:
+                    return "local_file"
+            except OSError:
+                return "local_path"
+            return "zero_byte_local"
+        return "missing_local"
+
+    @staticmethod
+    def _asset_location_host(value: object) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        parsed = urlparse(text)
+        if parsed.scheme and parsed.netloc:
+            return parsed.netloc.lower()
+        return None
 
     def _note_remote_substep_progress(
         self,
@@ -2907,6 +3011,11 @@ class NapCatMediaDownloader:
         substep = "forward_remote_url"
         cached_resolution = self._consume_remote_media_prefetch(cache_key)
         if cached_resolution is not ...:
+            extra_fields = {
+                "attempt_url": resolved_remote_url,
+                "attempt_url_kind": self._asset_location_kind(resolved_remote_url),
+                "attempt_url_host": self._asset_location_host(resolved_remote_url),
+            }
             if request is not None:
                 self._emit_asset_substep_trace(
                     trace_callback,
@@ -2916,6 +3025,7 @@ class NapCatMediaDownloader:
                     timeout_s=self.REMOTE_MEDIA_FETCH_TIMEOUT_S,
                     status="cached_ok" if cached_resolution else "cached_error",
                     detail=resolved_remote_url,
+                    extra_fields=extra_fields,
                 )
             if cached_resolution:
                 path = Path(cached_resolution)
@@ -2924,6 +3034,11 @@ class NapCatMediaDownloader:
                 self._drop_remote_prefetch_result(cache_key)
             return None, None
         if request is not None:
+            extra_fields = {
+                "attempt_url": resolved_remote_url,
+                "attempt_url_kind": self._asset_location_kind(resolved_remote_url),
+                "attempt_url_host": self._asset_location_host(resolved_remote_url),
+            }
             self._emit_asset_substep_trace(
                 trace_callback,
                 request,
@@ -2931,6 +3046,7 @@ class NapCatMediaDownloader:
                 substep=substep,
                 timeout_s=self.REMOTE_MEDIA_FETCH_TIMEOUT_S,
                 detail=resolved_remote_url,
+                extra_fields=extra_fields,
             )
         started = monotonic()
         resolved = self._download_remote_media(
@@ -2941,7 +3057,19 @@ class NapCatMediaDownloader:
         elapsed_s = monotonic() - started
         self._store_remote_prefetch_result(cache_key, resolved)
         self._record_prefetch_feedback("remote_ok" if resolved is not None else "remote_error")
+        resolved_size_bytes: int | None = None
+        if resolved is not None:
+            try:
+                resolved_size_bytes = Path(resolved).stat().st_size
+            except OSError:
+                resolved_size_bytes = None
         if request is not None:
+            extra_fields = {
+                "attempt_url": resolved_remote_url,
+                "attempt_url_kind": self._asset_location_kind(resolved_remote_url),
+                "attempt_url_host": self._asset_location_host(resolved_remote_url),
+                "resolved_size_bytes": resolved_size_bytes,
+            }
             self._emit_asset_substep_trace(
                 trace_callback,
                 request,
@@ -2951,6 +3079,7 @@ class NapCatMediaDownloader:
                 status="ok" if resolved is not None else "error",
                 elapsed_s=elapsed_s,
                 detail=resolved_remote_url,
+                extra_fields=extra_fields,
             )
             self._log_remote_substep_outcome(
                 request=request,
@@ -2959,6 +3088,7 @@ class NapCatMediaDownloader:
                 timeout_s=self.REMOTE_MEDIA_FETCH_TIMEOUT_S,
                 elapsed_s=elapsed_s,
                 detail=resolved_remote_url,
+                extra_fields=extra_fields,
             )
         if resolved is None:
             return None, None
@@ -4434,7 +4564,10 @@ class NapCatMediaDownloader:
         if not self._has_forward_parent_hint(hint):
             return None
         source_path = str(request.get("source_path") or "").strip()
-        if source_path:
+        if source_path and not (
+            self._looks_like_stale_local_media_path(source_path)
+            or self._looks_like_zero_byte_local_media_path(source_path)
+        ):
             return None
         local_placeholder_missing = self._classify_image_local_placeholder_missing(request)
         if local_placeholder_missing is not None:
@@ -4467,6 +4600,10 @@ class NapCatMediaDownloader:
             action="get_image",
             payload=payload,
         )
+        has_public_recovery_handle = self._has_forward_image_public_recovery_handle(
+            request,
+            payload=payload,
+        )
         local_broken = self._has_stale_forward_local_media_hint(
             request,
             payload=payload,
@@ -4474,21 +4611,144 @@ class NapCatMediaDownloader:
             request,
             payload=payload,
         )
-        forward_terminal = (
-            self._forward_context_empty(request, materialize=False)
-            or self._forward_context_error(request, materialize=False)
-            or self._forward_context_empty(request, materialize=True)
-            or self._forward_context_error(request, materialize=True)
-            or self._forward_context_unavailable(request, materialize=False)
-            or self._forward_context_unavailable(request, materialize=True)
+        metadata_terminal = self._has_terminal_forward_image_route_signal(
+            request,
+            materialize=False,
+        )
+        materialize_terminal = self._has_terminal_forward_image_route_signal(
+            request,
+            materialize=True,
         )
         if remote_failed and public_failed:
             return True
         if public_failed and local_broken:
             return True
-        if public_failed and forward_terminal:
+        if public_failed and (metadata_terminal or materialize_terminal):
+            return True
+        if not has_public_recovery_handle and materialize_terminal:
             return True
         return False
+
+    def _has_forward_image_public_recovery_handle(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        if str(request.get("asset_type") or "").strip().lower() != "image":
+            return False
+        hint = self._request_hint(request)
+        if not self._has_forward_parent_hint(hint):
+            return False
+        token = str(
+            (payload or {}).get("public_file_token") if isinstance(payload, dict) else ""
+        ).strip()
+        if token:
+            return True
+        return bool(
+            str(
+                request.get("public_file_token")
+                or hint.get("public_file_token")
+                or hint.get("file_id")
+                or ""
+            ).strip()
+        )
+
+    def _has_terminal_forward_image_route_signal(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        materialize: bool,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        if str(request.get("asset_type") or "").strip().lower() != "image":
+            return False
+        hint = self._request_hint(request)
+        if not self._has_forward_parent_hint(hint):
+            return False
+        return (
+            self._forward_context_empty(request, materialize=materialize)
+            or self._forward_context_error(request, materialize=materialize)
+            or self._forward_context_unavailable(request, materialize=materialize)
+        )
+
+    def _should_attempt_targeted_forward_image_materialize(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        if str(request.get("asset_type") or "").strip().lower() != "image":
+            return False
+        if not self._has_forward_parent_hint(self._request_hint(request)):
+            return False
+        if self._has_unexhausted_live_http_media_url(request, payload=payload):
+            return False
+        if self._has_forward_image_public_recovery_handle(request, payload=payload):
+            return False
+        if self._resolved_path_from_payload(payload if isinstance(payload, dict) else None) is not None:
+            return False
+        return (
+            self._forward_context_timed_out(request, materialize=False)
+            or self._forward_context_empty(request, materialize=False)
+            or self._forward_context_error(request, materialize=False)
+            or self._forward_context_unavailable(request, materialize=False)
+        )
+
+    def _should_prefer_targeted_forward_image_materialize_before_metadata(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        if str(request.get("asset_type") or "").strip().lower() != "image":
+            return False
+        if not self._has_forward_parent_hint(self._request_hint(request)):
+            return False
+        if not self._has_live_http_media_url(request, payload=payload):
+            return False
+        if not self._has_failed_forward_remote_url(request, payload=payload):
+            return False
+        if self._has_forward_image_public_recovery_handle(request, payload=payload):
+            return False
+        if self._resolved_path_from_payload(payload if isinstance(payload, dict) else None) is not None:
+            return False
+        return True
+
+    def _resolve_from_forward_payload_candidate(
+        self,
+        request: dict[str, Any],
+        *,
+        payload: dict[str, Any] | None,
+        trace_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[Path | None, str | None] | None:
+        if not isinstance(payload, dict):
+            return None
+        forward_remote_url = self._resolve_from_forward_remote_url(
+            payload,
+            request=request,
+            trace_callback=trace_callback,
+        )
+        if forward_remote_url != (None, None):
+            return forward_remote_url
+        public_resolved = self._resolve_from_public_token(
+            payload,
+            request=request,
+            trace_callback=trace_callback,
+        )
+        if public_resolved not in {None, (None, None)}:
+            return public_resolved
+        fast_resolved = self._resolve_from_fast_payload(payload)
+        if fast_resolved != (None, None):
+            return fast_resolved
+        return None
 
     def _has_failed_forward_remote_url(
         self,

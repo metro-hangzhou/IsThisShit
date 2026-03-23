@@ -366,6 +366,50 @@ class _OldForwardMaterializeOnlyTimeoutClient:
         return {"assets": []}
 
 
+class _ForwardImageMetadataTimeoutThenEmptyClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            return {"assets": []}
+        raise AssertionError("metadata should be skipped when a failed forward image URL already proves rehydration is required")
+
+
+class _ForwardImageMetadataTimeoutThenErrorClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            raise RuntimeError("materialize exploded")
+        raise AssertionError("metadata should be skipped when a failed forward image URL already proves rehydration is required")
+
+
+class _ForwardImageMetadataTimeoutThenSuccessClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            requested_file_name = str(kwargs.get("file_name") or "").strip()
+            return {
+                "targeted_mode": "single_target_download",
+                "assets": [
+                    {
+                        "asset_type": "image",
+                        "asset_role": "forward_media",
+                        "file_name": requested_file_name,
+                        "remote_url": f"http://127.0.0.1:3000/download?file={requested_file_name}",
+                    }
+                ],
+            }
+        raise AssertionError("metadata should be skipped when a failed forward image URL already proves rehydration is required")
+
+
 class _OldForwardEmptyClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -1411,6 +1455,139 @@ def test_classify_forward_missing_keeps_forward_image_without_terminal_evidence_
     classification = downloader._classify_forward_missing(request, payload=payload)
 
     assert classification is None
+
+
+def test_classify_forward_missing_keeps_forward_image_with_dead_remote_and_metadata_timeout_actionable_without_materialize_terminal_evidence() -> None:
+    fast_client = _OldForwardMaterializeOnlyTimeoutClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _mark_request_old(_build_forward_request("forward-dead-timeout.jpg"), days=7)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout&spec=0"
+    )
+    cache_key = (
+        "image",
+        downloader._normalized_match_url(
+            "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout&spec=0"
+        ),
+    )
+    downloader._remote_media_resolution_cache[cache_key] = None
+
+    assert downloader._download_via_forward_context(request, materialize=False) is None
+
+    classification = downloader._classify_forward_missing(request)
+
+    assert classification is None
+    assert len(fast_client.calls) == 1
+
+
+def test_classify_forward_missing_keeps_forward_image_with_dead_remote_but_no_terminal_route_signal_actionable() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _mark_request_old(_build_forward_request("forward-dead-no-route-proof.jpg"), days=7)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-no-route-proof&spec=0"
+    )
+    cache_key = (
+        "image",
+        downloader._normalized_match_url(
+            "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-no-route-proof&spec=0"
+        ),
+    )
+    downloader._remote_media_resolution_cache[cache_key] = None
+
+    classification = downloader._classify_forward_missing(request)
+
+    assert classification is None
+
+
+def test_classify_forward_missing_keeps_forward_image_without_remote_or_public_handle_actionable_even_after_metadata_timeout() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _mark_request_old(_build_forward_request("forward-timeout-no-remote.jpg"), days=7)
+
+    assert downloader._download_via_forward_context(request, materialize=False) is None
+
+    classification = downloader._classify_forward_missing(request)
+
+    assert classification is None
+    assert len(fast_client.calls) == 1
+
+
+def test_forward_image_metadata_timeout_then_materialize_empty_is_classified_as_expired() -> None:
+    fast_client = _ForwardImageMetadataTimeoutThenEmptyClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _mark_request_old(_build_forward_request("forward-timeout-empty.jpg"), days=7)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout-empty&spec=0"
+    )
+    cache_key = (
+        "image",
+        downloader._normalized_match_url(str(request["download_hint"]["url"])),
+    )
+    downloader._remote_media_resolution_cache[cache_key] = None
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert [bool(call.get("materialize")) for call in fast_client.calls] == [True]
+
+
+def test_forward_image_metadata_timeout_then_materialize_error_is_classified_as_expired() -> None:
+    fast_client = _ForwardImageMetadataTimeoutThenErrorClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _mark_request_old(_build_forward_request("forward-timeout-error.jpg"), days=7)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout-error&spec=0"
+    )
+    cache_key = (
+        "image",
+        downloader._normalized_match_url(str(request["download_hint"]["url"])),
+    )
+    downloader._remote_media_resolution_cache[cache_key] = None
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert [bool(call.get("materialize")) for call in fast_client.calls] == [True]
+
+
+def test_forward_image_metadata_timeout_then_targeted_materialize_can_recover() -> None:
+    fast_client = _ForwardImageMetadataTimeoutThenSuccessClient()
+    temp_root = _workspace_temp_dir()
+    downloader = _RemoteMediaDownloader(temp_root / "remote_cache")
+    downloader._fast_client = fast_client
+    request = _mark_request_old(_build_forward_request("forward-timeout-success.jpg"), days=7)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-timeout-success&spec=0"
+    )
+    cache_key = (
+        "image",
+        downloader._normalized_match_url(str(request["download_hint"]["url"])),
+    )
+    downloader._remote_media_resolution_cache[cache_key] = None
+
+    traces: list[dict[str, object]] = []
+    try:
+        resolved = downloader.resolve_for_export(request, trace_callback=traces.append)
+
+        assert resolved is not None
+        assert resolved[0] is not None
+        assert resolved[1] == "napcat_forward_remote_url"
+        assert [bool(call.get("materialize")) for call in fast_client.calls] == [True]
+
+        forward_remote_done = next(
+            payload
+            for payload in traces
+            if payload.get("phase") == "materialize_asset_substep"
+            and payload.get("substep") == "forward_remote_url"
+            and payload.get("stage") == "done"
+        )
+        assert forward_remote_done.get("timestamp_iso")
+        assert forward_remote_done.get("md5") is None
+        assert forward_remote_done.get("attempt_url_kind") == "napcat_local_download"
+        assert forward_remote_done.get("resolved_size_bytes") == len(b"fake-bytes")
+        assert forward_remote_done.get("hint_url_kind") == "qq_multimedia"
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def test_recent_forward_video_blank_public_payload_is_classified_as_expired_without_age_gate() -> None:
