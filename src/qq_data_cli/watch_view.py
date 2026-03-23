@@ -146,6 +146,13 @@ def _wrap_terminal_text(text: str, *, width: int) -> list[str]:
     return wrapped_lines or [""]
 
 
+def _watch_content_width(*, terminal_columns: int, reserve_scrollbar: bool) -> int:
+    width = max(20, int(terminal_columns))
+    if reserve_scrollbar:
+        width = max(4, width - 1)
+    return width
+
+
 class WatchConversationView:
     def __init__(
         self,
@@ -1166,7 +1173,11 @@ class WatchConversationView:
     def _get_timeline_text(self) -> str:
         if not self._entries:
             return "No messages yet."
-        return "\n".join(entry.text for entry in self._entries)
+        width = self._timeline_content_width()
+        wrapped: list[str] = []
+        for entry in self._entries:
+            wrapped.extend(_wrap_terminal_text(entry.text, width=width))
+        return "\n".join(wrapped)
 
     def _build_status_text(self) -> str:
         total = len(self._entries)
@@ -1181,6 +1192,12 @@ class WatchConversationView:
             return max(20, int(self._app.output.get_size().columns))
         except Exception:
             return 120
+
+    def _timeline_content_width(self) -> int:
+        return _watch_content_width(
+            terminal_columns=self._terminal_width(),
+            reserve_scrollbar=bool(self._message_area.scrollbar),
+        )
 
     def _wrap_lines(self, lines: list[str]) -> list[str]:
         width = self._terminal_width()
