@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from time import monotonic
 from typing import Any, Callable, Iterable, Literal
+from urllib.parse import urlparse
 
 import orjson
 
@@ -358,8 +359,7 @@ def materialize_snapshot_media(
             if (
                 media_resolution_mode == "napcat_only"
                 and media_download_manager is not None
-                and candidate.asset_type == "image"
-                and resolver in {"missing_after_napcat", "qq_expired_after_napcat"}
+                and _candidate_has_second_pass_public_retry_evidence(candidate)
                 and hasattr(media_download_manager, "resolve_via_public_token_route")
             ):
                 second_pass_candidates.append((asset, candidate))
@@ -582,7 +582,9 @@ def materialize_snapshot_media(
                 reused_count += 1
                 recovered_count += 1
                 continue
-            if asset.resolver != "missing_after_napcat":
+            if asset.status != "missing":
+                continue
+            if not _candidate_has_second_pass_public_retry_evidence(candidate):
                 continue
             request_payload = {
                 "asset_type": candidate.asset_type,
@@ -674,21 +676,59 @@ def _asset_resolution_cache_key(candidate: _AssetCandidate) -> tuple[Any, ...]:
 
 
 def _asset_recent_identity_key(candidate: _AssetCandidate) -> tuple[Any, ...] | None:
-    if candidate.asset_type != "image":
-        return None
+    hint = candidate.download_hint if isinstance(candidate.download_hint, dict) else {}
+    asset_type = _normalize_identity_string(candidate.asset_type)
     file_name = _normalize_identity_string(candidate.file_name)
     md5 = _normalize_identity_string(candidate.md5)
     source_leaf = ""
     if candidate.source_path:
         source_leaf = _normalize_identity_string(PureWindowsPath(candidate.source_path).name)
-    preferred_name = file_name or source_leaf
-    if not any([preferred_name, md5]):
-        return None
-    return (
-        candidate.asset_type,
-        preferred_name,
-        md5,
+    file_id = _normalize_identity_string(hint.get("file_id"))
+    public_token = _normalize_identity_string(hint.get("public_file_token"))
+    public_action = _normalize_identity_string(hint.get("public_action"))
+    remote_url = _normalize_identity_string(
+        _normalized_match_url(hint.get("remote_url") or hint.get("url"))
     )
+    if public_token and public_action:
+        return ("public_token", asset_type, public_action, public_token)
+    if file_id:
+        return ("file_id", asset_type, file_id)
+    if remote_url:
+        return ("remote_url", asset_type, remote_url)
+    preferred_name = file_name or source_leaf
+    if md5 and preferred_name:
+        return ("md5_named", asset_type, preferred_name, md5)
+    if asset_type == "image" and md5:
+        return ("image_md5_only", asset_type, md5)
+    return None
+
+
+def _candidate_has_second_pass_public_retry_evidence(candidate: _AssetCandidate) -> bool:
+    if candidate.asset_type not in {"image", "video", "file", "speech"}:
+        return False
+    hint = candidate.download_hint if isinstance(candidate.download_hint, dict) else {}
+    forward_parent = hint.get("_forward_parent") if isinstance(hint.get("_forward_parent"), dict) else {}
+    has_context_hint = any(
+        _normalize_identity_string(hint.get(key))
+        for key in ("message_id_raw", "element_id", "peer_uid", "chat_type_raw")
+    ) or any(
+        _normalize_identity_string(forward_parent.get(key))
+        for key in ("message_id_raw", "element_id", "peer_uid", "chat_type_raw")
+    )
+    if not has_context_hint:
+        return False
+    has_locator_evidence = any(
+        [
+            _normalize_identity_string(candidate.file_name),
+            _normalize_identity_string(candidate.md5),
+            _normalize_identity_string(candidate.source_path),
+            _normalize_identity_string(hint.get("file_id")),
+            _normalize_identity_string(hint.get("public_file_token")),
+            _normalize_identity_string(hint.get("public_action")),
+            _normalize_identity_string(_normalized_match_url(hint.get("remote_url") or hint.get("url"))),
+        ]
+    )
+    return has_locator_evidence
 
 
 def _record_forensic_incident(
@@ -780,6 +820,20 @@ def _normalize_identity_string(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip().lower()
+
+
+def _normalized_match_url(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return parsed._replace(
+            scheme=parsed.scheme.lower(),
+            netloc=parsed.netloc.lower(),
+            fragment="",
+        ).geturl()
+    return text.lower()
 
 
 def _emit_materialization_progress(

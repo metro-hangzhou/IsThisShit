@@ -90,7 +90,7 @@ def test_default_matrix_includes_video_and_speech_routes() -> None:
     assert any(item.age_days < 30 for item in results)
 
 
-def test_old_forward_timeout_budget_is_shorter_than_recent_for_same_route() -> None:
+def test_forward_timeout_budget_no_longer_changes_from_age_alone() -> None:
     recent = run_forward_timeout_simulation(
         route="public-token",
         asset_type="video",
@@ -108,8 +108,8 @@ def test_old_forward_timeout_budget_is_shorter_than_recent_for_same_route() -> N
         delay_s=0.0,
     )
 
-    assert old.timeout_budget_s < recent.timeout_budget_s
-    assert old.equivalent_live_timeout_s < recent.equivalent_live_timeout_s
+    assert old.timeout_budget_s == recent.timeout_budget_s
+    assert old.equivalent_live_timeout_s == recent.equivalent_live_timeout_s
 
 
 def test_forward_timeout_summary_reports_age_buckets_and_worst_case() -> None:
@@ -217,6 +217,7 @@ def test_asset_resolution_scenario_catalog_is_systematic() -> None:
     assert any(item.suite == "public_token_shape_drift" for item in scenarios)
     assert any(item.suite == "exhaustive_old_forward_payload_file_id" for item in scenarios)
     assert any(item.suite == "exhaustive_old_public_zero_byte" for item in scenarios)
+    assert any(item.suite == "terminal_evidence_age_invariance" for item in scenarios)
     assert any("public_not_found" in item.name for item in scenarios)
     assert any("direct_not_found" in item.name for item in scenarios)
     assert any(item.asset_type == "sticker" and item.topology == "nested_forward" for item in scenarios)
@@ -256,6 +257,26 @@ def test_asset_resolution_catalog_reports_state_coverage() -> None:
     assert summary["route_signal_flags"]["has_forward_parent"] > 0
     assert summary["shared_cache_risk_flags"]["old_forward_forward_video"] > 0
     assert summary["payload_shape_counts"]["forward_payload_state"]["public_token"] > 0
+
+
+def test_terminal_evidence_age_invariance_suite_matches_recent_and_old_results() -> None:
+    results = run_asset_resolution_matrix(suite="terminal_evidence_age_invariance")
+    by_name = {item.name: item for item in results}
+
+    assert len(results) == 22
+    assert all(item.matched for item in results)
+
+    for stem in (
+        "forward_image_dead_remote_public_timeout",
+        "forward_image_no_payload_unresolved",
+        "forward_video_blank_public_payload",
+        "forward_video_direct_not_found",
+        "forward_speech_blank_public_payload",
+    ):
+        recent = by_name[f"{stem}_recent"]
+        old = by_name[f"{stem}_old"]
+        assert recent.actual_resolver == old.actual_resolver
+        assert recent.actual_path_kind == old.actual_path_kind
 
 
 def test_prefetch_planning_matrix_reports_large_window_pressure_shapes() -> None:

@@ -1433,3 +1433,47 @@
   - simulator / matrix rerun：
     - `resolution-matrix`: `592/592 matched`
     - `shared-scope-matrix`: `48/48 matched`
+
+### [2026-03-23][048] evidence-first exporter pass 已把 provider / bundle 的剩余代理判据再往下压了一层，并在全量 live export 下保持 `actionable_missing=0`
+
+- 当前这轮严格审计把“除年龄以外的非证据级判据”重新梳理后，优先落了两组高价值修正：
+  - `media_bundle.py`
+    - second-pass public retry 不再依赖：
+      - `image` 专属逻辑
+      - 旧 `resolver` 标签
+    - 而是改成：
+      - 资产存在第二轮 public retry 所需的上下文证据
+      - 且该资产当前仍然是 `missing`
+    - recent identity reuse 也不再只偏向 `image`
+  - `provider.py`
+    - `fast_history` 来源不再天然跳过 parse-mult/history 补水
+    - forward/history enrichment 不再有全局 “three strikes and disable”
+    - `_match_message_by_seq(...)` 不再盲目接受 “只有一条消息” 的回包，而必须有正向 identity 证据
+- 对应 simulator / regression 当前已确认：
+  - `resolution-matrix`: `592/592 matched`, `cost_overruns=0`
+  - `forward-candidate-matrix`: `42/42 matched`
+  - `shared-scope-matrix`: `48/48 matched`
+  - `public-timeout-scope-matrix`: `16/16 matched`
+  - `pair-sequence-matrix`: `5/5 matched`
+  - `cross-run-reset-matrix`: `5/5 matched`
+  - `direct-file-id-scope-matrix`: `12/12 matched`
+- maintainer live full export rerun on group `922065597`：
+  - command:
+    - `export-history group 922065597 --limit 20000 --format jsonl`
+  - result:
+    - `records=12593`
+    - `elapsed=111.664s`
+    - `history_source=napcat_fast_history_bulk`
+    - `prefetch_chunks=3`
+    - `prefetch_timeout_count=0`
+    - `prefetch_degraded=no`
+    - `actionable_missing=0`
+    - `background_missing=1207`
+    - `final_missing_reason=[qq_expired_after_napcat:1204, qq_not_downloaded_local_placeholder:3]`
+- 当前判断：
+  - evidence-first 改动没有把全量导出 benchmark 打坏
+  - 当前剩余 missing 仍然全部属于 background missing
+  - 后续继续 hardening 的主战场应转向：
+    - placeholder 的 authoritative-proof 化
+    - bucket-style timeout/cache scope 的完全 evidence 化
+    - actionable-composition 驱动的 prefetch/pool shaping

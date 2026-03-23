@@ -2983,15 +2983,15 @@ def default_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
             max_remote_attempts=1,
         ),
         AssetResolutionScenario(
-            name="forward_old_image_expired_without_payload",
+            name="forward_old_image_unresolved_without_payload",
             asset_type="image",
             suite="classification_fast_fail",
             topology="forward",
             age_days=240,
-            expected_resolver="qq_expired_after_napcat",
+            expected_resolver=None,
             expected_path_kind="missing",
             max_client_calls=0,
-            max_fast_calls=0,
+            max_fast_calls=1,
             max_remote_attempts=0,
         ),
         AssetResolutionScenario(
@@ -3357,6 +3357,129 @@ def _exhaustive_old_forward_terminal_scenarios() -> list[AssetResolutionScenario
                             },
                         )
                     )
+    return scenarios
+
+
+def _terminal_evidence_age_invariance_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    for age_label, age_days in (("recent", 7), ("old", 260)):
+        scenarios.extend(
+            [
+                AssetResolutionScenario(
+                    name=f"forward_image_dead_remote_public_timeout_{age_label}",
+                    suite="terminal_evidence_age_invariance",
+                    asset_type="image",
+                    topology="forward",
+                    age_days=age_days,
+                    hint_remote_state="stale_http",
+                    forward_payload_state="public_token",
+                    public_result_state="timeout",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=1,
+                    max_fast_calls=1,
+                    max_remote_attempts=1,
+                    notes="Dead remote URL plus failed public token should classify terminally regardless of age.",
+                ),
+                AssetResolutionScenario(
+                    name=f"forward_image_no_payload_unresolved_{age_label}",
+                    suite="terminal_evidence_age_invariance",
+                    asset_type="image",
+                    topology="forward",
+                    age_days=age_days,
+                    expected_resolver=None,
+                    expected_path_kind="missing",
+                    max_client_calls=0,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                    notes="No terminal evidence should stay unresolved regardless of age.",
+                ),
+                AssetResolutionScenario(
+                    name=f"forward_video_blank_public_payload_{age_label}",
+                    suite="terminal_evidence_age_invariance",
+                    asset_type="video",
+                    topology="forward",
+                    age_days=age_days,
+                    source_path_state="stale_missing",
+                    forward_payload_state="public_token",
+                    public_result_state="blank_payload",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=1,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                    notes="Blank public get_file payload should classify terminally regardless of age.",
+                ),
+                AssetResolutionScenario(
+                    name=f"forward_video_direct_not_found_{age_label}",
+                    suite="terminal_evidence_age_invariance",
+                    asset_type="video",
+                    topology="forward",
+                    age_days=age_days,
+                    source_path_state="stale_missing",
+                    direct_file_result_state="not_found",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=1,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                    notes="Direct file-id not-found should classify terminally regardless of age.",
+                ),
+                AssetResolutionScenario(
+                    name=f"forward_speech_blank_public_payload_{age_label}",
+                    suite="terminal_evidence_age_invariance",
+                    asset_type="speech",
+                    topology="forward",
+                    age_days=age_days,
+                    source_path_state="stale_missing",
+                    forward_payload_state="public_token",
+                    public_result_state="blank_payload",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=1,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                    notes="Blank public get_record payload should classify terminally regardless of age.",
+                ),
+            ]
+        )
+        for asset_type in ("video", "file", "speech"):
+            token_action = "get_record" if asset_type == "speech" else "get_file"
+            scenarios.extend(
+                [
+                    AssetResolutionScenario(
+                        name=f"forward_{asset_type}_public_timeout_{age_label}",
+                        suite="terminal_evidence_age_invariance",
+                        asset_type=asset_type,
+                        topology="forward",
+                        age_days=age_days,
+                        source_path_state="stale_missing",
+                        forward_payload_state="public_token",
+                        public_result_state="timeout",
+                        expected_resolver="qq_expired_after_napcat",
+                        expected_path_kind="missing",
+                        max_client_calls=1,
+                        max_fast_calls=1,
+                        max_remote_attempts=0,
+                        notes=f"{token_action} timeout should classify terminally regardless of age.",
+                    ),
+                    AssetResolutionScenario(
+                        name=f"forward_{asset_type}_metadata_timeout_{age_label}",
+                        suite="terminal_evidence_age_invariance",
+                        asset_type=asset_type,
+                        topology="forward",
+                        age_days=age_days,
+                        source_path_state="stale_missing",
+                        forward_metadata_state="timeout",
+                        expected_resolver="qq_expired_after_napcat",
+                        expected_path_kind="missing",
+                        max_client_calls=0,
+                        max_fast_calls=1,
+                        max_remote_attempts=0,
+                        notes="Forward metadata timeout should classify terminally regardless of age.",
+                    ),
+                ]
+            )
     return scenarios
 
 
@@ -4013,6 +4136,7 @@ def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
             )
 
     scenarios.extend(_exhaustive_old_forward_terminal_scenarios())
+    scenarios.extend(_terminal_evidence_age_invariance_scenarios())
     scenarios.extend(_exhaustive_sticker_forward_parent_scenarios())
     scenarios.extend(_exhaustive_local_path_state_scenarios())
     scenarios.extend(_exhaustive_old_forward_direct_file_id_scenarios())

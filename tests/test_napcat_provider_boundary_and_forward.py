@@ -288,7 +288,7 @@ def test_enrich_forward_details_uses_history_as_last_chance_after_get_forward_ms
     def fake_hydrate_forward_message_via_history(message: dict[str, object], *, chat_type: str, chat_id: str):
         message["message"][0]["extra"]["forward_messages"] = [{"message_id": "nested"}]  # type: ignore[index]
         message["message"][0]["extra"]["detailed_text"] = "nested text"  # type: ignore[index]
-        return True, False
+        return True, None
 
     provider._hydrate_forward_message_via_history = fake_hydrate_forward_message_via_history  # type: ignore[method-assign]
 
@@ -324,7 +324,7 @@ def test_enrich_forward_details_marks_unavailable_when_forward_and_history_both_
     }
 
     def fake_hydrate_forward_message_via_history(message: dict[str, object], *, chat_type: str, chat_id: str):
-        return False, True
+        return False, "forward_structure_unavailable_via_history"
 
     provider._hydrate_forward_message_via_history = fake_hydrate_forward_message_via_history  # type: ignore[method-assign]
 
@@ -338,10 +338,80 @@ def test_enrich_forward_details_marks_unavailable_when_forward_and_history_both_
 
     assert enriched == 0
     assert unavailable == 1
-    assert (
-        target_message["message"][0]["data"]["_qq_data_forward_unavailable_reason"]  # type: ignore[index]
-        == "forward_structure_unavailable_via_history"
+
+
+def test_finalize_snapshot_does_not_skip_history_hydration_just_because_fast_history_source() -> None:
+    class _ForwardFailClient:
+        def get_forward_msg(self, message_id: str):
+            raise NapCatApiError("找不到相关的聊天记录")
+
+    provider = NapCatHistoryProvider(_ForwardFailClient())
+    target_message = {
+        "message_id": "m-forward",
+        "message_seq": "23388",
+        "message": [
+            {
+                "type": "forward",
+                "data": {"id": "fwd-1"},
+                "extra": {"forward_messages": [], "detailed_text": None},
+            }
+        ],
+    }
+
+    def fake_hydrate_forward_message_via_history(message: dict[str, object], *, chat_type: str, chat_id: str):
+        message["message"][0]["extra"]["forward_messages"] = [{"message_id": "nested"}]  # type: ignore[index]
+        message["message"][0]["extra"]["detailed_text"] = "nested text"  # type: ignore[index]
+        return True, None
+
+    provider._hydrate_forward_message_via_history = fake_hydrate_forward_message_via_history  # type: ignore[method-assign]
+
+    finalized = provider._finalize_snapshot(
+        _snapshot([target_message], source="napcat_fast_history"),
+        progress_callback=None,
     )
+
+    assert finalized.metadata.get("forward_detail_count") == 1
+    assert target_message["message"][0]["extra"]["forward_messages"] == [{"message_id": "nested"}]  # type: ignore[index]
+
+
+def test_match_message_by_seq_does_not_blindly_accept_single_message_without_identity_proof() -> None:
+    provider = NapCatHistoryProvider(_DummyClient())
+    payload = {
+        "messages": [
+            {
+                "message": [{"type": "forward", "data": {"content": [{"text": "nested"}]}}],
+            }
+        ]
+    }
+
+    matched = provider._match_message_by_seq(
+        payload,
+        "23388",
+        target_message={"message_id": "target-msg", "message_seq": "23388"},
+    )
+
+    assert matched is None
+
+
+def test_match_message_by_seq_accepts_single_message_when_message_id_matches() -> None:
+    provider = NapCatHistoryProvider(_DummyClient())
+    payload = {
+        "messages": [
+            {
+                "message_id": "target-msg",
+                "message": [{"type": "forward", "data": {"content": [{"text": "nested"}]}}],
+            }
+        ]
+    }
+
+    matched = provider._match_message_by_seq(
+        payload,
+        "23388",
+        target_message={"message_id": "target-msg", "message_seq": "23388"},
+    )
+
+    assert matched is not None
+    assert matched.get("message_id") == "target-msg"
 
 
 def test_enrich_forward_details_does_not_poison_later_forward_after_single_known_failure() -> None:

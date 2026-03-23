@@ -41,20 +41,14 @@ class NapCatHistoryProvider:
         self._fast_mode = fast_mode
         self._fast_available: bool | None = None
         self._fast_tail_bulk_available: bool | None = None
-        self._known_unavailable_forward_ids: set[str] = set()
-        self._known_unavailable_history_keys: set[str] = set()
-        self._disable_parse_mult_forward_hydration = False
-        self._known_forward_history_failures = 0
-        self._known_forward_detail_failures = 0
+        self._known_unavailable_forward_ids: dict[str, str] = {}
+        self._known_unavailable_history_keys: dict[str, str] = {}
 
     def reset_export_state(self) -> None:
         self._fast_available = None
         self._fast_tail_bulk_available = None
         self._known_unavailable_forward_ids.clear()
         self._known_unavailable_history_keys.clear()
-        self._disable_parse_mult_forward_hydration = False
-        self._known_forward_history_failures = 0
-        self._known_forward_detail_failures = 0
 
     def fetch_snapshot(self, request: ExportRequest) -> SourceChatSnapshot:
         return self.fetch_snapshot_before(
@@ -746,7 +740,7 @@ class NapCatHistoryProvider:
             snapshot.messages,
             chat_type=snapshot.chat_type,
             chat_id=snapshot.chat_id,
-            skip_history_retry=source.startswith("napcat_fast_history"),
+            skip_history_retry=False,
             progress_callback=progress_callback,
         )
         if enriched_count <= 0 and structure_unavailable_count <= 0:
@@ -769,9 +763,6 @@ class NapCatHistoryProvider:
     ) -> tuple[int, int]:
         cache: dict[str, list[dict[str, Any]] | None] = {}
         parse_mult_cache: dict[str, bool] = {}
-        skip_forward_msg_fallback = False
-        history_retry_known_failures = 0
-        forward_detail_known_failures = 0
         structure_unavailable = 0
         already_resolved = sum(
             1
@@ -792,7 +783,6 @@ class NapCatHistoryProvider:
             )
             if (
                 not skip_history_retry
-                and not self._disable_parse_mult_forward_hydration
                 and message_key
                 and message_key not in parse_mult_cache
             ):
@@ -800,15 +790,10 @@ class NapCatHistoryProvider:
                     parse_mult_cache[message_key] = False
                     if self._mark_forward_target_unavailable(
                         target,
-                        reason="forward_structure_unavailable_via_history",
+                        reason=self._known_unavailable_history_keys[message_key]
+                        or "forward_structure_unavailable_via_history",
                     ):
                         structure_unavailable += 1
-                    history_retry_known_failures += 1
-                    if history_retry_known_failures >= 3:
-                        skip_history_retry = True
-                    self._known_forward_history_failures += 1
-                    if self._known_forward_history_failures >= 3:
-                        self._disable_parse_mult_forward_hydration = True
                 else:
                     hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
                         target["message"],
@@ -817,20 +802,12 @@ class NapCatHistoryProvider:
                     )
                     parse_mult_cache[message_key] = hydrated_via_history
                     if known_history_unavailable:
-                        self._known_unavailable_history_keys.add(message_key)
+                        self._known_unavailable_history_keys[message_key] = known_history_unavailable
                         if self._mark_forward_target_unavailable(
                             target,
-                            reason="forward_structure_unavailable_via_history",
+                            reason=known_history_unavailable,
                         ):
                             structure_unavailable += 1
-                        history_retry_known_failures += 1
-                        self._known_forward_history_failures += 1
-                        if history_retry_known_failures >= 3:
-                            skip_history_retry = True
-                        if self._known_forward_history_failures >= 3:
-                            self._disable_parse_mult_forward_hydration = True
-                    elif hydrated_via_history:
-                        self._known_forward_history_failures = 0
                 if parse_mult_cache[message_key]:
                     enriched += 1
             if parse_mult_cache.get(message_key):
@@ -851,7 +828,7 @@ class NapCatHistoryProvider:
             if forward_id in self._known_unavailable_forward_ids:
                 cache[forward_id] = None
                 recovered_via_history = False
-                if message_key and not self._disable_parse_mult_forward_hydration:
+                if message_key:
                     hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
                         target["message"],
                         chat_type=chat_type,
@@ -864,36 +841,25 @@ class NapCatHistoryProvider:
                         recovered_via_history = True
                     elif known_history_unavailable and self._mark_forward_target_unavailable(
                         target,
-                        reason="forward_structure_unavailable_via_history",
+                        reason=known_history_unavailable,
                     ):
                         structure_unavailable += 1
                 elif self._mark_forward_target_unavailable(
                     target,
-                    reason="forward_structure_unavailable_via_get_forward_msg",
+                    reason=self._known_unavailable_forward_ids[forward_id]
+                    or "forward_structure_unavailable_via_get_forward_msg",
                 ):
                     structure_unavailable += 1
-                if not recovered_via_history:
-                    forward_detail_known_failures += 1
-                    self._known_forward_detail_failures += 1
-                    if (
-                        forward_detail_known_failures >= 3
-                        or self._known_forward_detail_failures >= 3
-                    ):
-                        skip_forward_msg_fallback = True
-            if skip_forward_msg_fallback and forward_id not in cache:
-                cache[forward_id] = None
             if forward_id not in cache:
                 try:
                     response = self._client.get_forward_msg(forward_id)
                 except (NapCatApiError, httpx.HTTPError) as exc:
                     cache[forward_id] = None
-                    if self._is_known_forward_detail_unavailable(exc):
-                        self._known_unavailable_forward_ids.add(forward_id)
+                    known_forward_unavailable = self._known_forward_detail_unavailable_reason(exc)
+                    if known_forward_unavailable:
+                        self._known_unavailable_forward_ids[forward_id] = known_forward_unavailable
                         recovered_via_history = False
-                        if (
-                            message_key
-                            and not self._disable_parse_mult_forward_hydration
-                        ):
+                        if message_key:
                             hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
                                 target["message"],
                                 chat_type=chat_type,
@@ -906,25 +872,15 @@ class NapCatHistoryProvider:
                                 recovered_via_history = True
                             elif known_history_unavailable and self._mark_forward_target_unavailable(
                                 target,
-                                reason="forward_structure_unavailable_via_history",
+                                reason=known_history_unavailable,
                             ):
                                 structure_unavailable += 1
                         elif self._mark_forward_target_unavailable(
                             target,
-                            reason="forward_structure_unavailable_via_get_forward_msg",
+                            reason=known_forward_unavailable,
                         ):
                             structure_unavailable += 1
-                        if not recovered_via_history:
-                            forward_detail_known_failures += 1
-                            self._known_forward_detail_failures += 1
-                            if (
-                                forward_detail_known_failures >= 3
-                                or self._known_forward_detail_failures >= 3
-                            ):
-                                skip_forward_msg_fallback = True
                 else:
-                    forward_detail_known_failures = 0
-                    self._known_forward_detail_failures = 0
                     payload = (
                         response
                         if isinstance(response, dict)
@@ -967,20 +923,21 @@ class NapCatHistoryProvider:
         attach["_qq_data_forward_unavailable_reason"] = reason
         return True
 
-    def _is_known_forward_detail_unavailable(self, exc: Exception) -> bool:
+    def _known_forward_detail_unavailable_reason(self, exc: Exception) -> str | None:
         if not isinstance(exc, NapCatApiError):
-            return False
+            return None
         message = str(exc).strip().lower()
         if not message:
-            return False
-        needles = (
-            "找不到相关的聊天记录",
-            "protocolfallbacklogic",
-            "消息已过期",
-            "内层消息",
-            "unexpected end of file",
-        )
-        return any(needle in message for needle in needles)
+            return None
+        if "unexpected end of file" in message:
+            return "forward_structure_unavailable_unexpected_eof"
+        if "protocolfallbacklogic" in message or "找不到相关的聊天记录" in message:
+            return "forward_structure_unavailable_protocol_fallback"
+        if "消息已过期" in message:
+            return "forward_structure_unavailable_expired"
+        if "内层消息" in message:
+            return "forward_structure_unavailable_inner_message"
+        return None
 
     def _hydrate_forward_message_via_history(
         self,
@@ -988,7 +945,7 @@ class NapCatHistoryProvider:
         *,
         chat_type: str,
         chat_id: str,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, str | None]:
         raw_message = _message_raw(message)
         message_seq = str(
             message.get("message_seq")
@@ -997,7 +954,7 @@ class NapCatHistoryProvider:
             or ""
         ).strip()
         if not message_seq:
-            return False, False
+            return False, None
         try:
             if chat_type == "group":
                 payload = self._client.get_group_msg_history(
@@ -1016,50 +973,53 @@ class NapCatHistoryProvider:
                     parse_mult_msg=True,
                 )
         except (NapCatApiError, httpx.HTTPError) as exc:
-            return False, self._is_known_forward_history_unavailable(exc)
+            return False, self._known_forward_history_unavailable_reason(exc)
 
-        candidate = self._match_message_by_seq(payload, message_seq)
+        candidate = self._match_message_by_seq(payload, message_seq, target_message=message)
         if candidate is None:
-            return False, False
+            return False, None
         onebot_segments = candidate.get("message")
         if not isinstance(onebot_segments, list) or not onebot_segments:
-            return False, False
+            return False, None
         forward_segments = [
             segment
             for segment in onebot_segments
             if isinstance(segment, dict) and segment.get("type") == "forward"
         ]
         if not forward_segments:
-            return False, False
+            return False, None
         if not any(
             (segment.get("data") or {}).get("content") for segment in forward_segments
         ):
-            return False, False
+            return False, None
         message["message"] = onebot_segments
         if candidate.get("raw_message") not in {None, ""}:
             message["raw_message"] = candidate.get("raw_message")
         message["message_format"] = candidate.get("message_format") or "array"
-        return True, False
+        return True, None
 
-    def _is_known_forward_history_unavailable(self, exc: Exception) -> bool:
+    def _known_forward_history_unavailable_reason(self, exc: Exception) -> str | None:
         if not isinstance(exc, NapCatApiError):
-            return False
+            return None
         message = str(exc).strip().lower()
         if not message:
-            return False
-        needles = (
-            "消息不存在",
-            "消息已过期",
-            "旧版客户端",
-            "unexpected end of file",
-            "找不到相关的聊天记录",
-        )
-        return any(needle in message for needle in needles)
+            return None
+        if "旧版客户端" in message:
+            return "forward_structure_unavailable_old_client"
+        if "unexpected end of file" in message:
+            return "forward_structure_unavailable_unexpected_eof"
+        if "消息不存在" in message or "找不到相关的聊天记录" in message:
+            return "forward_structure_unavailable_history_missing"
+        if "消息已过期" in message:
+            return "forward_structure_unavailable_history_expired"
+        return None
 
     def _match_message_by_seq(
         self,
         payload: Any,
         message_seq: str,
+        *,
+        target_message: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         messages = self._extract_messages(payload)
         if not messages:
@@ -1081,17 +1041,33 @@ class NapCatHistoryProvider:
             only = messages[0]
             if not isinstance(only, dict):
                 return None
-            raw_message = _message_raw(only)
-            only_keys = {
-                str(only.get("message_seq") or "").strip(),
-                str(only.get("messageSeq") or "").strip(),
-                str(only.get("real_seq") or "").strip(),
-                str(only.get("realSeq") or "").strip(),
-                str(raw_message.get("msgSeq") or "").strip(),
-            }
-            if not any(only_keys):
+            if self._message_identity_matches_target(only, target_message):
                 return only
         return None
+
+    def _message_identity_matches_target(
+        self,
+        candidate: dict[str, Any] | None,
+        target_message: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(candidate, dict) or not isinstance(target_message, dict):
+            return False
+        candidate_ids = self._message_identity_keys(candidate)
+        target_ids = self._message_identity_keys(target_message)
+        if candidate_ids and target_ids and candidate_ids.intersection(target_ids):
+            return True
+        return False
+
+    @staticmethod
+    def _message_identity_keys(message: dict[str, Any]) -> set[str]:
+        raw_message = _message_raw(message)
+        keys = {
+            str(message.get("message_id") or "").strip(),
+            str(message.get("messageId") or "").strip(),
+            str(raw_message.get("msgId") or "").strip(),
+        }
+        keys.discard("")
+        return keys
 
     def _hydrate_fast_history_page_forwards(
         self,
@@ -1102,8 +1078,6 @@ class NapCatHistoryProvider:
         count: int,
         reverse_order: bool,
     ) -> int:
-        if self._disable_parse_mult_forward_hydration:
-            return 0
         forward_message_ids = {
             str(
                 message.get("message_id")
