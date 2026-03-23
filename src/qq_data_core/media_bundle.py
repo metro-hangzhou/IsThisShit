@@ -232,7 +232,7 @@ def materialize_snapshot_media(
                     }
                 )
     copied_map: dict[str, str] = {}
-    image_identity_reuse_map: dict[tuple[Any, ...], tuple[str, str | None, str | None]] = {}
+    recent_identity_reuse_map: dict[tuple[Any, ...], tuple[str, str | None, str | None]] = {}
     occupied_export_paths: dict[str, str] = {}
     resolution_cache: dict[tuple[Any, ...], tuple[Path | None, str]] = {}
     assets: list[MaterializedAsset] = []
@@ -405,9 +405,8 @@ def materialize_snapshot_media(
         if dedupe_key in copied_map:
             asset.status = "reused"
             asset.exported_rel_path = copied_map[dedupe_key]
-            identity_key = _asset_recent_identity_key(candidate)
-            if identity_key is not None:
-                image_identity_reuse_map[identity_key] = (
+            for identity_key in _asset_recent_identity_keys(candidate):
+                recent_identity_reuse_map[identity_key] = (
                     asset.exported_rel_path,
                     asset.resolved_source_path,
                     asset.resolver,
@@ -508,9 +507,8 @@ def materialize_snapshot_media(
         asset.exported_rel_path = rel_path.as_posix()
         copied_map[dedupe_key] = asset.exported_rel_path
         occupied_export_paths[asset.exported_rel_path.casefold()] = dedupe_key
-        identity_key = _asset_recent_identity_key(candidate)
-        if identity_key is not None:
-            image_identity_reuse_map[identity_key] = (
+        for identity_key in _asset_recent_identity_keys(candidate):
+            recent_identity_reuse_map[identity_key] = (
                 asset.exported_rel_path,
                 asset.resolved_source_path,
                 asset.resolver,
@@ -564,11 +562,9 @@ def materialize_snapshot_media(
             )
         recovered_count = 0
         for asset, candidate in second_pass_candidates:
-            identity_key = _asset_recent_identity_key(candidate)
-            identity_reuse = (
-                image_identity_reuse_map.get(identity_key)
-                if identity_key is not None
-                else None
+            identity_reuse = _lookup_recent_identity_reuse(
+                candidate,
+                recent_identity_reuse_map,
             )
             if identity_reuse is not None:
                 exported_rel_path, resolved_source_path, reused_resolver = identity_reuse
@@ -675,7 +671,7 @@ def _asset_resolution_cache_key(candidate: _AssetCandidate) -> tuple[Any, ...]:
     )
 
 
-def _asset_recent_identity_key(candidate: _AssetCandidate) -> tuple[Any, ...] | None:
+def _asset_recent_identity_keys(candidate: _AssetCandidate) -> tuple[tuple[Any, ...], ...]:
     hint = candidate.download_hint if isinstance(candidate.download_hint, dict) else {}
     asset_type = _normalize_identity_string(candidate.asset_type)
     file_name = _normalize_identity_string(candidate.file_name)
@@ -689,17 +685,41 @@ def _asset_recent_identity_key(candidate: _AssetCandidate) -> tuple[Any, ...] | 
     remote_url = _normalize_identity_string(
         _normalized_match_url(hint.get("remote_url") or hint.get("url"))
     )
+    preferred_names = tuple(
+        name
+        for name in (file_name, source_leaf)
+        if name
+    )
+    keys: list[tuple[Any, ...]] = []
     if public_token and public_action:
-        return ("public_token", asset_type, public_action, public_token)
+        keys.append(("public_token", asset_type, public_action, public_token))
     if file_id:
-        return ("file_id", asset_type, file_id)
+        keys.append(("file_id", asset_type, file_id))
     if remote_url:
-        return ("remote_url", asset_type, remote_url)
-    preferred_name = file_name or source_leaf
-    if md5 and preferred_name:
-        return ("md5_named", asset_type, preferred_name, md5)
-    if asset_type == "image" and md5:
-        return ("image_md5_only", asset_type, md5)
+        keys.append(("remote_url", asset_type, remote_url))
+    if md5:
+        for preferred_name in preferred_names:
+            keys.append(("md5_named", asset_type, preferred_name, md5))
+        if asset_type == "image":
+            keys.append(("image_md5_only", asset_type, md5))
+    deduped_keys: list[tuple[Any, ...]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_keys.append(key)
+    return tuple(deduped_keys)
+
+
+def _lookup_recent_identity_reuse(
+    candidate: _AssetCandidate,
+    reuse_map: dict[tuple[Any, ...], tuple[str, str | None, str | None]],
+) -> tuple[str, str | None, str | None] | None:
+    for identity_key in _asset_recent_identity_keys(candidate):
+        reused = reuse_map.get(identity_key)
+        if reused is not None:
+            return reused
     return None
 
 

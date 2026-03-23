@@ -20,8 +20,15 @@ The turn-level contract is:
 1. remove remaining correctness-impacting proxy decisions
 2. extend simulator coverage for the removed proxy families
 3. run simulator/regression checks
-4. run a full live export on group `922065597`
-5. only call the turn complete when `actionable_missing=0` and benchmark has not materially regressed
+4. when residual actionable/missing count is small, run targeted window retests first and only escalate to full live export if those narrow windows are clean or if broad benchmark validation is still needed
+5. run a full live export on group `922065597` only after the targeted retests above have converged, or when verifying that a broad-path change did not regress benchmark/runtime behavior
+6. only call the turn complete when `actionable_missing=0` and benchmark has not materially regressed
+
+Targeted-first validation rule:
+
+- if a new regression narrows down to a handful of `missing_after_napcat` assets or 1-2 retry windows, do not jump straight to another full export
+- first retest those exact windows and fix the concrete evidence gap there
+- only after the targeted windows are clean should we pay the cost of a full-group validation run
 
 ## Current Audit Snapshot
 
