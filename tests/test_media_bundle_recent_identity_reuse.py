@@ -424,6 +424,74 @@ def test_recent_forward_public_retry_clears_missing_kind_after_recovery() -> Non
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def test_background_missing_does_not_enter_second_pass_public_retry() -> None:
+    temp_root = Path(".") / "state" / "test_temp_background_missing_no_public_retry"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        manager = _MissingAssetManager(missing_resolver="qq_expired_after_napcat")
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _forward_image_message(
+                    file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
+                    md5="e23a4961d16c0004dbccb8884a8e427b",
+                    timestamp_ms=1768035294000,
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["missing"]
+        assert assets[0].missing_kind == "qq_expired_after_napcat"
+        assert manager.public_retry_calls == 0
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_placeholder_missing_does_not_enter_second_pass_public_retry() -> None:
+    temp_root = Path(".") / "state" / "test_temp_placeholder_missing_no_public_retry"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        manager = _MissingAssetManager(missing_resolver="qq_not_downloaded_local_placeholder")
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _forward_image_message(
+                    file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
+                    md5="e23a4961d16c0004dbccb8884a8e427b",
+                    timestamp_ms=1768035294000,
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["missing"]
+        assert assets[0].missing_kind == "qq_not_downloaded_local_placeholder"
+        assert manager.public_retry_calls == 0
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def test_recent_forward_video_background_missing_is_reused_after_later_top_level_success() -> None:
     temp_root = Path(".") / "state" / "test_temp_recent_forward_video_reuse"
     try:
