@@ -134,6 +134,44 @@ def _top_level_image_message(
     )
 
 
+def _top_level_image_message_with_file_id(
+    *,
+    file_name: str,
+    md5: str,
+    source_path: str,
+    timestamp_ms: int,
+    file_id: str,
+    url: str,
+) -> NormalizedMessage:
+    return NormalizedMessage(
+        chat_type="group",
+        chat_id="922065597",
+        group_id="922065597",
+        chat_name="蕾米二次元萌萌群",
+        sender_id="10002",
+        sender_name="top-level-sender",
+        message_id="top-level-msg",
+        message_seq="2",
+        timestamp_ms=timestamp_ms,
+        timestamp_iso="2026-01-10T16:55:01+08:00",
+        content=f"[image:{file_name}]",
+        text_content="",
+        image_file_names=[file_name],
+        segments=[
+            NormalizedSegment(
+                type="image",
+                file_name=file_name,
+                path=source_path,
+                md5=md5,
+                extra={
+                    "file_id": file_id,
+                    "url": url,
+                },
+            )
+        ],
+    )
+
+
 def _forward_video_message(*, file_name: str, md5: str, timestamp_ms: int) -> NormalizedMessage:
     return NormalizedMessage(
         chat_type="group",
@@ -301,6 +339,52 @@ def test_recent_forward_background_missing_is_reused_after_later_top_level_succe
     assert assets[0].exported_rel_path == assets[1].exported_rel_path
     assert assets[0].missing_kind is None
     assert assets[0].note is None
+
+
+def test_recent_forward_image_missing_reuses_later_file_id_backed_success() -> None:
+    temp_root = Path(".") / "state" / "test_temp_recent_forward_reuse_file_id_alias"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        image_path = temp_root / "E23A4961D16C0004DBCCB8884A8E427B.jpg"
+        image_path.write_bytes(b"image-bytes")
+        manager = _MissingAssetManager(missing_resolver="missing_after_napcat")
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _forward_image_message(
+                    file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
+                    md5="e23a4961d16c0004dbccb8884a8e427b",
+                    timestamp_ms=1768035294000,
+                ),
+                _top_level_image_message_with_file_id(
+                    file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
+                    md5="e23a4961d16c0004dbccb8884a8e427b",
+                    source_path=str(image_path),
+                    timestamp_ms=1768035301000,
+                    file_id="live-file-id-token",
+                    url="/download?appid=1407&fileid=live-file-id-token&spec=0",
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["reused", "copied"]
+        assert assets[0].exported_rel_path == assets[1].exported_rel_path
+        assert assets[0].missing_kind is None
+        assert assets[0].note is None
+        assert manager.public_retry_calls == 0
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def test_recent_forward_public_retry_clears_missing_kind_after_recovery() -> None:

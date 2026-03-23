@@ -66,6 +66,20 @@
 
 ## 4. 里程碑日志
 
+### [2026-03-23][049] exporter live validation now follows a targeted-first rule before full-group reruns
+
+- current maintainer workflow has been tightened for residual actionable misses:
+  - if the export result narrows down to a few `missing_after_napcat` assets or a small retry-hint set, validate those exact windows first
+  - only after the targeted windows converge should we spend time on another full-group live export
+- rationale:
+  - this avoids burning `100s+` on broad reruns when the unresolved surface has already shrunk to 1-2 concrete windows
+  - it also makes it easier to isolate whether the problem is:
+    - bundle/backfill logic
+    - a specific forward parent
+    - or a truly terminal background-missing asset
+- this rule is now also recorded in:
+  - [TODOs.evidence-first-exporter.md](../todos/TODOs.evidence-first-exporter.md)
+
 ### [2026-03-23][034] forward terminal classification no longer relies primarily on asset age
 
 - exporter-side forward `video/file/speech` terminal handling has been shifted from "very old asset" heuristics toward terminal evidence:
