@@ -66,6 +66,44 @@
 
 ## 4. 里程碑日志
 
+### [2026-03-23][050] 新增 evidence-first simulator exhaustive 规划面板
+
+- 为了把 simulator 从“强手写矩阵 + 历史回归样本”推进到“接近数学意义上的充分覆盖”，新增执行面板：
+  - [TODOs.evidence-first-simulator-exhaustive.md](../todos/TODOs.evidence-first-simulator-exhaustive.md)
+- 新面板明确了下一阶段主线：
+  - 先把 raw payload 归约成封闭的 evidence algebra
+  - 再对 evidence space 做 reachable-state bounded exhaustive enumeration
+  - 用独立 oracle 同时校验：
+    - 正确结果
+    - 终局性
+    - 路由成本上界
+- 这条线的目标不是“穷举所有 QQ 原始 payload 字节形态”，而是：
+  - 对 exporter 真正的决策空间实现接近数学意义上的穷举覆盖
+
+### [2026-03-24][051] evidence-first targeted retest converged and the old `2948/3150` stall signature no longer reflects a true slow asset path
+
+- maintainer-side targeted retest against the previous residual actionable manifest windows now lands at:
+  - `2025-12-14_19-10-26 .. 19-10-56`: `actionable_missing=0`
+  - `2026-01-10_16-54-39 .. 16-55-09`: `actionable_missing=0`
+- the image terminality rule was clarified further:
+  - `unsupported localhost /download + no local file` is not sufficient terminal proof by itself
+  - terminal classification now requires the full evidence chain:
+    - authoritative remote terminal failure
+    - unsupported projected localhost download
+    - no local/hydrated file
+    - no remaining public/file-id/live-remote recovery handle
+- a fresh full live export on group `922065597` now shows:
+  - `records=12593`
+  - `elapsed=109.587s`
+  - `history_source=napcat_fast_history_bulk`
+  - `actionable_missing=0`
+  - `background_missing=1240`
+- importantly, the old operator-facing stall signature around `2948/3150` has been re-measured:
+  - sampled asset `BE6DFDF9BF0B50989E54D22DE5AE2E55.png`
+  - final resolver: `qq_not_downloaded_local_placeholder`
+  - total asset step cost: `~66ms`
+  - therefore the current maintainer runtime no longer exhibits the former `20s+` asset timeout on that path
+
 ### [2026-03-23][049] exporter live validation now follows a targeted-first rule before full-group reruns
 
 - current maintainer workflow has been tightened for residual actionable misses:

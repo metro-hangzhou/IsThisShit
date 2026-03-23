@@ -136,7 +136,7 @@ def test_asset_resolution_matrix_matches_expectations() -> None:
 def test_asset_resolution_matrix_includes_core_failure_and_remote_recovery_paths() -> None:
     results = {item.name: item for item in run_asset_resolution_matrix()}
 
-    assert results["top_level_image_placeholder_zero_byte"].actual_resolver == "qq_not_downloaded_local_placeholder"
+    assert results["top_level_image_placeholder_zero_byte"].actual_resolver is None
     assert results["top_level_image_placeholder_zero_byte"].actual_path_kind == "missing"
 
     assert results["top_level_speech_public_token_remote"].actual_resolver == "napcat_public_token_get_record_remote_url"
@@ -184,7 +184,7 @@ def test_asset_resolution_matrix_includes_core_failure_and_remote_recovery_paths
     assert results["exhaustive_forward_image_recent_none_dead_remote_metadata_timeout_materialize_empty"].actual_path_kind == "missing"
     assert results["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_empty"].actual_resolver == "qq_expired_after_napcat"
     assert results["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_empty"].actual_path_kind == "missing"
-    assert results["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_resolver == "qq_expired_after_napcat"
+    assert results["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_resolver is None
     assert results["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_path_kind == "missing"
     assert results["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"].actual_resolver == "napcat_forward_remote_url"
     assert results["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"].actual_path_kind == "remote"
@@ -463,7 +463,7 @@ def test_asset_resolution_exhaustive_forward_image_terminal_suite_matches_expect
     assert by_name["exhaustive_forward_image_recent_none_dead_remote_metadata_timeout_materialize_empty"].actual_path_kind == "missing"
     assert by_name["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_error"].actual_resolver == "qq_expired_after_napcat"
     assert by_name["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_error"].actual_path_kind == "missing"
-    assert by_name["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_resolver == "qq_expired_after_napcat"
+    assert by_name["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_resolver is None
     assert by_name["exhaustive_forward_image_recent_no_remote_metadata_timeout_terminal"].actual_path_kind == "missing"
     assert by_name["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"].actual_resolver == "napcat_forward_remote_url"
     assert by_name["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"].actual_path_kind == "remote"
@@ -561,5 +561,5 @@ def test_asset_resolution_sequence_reuses_forward_image_dead_remote_terminal_cla
     assert result.actual_resolver == "qq_expired_after_napcat"
     assert result.actual_path_kind == "missing"
     assert result.client_call_count == 0
-    assert result.fast_call_count == 1
-    assert result.remote_attempt_count == 1
+    assert result.fast_call_count == 0
+    assert result.remote_attempt_count == 2

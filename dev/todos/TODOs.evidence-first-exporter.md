@@ -70,6 +70,63 @@ The latest strict audit found the remaining non-evidence decisions concentrated 
   - `actionable_missing=0`
   - `background_missing=1207`
   - `final_missing_reason=[qq_expired_after_napcat:1204, qq_not_downloaded_local_placeholder:3]`
+- remote URL recovery is no longer coupled to async prefetch runtime startup
+  - if a valid live remote URL exists, downloader now has a synchronous fallback path when remote prefetch runtime is unavailable
+  - targeted retest against the residual `2025-12-14` and `2026-01-10` windows now lands at:
+    - `cluster_1: actionable_missing=0`
+    - `cluster_2: actionable_missing=0`
+- `forward image` slow-step instrumentation and ordering
+  - substep trace now records:
+    - `timestamp_iso`
+    - `md5`
+    - `source_path/source_path_kind`
+    - `hint_url_kind/hint_url_host`
+    - `attempt_url/attempt_url_kind/attempt_url_host`
+    - `resolved_size_bytes`
+  - `targeted_missing_retest.py` now also emits full progress/substep trace into `state/export_perf`
+  - for forward `image` assets with:
+    - live HTTP hint present
+    - direct `forward_remote_url` already failed in-process
+    - no public-token/file-id recovery handle
+    - no hydrated local path yet
+    downloader now prefers `forward_context_materialize` before metadata-only hydration
+  - live narrow-window retest on `2025-12-14_19-10-26 .. 19-10-56` confirmed:
+    - previous bad sample `3BE10FA97950F66D11876F8E815A763C.gif`
+    - old path: `~33.6s`
+    - new path: `~21.5s`
+    - metadata timeout stage removed; remaining cost is the real NapCat-side materialize itself
+
+## [2026-03-24] Latest Evidence-First Validation
+
+- targeted manifest retest against:
+  - `D:\Coding_Project\gittest20260316_t1\IsThisShit\exports\group_922065597_20260323_153041_110212.manifest.json`
+- result:
+  - `cluster_1 (2025-12-14_19-10-26 .. 19-10-56): actionable_missing=0, background_missing=3`
+  - `cluster_2 (2026-01-10_16-54-39 .. 16-55-09): actionable_missing=0, background_missing=4`
+- current evidence-first rule clarified during this pass:
+  - `unsupported projected localhost download + no local file` is not terminal by itself
+  - terminal image/background classification requires a complete proof chain such as:
+    - original remote already expired or otherwise terminal
+    - projected localhost download unsupported
+    - no local file / no hydrated local path
+    - no remaining public/file-id/live-remote recovery handle
+- full live export on group `922065597` after the targeted retest convergence now lands at:
+  - `records=12593`
+  - `elapsed=109.587s`
+  - `history_source=napcat_fast_history_bulk`
+  - `actionable_missing=0`
+  - `background_missing=1240`
+  - `final_missing_reason=[qq_expired_after_napcat:1154, qq_not_downloaded_local_placeholder:86]`
+- the former `2948/3150` stall signature is no longer a real slow asset path on the maintainer runtime:
+  - sampled asset `BE6DFDF9BF0B50989E54D22DE5AE2E55.png`
+  - final classification: `qq_not_downloaded_local_placeholder`
+  - full asset step cost: `66ms`
+  - `public_token_get_image`: `8ms`
+  - `public_token_get_image_remote_url`: `51ms error`
+- current full-trace maxima on the maintainer runtime:
+  - slowest `materialize_assets` step: `0.765s`
+  - slowest `materialize_asset_substep`: `context_hydration(video)=0.614s`
+  - no `media_resolution_substep` timeout events remain in the full trace
 
 ## Remaining Non-Evidence Decisions After This Pass
 
