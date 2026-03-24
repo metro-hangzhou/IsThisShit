@@ -378,10 +378,21 @@ def _normalize_forward_nodes(
                 data.get("user_id") or data.get("sender_id") or data.get("uin")
             )
             sender_name = _clean_text(data.get("nickname") or data.get("name")) or None
+            (
+                segments,
+                image_file_names,
+                uploaded_file_names,
+                emoji_tokens,
+                content_parts,
+                text_content,
+                _reply_to,
+            ) = _normalize_onebot_segments(
+                nested_message,
+                inherited_parent_context=inherited_parent_context,
+            )
         else:
             data = raw_node
             sender = raw_node.get("sender") or {}
-            nested_message = {"message": raw_node.get("message") or []}
             sender_id = _clean_text(
                 raw_node.get("user_id")
                 or raw_node.get("sender_id")
@@ -397,18 +408,38 @@ def _normalize_forward_nodes(
                 )
                 or None
             )
-        (
-            segments,
-            image_file_names,
-            uploaded_file_names,
-            emoji_tokens,
-            content_parts,
-            text_content,
-            _reply_to,
-        ) = _normalize_onebot_segments(
-            nested_message,
-            inherited_parent_context=inherited_parent_context,
-        )
+            raw_nested_message = _message_raw(raw_node)
+            if raw_nested_message:
+                nested_message = {
+                    "raw_message": raw_nested_message,
+                    "message_id": raw_node.get("message_id"),
+                    "message_seq": raw_node.get("message_seq"),
+                    "user_id": raw_node.get("user_id"),
+                    "sender": raw_node.get("sender"),
+                }
+                (
+                    segments,
+                    image_file_names,
+                    uploaded_file_names,
+                    emoji_tokens,
+                    content_parts,
+                    text_content,
+                    _reply_to,
+                ) = _normalize_exporter_elements(nested_message)
+            else:
+                nested_message = {"message": raw_node.get("message") or []}
+                (
+                    segments,
+                    image_file_names,
+                    uploaded_file_names,
+                    emoji_tokens,
+                    content_parts,
+                    text_content,
+                    _reply_to,
+                ) = _normalize_onebot_segments(
+                    nested_message,
+                    inherited_parent_context=inherited_parent_context,
+                )
         content = " ".join(part for part in content_parts if part).strip()
         node_text = text_content or content
         normalized_node = {

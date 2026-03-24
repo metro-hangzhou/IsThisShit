@@ -1617,3 +1617,31 @@
   - 把 bulk forward hydrate 的 per-window/per-chunk 成本单独打出来
   - 收窄 finalize / forward retry 里 `0 hit` 的无效工作
   - 基于新的 copy/finalize telemetry 决定是否还值得继续优化本地 I/O
+
+### [2026-03-24][050] forward/detail enrichment 已新增 fast-plugin 直取路线，准备替换 full export 里零收益的 `history_retry + get_forward_msg` 链
+
+- 通过 `state/export_perf/cli_export_group_922065597_20260324_175137_771039_36128.report.json` 的 broad perf audit 已经确认：
+  - `provider.finalize_snapshot ~= 3.56s`
+  - `forward_expand_summary` 中：
+    - `history_retry_calls=62`, `history_retry_hits=0`
+    - `get_forward_msg_calls=31`, `get_forward_msg_hits=0`
+  - 当前 broad-path forward/detail enrichment 主要是在做高成本、低命中的协议 fallback
+- 当前已落地一条新的 fast-plugin route：
+  - `POST /hydrate-forward-detail`
+  - 内部直接复用插件现有的：
+    - `loadForwardMessages(...)`
+    - `MsgApi.getMultiMsg(...)`
+    - `PacketApi.pkt.operation.FetchForwardMsg(...)`
+- Python/exporter 当前也已接入：
+  - `NapCatFastHistoryClient.hydrate_forward_detail(...)`
+  - `NapCatHistoryProvider._hydrate_forward_message_via_fast_plugin(...)`
+  - `_enrich_forward_details(...)` 现在会先尝试 fast-plugin detail，再回落到：
+    - `history_retry`
+    - `get_forward_msg`
+- 当前 focused regression 已确认：
+  - fast-plugin hit 时，不再进入 `history_retry / get_forward_msg`
+  - fast-plugin miss 时，现有 fallback 仍然工作
+  - raw forward detail 现在也能被 Python normalization 正确消费
+- 这条优化要真正体现在 live export benchmark 上，还需要：
+  - maintainer/runtime 侧对 NapCat 做一次真实重启
+  - 因为 plugin route 新增后，旧进程不会自动加载新路由

@@ -667,7 +667,23 @@ function scoreForwardAssetCandidate(target, candidate) {
   return score;
 }
 
-async function findForwardMediaTarget(ctx, messages, target, depth = 1) {
+function isDecisiveForwardAssetScore(target, candidate, score) {
+  if (!target || !candidate || score <= 0) {
+    return false;
+  }
+  if (target.md5 && candidate.md5 && candidate.md5 === target.md5) {
+    return true;
+  }
+  if (target.file_id && candidate.file_id && candidate.file_id === target.file_id) {
+    return true;
+  }
+  if (target.url && candidate.url && candidate.url === target.url) {
+    return !target.file_name || !candidate.file_name || candidate.file_name === target.file_name;
+  }
+  return false;
+}
+
+async function findForwardMediaTarget(ctx, messages, target, depth = 1, forwardLoadCache = null) {
   let bestMatch = null;
   let bestScore = -1;
   for (const msg of messages || []) {
@@ -676,14 +692,6 @@ async function findForwardMediaTarget(ctx, messages, target, depth = 1) {
       continue;
     }
     for (const element of msg.elements) {
-      if (element?.multiForwardMsgElement?.resId) {
-        const nested = await loadForwardMessages(ctx, msg, element.multiForwardMsgElement);
-        const nestedMatch = await findForwardMediaTarget(ctx, nested, target, depth + 1);
-        if (nestedMatch && nestedMatch.score > bestScore) {
-          bestMatch = nestedMatch;
-          bestScore = nestedMatch.score;
-        }
-      }
       const candidates = buildForwardMatchCandidates(element);
       for (const candidate of candidates) {
         const score = scoreForwardAssetCandidate(target, candidate);
@@ -698,6 +706,20 @@ async function findForwardMediaTarget(ctx, messages, target, depth = 1) {
           assetRole: candidate.asset_role || "",
         };
         bestScore = score;
+        if (isDecisiveForwardAssetScore(target, candidate, score)) {
+          return bestMatch;
+        }
+      }
+      if (element?.multiForwardMsgElement?.resId) {
+        const nested = await loadForwardMessages(ctx, msg, element.multiForwardMsgElement, forwardLoadCache);
+        const nestedMatch = await findForwardMediaTarget(ctx, nested, target, depth + 1, forwardLoadCache);
+        if (nestedMatch && nestedMatch.score > bestScore) {
+          bestMatch = nestedMatch;
+          bestScore = nestedMatch.score;
+          if (nestedMatch.score >= 100) {
+            return bestMatch;
+          }
+        }
       }
     }
   }
@@ -843,6 +865,7 @@ async function hydrateElementRecord(ctx, rawMessage, element, assetRole = "", de
 async function hydrateMedia(ctx, payload) {
   const elementId = asText(payload?.element_id);
   const assetRole = asText(payload?.asset_role).toLowerCase();
+  const metadataOnly = Boolean(payload?.metadata_only);
   if (!elementId) {
     throw new Error("element_id is required");
   }
@@ -850,6 +873,9 @@ async function hydrateMedia(ctx, payload) {
   const mixElement = rawMessage?.elements?.find((element) => asText(element?.elementId) === elementId);
   if (!mixElement) {
     throw new Error(`element ${elementId} not found in message ${msgId}`);
+  }
+  if (metadataOnly) {
+    return normalizeHydratedElementRecord(rawMessage, mixElement, "", assetRole);
   }
   return hydrateElementRecord(ctx, rawMessage, mixElement, assetRole);
 }
@@ -871,7 +897,24 @@ async function hydrateMediaBatch(ctx, payload) {
   return { items: results };
 }
 
-async function loadForwardMessages(ctx, rawMessage, forwardElement) {
+function buildForwardLoadCacheKey(rawMessage, forwardElement) {
+  const resId = asText(forwardElement?.resId);
+  const msgId = asText(rawMessage?.msgId);
+  if (!resId && !msgId) {
+    return "";
+  }
+  return `${resId || "-"}::${msgId || "-"}`;
+}
+
+async function loadForwardMessages(ctx, rawMessage, forwardElement, forwardLoadCache = null) {
+  const cacheKey = buildForwardLoadCacheKey(rawMessage, forwardElement);
+  if (forwardLoadCache instanceof Map && cacheKey) {
+    const cached = forwardLoadCache.get(cacheKey);
+    if (cached) {
+      return await cached;
+    }
+  }
+  const loadTask = (async () => {
   const parentMsgPeer = rawMessage?.parentMsgPeer ?? {
     chatType: rawMessage?.chatType,
     guildId: "",
@@ -882,18 +925,44 @@ async function loadForwardMessages(ctx, rawMessage, forwardElement) {
     : [];
   parentMsgIdList.push(rawMessage?.msgId);
   if (parentMsgIdList[0]) {
-    const multiMsgs = (
-      await ctx.core.apis.MsgApi.getMultiMsg(parentMsgPeer, parentMsgIdList[0], rawMessage?.msgId)
-    )?.msgList;
-    if (Array.isArray(multiMsgs) && multiMsgs.length > 0) {
-      return multiMsgs;
+    try {
+      const multiMsgs = (
+        await ctx.core.apis.MsgApi.getMultiMsg(parentMsgPeer, parentMsgIdList[0], rawMessage?.msgId)
+      )?.msgList;
+      if (Array.isArray(multiMsgs) && multiMsgs.length > 0) {
+        return multiMsgs;
+      }
+    } catch (error) {
+      ctx.logger.warn(
+        `loadForwardMessages getMultiMsg failed msgId=${asText(rawMessage?.msgId) || "-"} detail=${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
-  const fallback = await ctx.core.apis.PacketApi.pkt.operation.FetchForwardMsg(forwardElement?.resId);
-  return Array.isArray(fallback) ? fallback : [];
+  try {
+    const fallback = await ctx.core.apis.PacketApi.pkt.operation.FetchForwardMsg(forwardElement?.resId);
+    return Array.isArray(fallback) ? fallback : [];
+  } catch (error) {
+    ctx.logger.warn(
+      `loadForwardMessages fallback failed resId=${asText(forwardElement?.resId) || "-"} detail=${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return [];
+  }
+  })();
+  if (forwardLoadCache instanceof Map && cacheKey) {
+    forwardLoadCache.set(cacheKey, loadTask);
+  }
+  const loaded = await loadTask;
+  if (forwardLoadCache instanceof Map && cacheKey) {
+    forwardLoadCache.set(cacheKey, loaded);
+  }
+  return loaded;
 }
 
-async function collectForwardMediaRecords(ctx, messages, depth = 1) {
+async function collectForwardMediaRecords(ctx, messages, depth = 1, forwardLoadCache = null) {
   const assets = [];
   for (const msg of messages || []) {
     const safeMsgId = asText(msg?.msgId);
@@ -930,8 +999,8 @@ async function collectForwardMediaRecords(ctx, messages, depth = 1) {
         continue;
       }
       if (element?.multiForwardMsgElement?.resId) {
-        const nested = await loadForwardMessages(ctx, msg, element.multiForwardMsgElement);
-        const nestedAssets = await collectForwardMediaRecords(ctx, nested, depth + 1);
+        const nested = await loadForwardMessages(ctx, msg, element.multiForwardMsgElement, forwardLoadCache);
+        const nestedAssets = await collectForwardMediaRecords(ctx, nested, depth + 1, forwardLoadCache);
         assets.push(...nestedAssets);
       }
     }
@@ -951,10 +1020,11 @@ async function hydrateForwardMedia(ctx, payload) {
   if (!forwardElement?.multiForwardMsgElement?.resId) {
     throw new Error(`forward element ${elementId} not found`);
   }
-  const nestedMessages = await loadForwardMessages(ctx, rawMessage, forwardElement.multiForwardMsgElement);
+  const forwardLoadCache = new Map();
+  const nestedMessages = await loadForwardMessages(ctx, rawMessage, forwardElement.multiForwardMsgElement, forwardLoadCache);
     const target = buildForwardAssetTarget(payload);
     if (target) {
-      const matched = await findForwardMediaTarget(ctx, nestedMessages, target, 1);
+      const matched = await findForwardMediaTarget(ctx, nestedMessages, target, 1, forwardLoadCache);
       if (matched?.rawMessage && matched?.element) {
         const matchedAssetType = asText(target?.asset_type).toLowerCase();
         const shouldMaterialize = Boolean(payload?.materialize);
@@ -963,7 +1033,8 @@ async function hydrateForwardMedia(ctx, payload) {
         // drive the actual download. Avoid blocking the whole export on a long
         // downloadMedia(...) call before returning that metadata.
         const metadataOnly =
-          !shouldMaterialize && (matchedAssetType === "video" || matchedAssetType === "file");
+          !shouldMaterialize
+          && (matchedAssetType === "image" || matchedAssetType === "video" || matchedAssetType === "file");
         const normalized = metadataOnly
           ? normalizeHydratedElementRecord(
               matched.rawMessage,
@@ -994,9 +1065,41 @@ async function hydrateForwardMedia(ctx, payload) {
               : "hydrated",
         };
       }
+      return {
+        assets: [],
+        targeted: true,
+        targeted_mode: "targeted_miss",
+      };
     }
-  const assets = await collectForwardMediaRecords(ctx, nestedMessages, 1);
+  const assets = await collectForwardMediaRecords(ctx, nestedMessages, 1, forwardLoadCache);
   return { assets };
+}
+
+async function hydrateForwardDetail(ctx, payload) {
+  const elementId = asText(payload?.element_id);
+  if (!elementId) {
+    throw new Error("element_id is required");
+  }
+  const { rawMessage } = await getRawMessageByContext(ctx, payload);
+  const forwardElement = rawMessage?.elements?.find(
+    (element) => asText(element?.elementId) === elementId && element?.multiForwardMsgElement?.resId,
+  );
+  if (!forwardElement?.multiForwardMsgElement?.resId) {
+    throw new Error(`forward element ${elementId} not found`);
+  }
+  const forwardLoadCache = new Map();
+  const nestedMessages = await loadForwardMessages(
+    ctx,
+    rawMessage,
+    forwardElement.multiForwardMsgElement,
+    forwardLoadCache,
+  );
+  return {
+    targeted: true,
+    forward_id: asText(forwardElement.multiForwardMsgElement?.resId) || null,
+    message_count: Array.isArray(nestedMessages) ? nestedMessages.length : 0,
+    messages: Array.isArray(nestedMessages) ? nestedMessages.map(slimRawMessage) : [],
+  };
 }
 
 export async function plugin_init(ctx) {
@@ -1009,6 +1112,7 @@ export async function plugin_init(ctx) {
     { name: "history_tail_bulk", method: "POST", path: "/history-tail-bulk" },
     { name: "hydrate_media", method: "POST", path: "/hydrate-media" },
     { name: "hydrate_media_batch", method: "POST", path: "/hydrate-media-batch" },
+    { name: "hydrate_forward_detail", method: "POST", path: "/hydrate-forward-detail" },
     { name: "hydrate_forward_media", method: "POST", path: "/hydrate-forward-media" },
   ];
 
@@ -1080,6 +1184,19 @@ export async function plugin_init(ctx) {
       res.json({ code: 0, data });
     } catch (error) {
       ctx.logger.error("hydrate-media-batch route failed", error);
+      res.status(500).json({
+        code: -1,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  ctx.router.postNoAuth("/hydrate-forward-detail", async (req, res) => {
+    try {
+      const data = await hydrateForwardDetail(ctx, req.body || {});
+      res.json({ code: 0, data });
+    } catch (error) {
+      ctx.logger.error("hydrate-forward-detail route failed", error);
       res.status(500).json({
         code: -1,
         message: error instanceof Error ? error.message : String(error),
