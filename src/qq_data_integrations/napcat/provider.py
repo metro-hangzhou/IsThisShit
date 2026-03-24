@@ -13,6 +13,7 @@ from .fast_history_client import (
     FAST_HISTORY_MAX_PAGE_SIZE,
     NapCatFastHistoryClient,
     NapCatFastHistoryError,
+    NapCatFastHistoryUnavailable,
 )
 from .http_client import NapCatApiError, NapCatApiTimeoutError, NapCatHttpClient
 from .models import ChatHistoryBounds
@@ -43,6 +44,7 @@ class NapCatHistoryProvider:
         self._fast_mode = fast_mode
         self._fast_available: bool | None = None
         self._fast_tail_bulk_available: bool | None = None
+        self._fast_forward_detail_available: bool | None = None
         self._known_unavailable_forward_ids: dict[str, str] = {}
         self._known_unavailable_history_keys: dict[str, str] = {}
         self._forward_history_probe_outcomes: dict[str, dict[str, Any]] = {}
@@ -50,6 +52,7 @@ class NapCatHistoryProvider:
     def reset_export_state(self) -> None:
         self._fast_available = None
         self._fast_tail_bulk_available = None
+        self._fast_forward_detail_available = None
         self._known_unavailable_forward_ids.clear()
         self._known_unavailable_history_keys.clear()
         self._forward_history_probe_outcomes.clear()
@@ -1297,6 +1300,9 @@ class NapCatHistoryProvider:
         structure_unavailable = 0
         history_retry_calls = 0
         history_retry_hits = 0
+        fast_plugin_calls = 0
+        fast_plugin_hits = 0
+        known_fast_plugin_unavailable_hits = 0
         get_forward_msg_calls = 0
         get_forward_msg_hits = 0
         known_history_unavailable_hits = 0
@@ -1346,7 +1352,54 @@ class NapCatHistoryProvider:
                 continue
 
             message_key = self._forward_message_key(target["message"])
+            forward_id = target["forward_id"]
             history_outcome = _history_outcome(message_key)
+            if forward_id in cache:
+                cache_hits += 1
+                resolved_messages = cache.get(forward_id)
+                if resolved_messages:
+                    target["attach"][target["key"]] = resolved_messages
+                    enriched += 1
+                if progress_callback is not None and (
+                    processed == total_targets or processed % 10 == 0
+                ):
+                    progress_callback(
+                        {
+                            "phase": "forward_expand",
+                            "processed_forwards": processed,
+                            "total_forwards": total_targets,
+                            "resolved_forwards": enriched,
+                        }
+                    )
+                continue
+
+            fast_plugin_messages: list[dict[str, Any]] | None = None
+            fast_plugin_reason: str | None = None
+            if not skip_history_retry:
+                fast_plugin_calls += 1
+                fast_plugin_messages, fast_plugin_reason = (
+                    self._hydrate_forward_message_via_fast_plugin(target)
+                )
+                if fast_plugin_messages:
+                    fast_plugin_hits += 1
+                    cache[forward_id] = fast_plugin_messages
+                    target["attach"][target["key"]] = fast_plugin_messages
+                    enriched += 1
+                    if progress_callback is not None and (
+                        processed == total_targets or processed % 10 == 0
+                    ):
+                        progress_callback(
+                            {
+                                "phase": "forward_expand",
+                                "processed_forwards": processed,
+                                "total_forwards": total_targets,
+                                "resolved_forwards": enriched,
+                            }
+                        )
+                    continue
+                if fast_plugin_reason:
+                    known_fast_plugin_unavailable_hits += 1
+
             if (
                 not skip_history_retry
                 and message_key
@@ -1386,7 +1439,6 @@ class NapCatHistoryProvider:
                     )
                 continue
 
-            forward_id = target["forward_id"]
             if forward_id in self._known_unavailable_forward_ids:
                 known_forward_unavailable_hits += 1
                 cache[forward_id] = None
@@ -1494,8 +1546,6 @@ class NapCatHistoryProvider:
                     )
                     if cache[forward_id]:
                         get_forward_msg_hits += 1
-            else:
-                cache_hits += 1
             resolved_messages = cache.get(forward_id)
             if resolved_messages:
                 target["attach"][target["key"]] = resolved_messages
@@ -1521,6 +1571,9 @@ class NapCatHistoryProvider:
                 "resolved_forwards": enriched,
                 "already_resolved": already_resolved,
                 "structure_unavailable_count": structure_unavailable,
+                "fast_plugin_calls": fast_plugin_calls,
+                "fast_plugin_hits": fast_plugin_hits,
+                "known_fast_plugin_unavailable_hits": known_fast_plugin_unavailable_hits,
                 "history_retry_calls": history_retry_calls,
                 "history_retry_hits": history_retry_hits,
                 "get_forward_msg_calls": get_forward_msg_calls,
@@ -1561,6 +1614,66 @@ class NapCatHistoryProvider:
         if "内层消息" in message:
             return "forward_structure_unavailable_inner_message"
         return None
+
+    def _hydrate_forward_message_via_fast_plugin(
+        self,
+        target: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
+        if self._fast_client is None or self._fast_mode == "off":
+            return None, None
+        hydrate_forward_detail = getattr(self._fast_client, "hydrate_forward_detail", None)
+        if not callable(hydrate_forward_detail):
+            return None, None
+        if self._fast_forward_detail_available is False and self._fast_mode != "force":
+            return None, "forward_structure_unavailable_fast_plugin_route"
+
+        message = target.get("message")
+        if not isinstance(message, dict):
+            return None, None
+        raw_message = _message_raw(message)
+        message_id_raw = str(
+            target.get("message_id")
+            or message.get("message_id")
+            or message.get("messageId")
+            or raw_message.get("msgId")
+            or ""
+        ).strip()
+        element_id = str(target.get("element_id") or "").strip()
+        peer_uid = str(raw_message.get("peerUid") or "").strip()
+        chat_type_raw = raw_message.get("chatType")
+        if (
+            not message_id_raw
+            or not element_id
+            or not peer_uid
+            or chat_type_raw in {None, ""}
+        ):
+            return None, None
+
+        try:
+            payload = hydrate_forward_detail(
+                message_id_raw=message_id_raw,
+                element_id=element_id,
+                peer_uid=peer_uid,
+                chat_type_raw=chat_type_raw,
+            )
+        except NapCatFastHistoryUnavailable:
+            if self._fast_mode == "force":
+                raise
+            self._fast_forward_detail_available = False
+            return None, "forward_structure_unavailable_fast_plugin_route"
+        except NapCatFastHistoryError:
+            if self._fast_mode == "force":
+                raise
+            return None, None
+        except httpx.HTTPError:
+            return None, None
+
+        self._fast_available = True
+        self._fast_forward_detail_available = True
+        nested_messages = self._extract_messages(payload)
+        if not nested_messages:
+            return None, None
+        return nested_messages, None
 
     def _hydrate_forward_message_via_history(
         self,
@@ -2027,6 +2140,7 @@ class NapCatHistoryProvider:
                         or message.get("messageId")
                         or raw_message.get("msgId"),
                         "forward_id": forward_id,
+                        "element_id": str(element.get("elementId") or "").strip() or None,
                         "attach": forward,
                         "key": "messages",
                     }
@@ -2052,6 +2166,7 @@ class NapCatHistoryProvider:
                         or message.get("messageId")
                         or raw_message.get("msgId"),
                         "forward_id": forward_id,
+                        "element_id": str(data.get("element_id") or "").strip() or None,
                         "attach": data,
                         "key": "content",
                     }

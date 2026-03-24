@@ -238,6 +238,24 @@ class NapCatFastHistoryClient:
         response = self._post("/hydrate-forward-media", json=payload, timeout=timeout)
         return self._extract_data(response)
 
+    def hydrate_forward_detail(
+        self,
+        *,
+        message_id_raw: str,
+        element_id: str,
+        peer_uid: str,
+        chat_type_raw: int | str,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> Any:
+        payload = {
+            "message_id_raw": str(message_id_raw),
+            "element_id": str(element_id),
+            "peer_uid": str(peer_uid),
+            "chat_type_raw": int(chat_type_raw),
+        }
+        response = self._post("/hydrate-forward-detail", json=payload, timeout=timeout)
+        return self._extract_data(response)
+
     def _extract_data(self, response: httpx.Response, *, require_code: bool = True) -> Any:
         if response.status_code in {404, 503}:
             raise NapCatFastHistoryUnavailable(
