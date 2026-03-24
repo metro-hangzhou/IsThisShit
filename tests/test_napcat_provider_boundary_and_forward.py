@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+from threading import Lock
+import time
 
 from qq_data_core.models import EXPORT_TIMEZONE, ExportRequest, SourceChatSnapshot
 from qq_data_integrations.napcat.http_client import NapCatApiError
@@ -10,6 +12,49 @@ from qq_data_integrations.napcat.provider import FORWARD_ELEMENT_TYPE, NapCatHis
 class _DummyClient:
     def get_forward_msg(self, message_id: str):
         raise NotImplementedError
+
+
+class _ConcurrentFastPluginClient:
+    def __init__(self, *, delay_s: float = 0.02) -> None:
+        self.delay_s = delay_s
+        self.calls: list[dict[str, object]] = []
+        self.active = 0
+        self.max_active = 0
+        self._lock = Lock()
+
+    def hydrate_forward_detail(self, **kwargs):
+        with self._lock:
+            self.calls.append(kwargs)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(self.delay_s)
+            return {
+                "messages": [
+                    {
+                        "message_id": f"nested-{len(self.calls)}",
+                        "message_seq": "1",
+                        "sender": {"uin": "42", "nickname": "Alice"},
+                        "rawMessage": {
+                            "msgId": "nested",
+                            "msgSeq": "1",
+                            "senderUin": "42",
+                            "sendNickName": "Alice",
+                            "peerUid": "922065597",
+                            "chatType": 2,
+                            "elements": [
+                                {
+                                    "elementType": 1,
+                                    "textElement": {"content": "hello from plugin"},
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+        finally:
+            with self._lock:
+                self.active -= 1
 
 
 def _request() -> ExportRequest:
@@ -39,6 +84,26 @@ def _forward_reference_message(message_id: str, seq: str) -> dict[str, object]:
         ],
     }
     return message
+
+
+def _plugin_forward_target(message_id: str, seq: str) -> dict[str, object]:
+    return {
+        "message_id": message_id,
+        "message_seq": seq,
+        "raw_message": {
+            "msgId": message_id,
+            "msgSeq": seq,
+            "peerUid": "922065597",
+            "chatType": 2,
+            "elements": [
+                {
+                    "elementType": FORWARD_ELEMENT_TYPE,
+                    "elementId": f"elem-{message_id}",
+                    "multiForwardMsgElement": {"resId": f"fwd-{message_id}"},
+                }
+            ],
+        },
+    }
 
 
 def _snapshot(messages: list[dict[str, object]], *, source: str = "napcat_fast_history") -> SourceChatSnapshot:
@@ -372,6 +437,188 @@ def test_fetch_full_snapshot_falls_back_to_history_page_after_partial_fast_full_
     assert [item["message_id"] for item in snapshot.messages] == ["m1", "m2", "m3"]
 
 
+def test_fetch_fast_history_tail_bulk_uses_seq_window_strategy() -> None:
+    class _FastClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def get_history_tail_bulk(
+            self,
+            chat_type: str,
+            chat_id: str,
+            *,
+            data_count: int,
+            page_size: int,
+            anchor_message_id: str | None = None,
+            anchor_message_seq: str | None = None,
+            history_fetch_strategy: str | None = None,
+            include_debug_stats: bool = False,
+            timeout=None,
+        ):
+            self.calls.append(
+                {
+                    "chat_type": chat_type,
+                    "chat_id": chat_id,
+                    "data_count": data_count,
+                    "page_size": page_size,
+                    "anchor_message_id": anchor_message_id,
+                    "anchor_message_seq": anchor_message_seq,
+                    "history_fetch_strategy": history_fetch_strategy,
+                    "include_debug_stats": include_debug_stats,
+                }
+            )
+            return {"messages": [], "pages_scanned": 0, "exhausted": True, "page_size": page_size}
+
+    fast_client = _FastClient()
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=fast_client)
+
+    provider._fetch_fast_history_tail_bulk(  # type: ignore[attr-defined]
+        _request(),
+        data_count=2000,
+        page_size=500,
+        anchor_message_id="anchor-msg",
+        anchor_message_seq="7473",
+    )
+
+    assert fast_client.calls == [
+        {
+            "chat_type": "group",
+            "chat_id": "922065597",
+            "data_count": 2000,
+            "page_size": 500,
+            "anchor_message_id": "anchor-msg",
+            "anchor_message_seq": "7473",
+            "history_fetch_strategy": "seq_window",
+            "include_debug_stats": False,
+        }
+    ]
+
+
+def test_fetch_snapshot_tail_prefers_plugin_full_bulk_route_for_large_request() -> None:
+    class _FastClient:
+        def __init__(self) -> None:
+            self.full_calls: list[dict[str, object]] = []
+            self.tail_calls: list[dict[str, object]] = []
+
+        def get_history_full_bulk(
+            self,
+            chat_type: str,
+            chat_id: str,
+            *,
+            data_count: int,
+            page_size: int,
+            history_fetch_strategy: str | None = None,
+            include_debug_stats: bool = False,
+            timeout=None,
+        ):
+            self.full_calls.append(
+                {
+                    "chat_type": chat_type,
+                    "chat_id": chat_id,
+                    "data_count": data_count,
+                    "page_size": page_size,
+                    "history_fetch_strategy": history_fetch_strategy,
+                    "include_debug_stats": include_debug_stats,
+                }
+            )
+            return {
+                "messages": [_message("m1", "1"), _message("m2", "2"), _message("m3", "3")],
+                "pages_scanned": 3,
+                "page_size": 200,
+                "requested_data_count": data_count,
+                "exhausted": True,
+                "elapsed_ms": 222,
+            }
+
+        def get_history_tail_bulk(self, *args, **kwargs):
+            self.tail_calls.append({"args": args, "kwargs": kwargs})
+            return None
+
+    fast_client = _FastClient()
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=fast_client)
+    provider._finalize_snapshot = lambda snapshot, progress_callback=None: snapshot  # type: ignore[method-assign]
+
+    snapshot = provider.fetch_snapshot_tail(
+        ExportRequest(chat_type="group", chat_id="922065597", chat_name="test", limit=5000),
+        data_count=5000,
+        page_size=500,
+        progress_callback=None,
+    )
+
+    assert [item["message_id"] for item in snapshot.messages] == ["m1", "m2", "m3"]
+    assert snapshot.metadata["source"] == "napcat_fast_history_bulk"
+    assert fast_client.tail_calls == []
+    assert fast_client.full_calls == [
+        {
+            "chat_type": "group",
+            "chat_id": "922065597",
+            "data_count": 5000,
+            "page_size": 200,
+            "history_fetch_strategy": "seq_window",
+            "include_debug_stats": False,
+        }
+    ]
+
+
+def test_fetch_full_snapshot_prefers_plugin_full_bulk_route() -> None:
+    class _FastClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def get_history_full_bulk(
+            self,
+            chat_type: str,
+            chat_id: str,
+            *,
+            data_count: int,
+            page_size: int,
+            history_fetch_strategy: str | None = None,
+            include_debug_stats: bool = False,
+            timeout=None,
+        ):
+            self.calls.append(
+                {
+                    "chat_type": chat_type,
+                    "chat_id": chat_id,
+                    "data_count": data_count,
+                    "page_size": page_size,
+                    "history_fetch_strategy": history_fetch_strategy,
+                    "include_debug_stats": include_debug_stats,
+                }
+            )
+            return {
+                "messages": [_message("m1", "1"), _message("m2", "2")],
+                "pages_scanned": 2,
+                "page_size": 200,
+                "requested_data_count": data_count,
+                "exhausted": True,
+                "elapsed_ms": 123,
+            }
+
+    fast_client = _FastClient()
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=fast_client)
+    provider._finalize_snapshot = lambda snapshot, progress_callback=None: snapshot  # type: ignore[method-assign]
+
+    snapshot = provider.fetch_full_snapshot(
+        ExportRequest(chat_type="group", chat_id="922065597", chat_name="test", limit=13000),
+        page_size=500,
+        progress_callback=None,
+    )
+
+    assert [item["message_id"] for item in snapshot.messages] == ["m1", "m2"]
+    assert snapshot.metadata["source"] == "napcat_fast_history_bulk"
+    assert fast_client.calls == [
+        {
+            "chat_type": "group",
+            "chat_id": "922065597",
+            "data_count": 13000,
+            "page_size": 200,
+            "history_fetch_strategy": "seq_window",
+            "include_debug_stats": False,
+        }
+    ]
+
+
 def test_enrich_forward_details_uses_history_as_last_chance_after_get_forward_msg_failure() -> None:
     class _ForwardFailClient:
         def get_forward_msg(self, message_id: str):
@@ -558,6 +805,281 @@ def test_enrich_forward_details_uses_fast_plugin_before_history_and_get_forward_
     summary = next(row for row in progress if row.get("phase") == "forward_expand_summary")
     assert summary["fast_plugin_calls"] == 1
     assert summary["fast_plugin_hits"] == 1
+
+
+def test_enrich_forward_details_prefetches_fast_plugin_concurrently() -> None:
+    fast_client = _ConcurrentFastPluginClient()
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=fast_client)
+    messages = [_plugin_forward_target(f"m-{index}", str(index)) for index in range(1, 7)]
+    progress: list[dict[str, object]] = []
+
+    enriched, unavailable = provider._enrich_forward_details(
+        messages,
+        chat_type="group",
+        chat_id="922065597",
+        skip_history_retry=False,
+        progress_callback=progress.append,
+    )
+
+    assert enriched == 6
+    assert unavailable == 0
+    assert len(fast_client.calls) == 6
+    assert fast_client.max_active > 1
+    summary = next(row for row in progress if row.get("phase") == "forward_expand_summary")
+    assert summary["history_retry_calls"] == 0
+    assert summary["get_forward_msg_calls"] == 0
+
+
+def test_enrich_forward_details_prefers_fast_plugin_batch_route() -> None:
+    class _ForwardFailClient:
+        def __init__(self) -> None:
+            self.forward_calls: list[str] = []
+
+        def get_forward_msg(self, message_id: str):
+            self.forward_calls.append(message_id)
+            raise NapCatApiError("找不到相关的聊天记录")
+
+    class _FastPluginBatchClient:
+        def __init__(self) -> None:
+            self.batch_calls: list[list[dict[str, object]]] = []
+            self.single_calls: list[dict[str, object]] = []
+
+        def hydrate_forward_detail_batch(self, items):
+            self.batch_calls.append(list(items))
+            results = []
+            for index, item in enumerate(items, start=1):
+                results.append(
+                    {
+                        "ok": True,
+                        "data": {
+                            "messages": [
+                                {
+                                    "message_id": f"nested-{index}",
+                                    "message_seq": str(index),
+                                    "sender": {"uin": "42", "nickname": "Alice"},
+                                    "rawMessage": {
+                                        "msgId": f"nested-{index}",
+                                        "msgSeq": str(index),
+                                        "senderUin": "42",
+                                        "sendNickName": "Alice",
+                                        "peerUid": str(item["peer_uid"]),
+                                        "chatType": item["chat_type_raw"],
+                                        "elements": [
+                                            {
+                                                "elementType": 1,
+                                                "textElement": {"content": f"hello {index}"},
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+            return {"items": results}
+
+        def hydrate_forward_detail(self, **kwargs):
+            self.single_calls.append(kwargs)
+            raise AssertionError("single forward-detail route should not be used when batch route is available")
+
+    client = _ForwardFailClient()
+    fast_client = _FastPluginBatchClient()
+    provider = NapCatHistoryProvider(client, fast_client=fast_client)
+    target_messages = [
+        {
+            "message_id": "m-forward-1",
+            "message_seq": "23388",
+            "raw_message": {
+                "msgId": "m-forward-1",
+                "msgSeq": "23388",
+                "peerUid": "922065597",
+                "chatType": 2,
+                "elements": [
+                    {
+                        "elementType": FORWARD_ELEMENT_TYPE,
+                        "elementId": "elem-forward-1",
+                        "multiForwardMsgElement": {"resId": "fwd-1"},
+                    }
+                ],
+            },
+        },
+        {
+            "message_id": "m-forward-2",
+            "message_seq": "23389",
+            "raw_message": {
+                "msgId": "m-forward-2",
+                "msgSeq": "23389",
+                "peerUid": "922065597",
+                "chatType": 2,
+                "elements": [
+                    {
+                        "elementType": FORWARD_ELEMENT_TYPE,
+                        "elementId": "elem-forward-2",
+                        "multiForwardMsgElement": {"resId": "fwd-2"},
+                    }
+                ],
+            },
+        },
+    ]
+
+    progress: list[dict[str, object]] = []
+    enriched, unavailable = provider._enrich_forward_details(
+        target_messages,
+        chat_type="group",
+        chat_id="922065597",
+        skip_history_retry=False,
+        progress_callback=progress.append,
+    )
+
+    assert enriched == 2
+    assert unavailable == 0
+    assert client.forward_calls == []
+    assert len(fast_client.batch_calls) == 1
+    assert len(fast_client.batch_calls[0]) == 2
+    assert fast_client.single_calls == []
+    summary = next(row for row in progress if row.get("phase") == "forward_expand_summary")
+    assert summary["fast_plugin_calls"] == 2
+    assert summary["fast_plugin_hits"] == 2
+    assert summary["history_retry_calls"] == 0
+    assert summary["get_forward_msg_calls"] == 0
+
+
+def test_enrich_forward_details_falls_back_to_single_fast_plugin_after_partial_batch_failure() -> None:
+    class _ForwardFailClient:
+        def __init__(self) -> None:
+            self.forward_calls: list[str] = []
+
+        def get_forward_msg(self, message_id: str):
+            self.forward_calls.append(message_id)
+            raise NapCatApiError("找不到相关的聊天记录")
+
+    class _FastPluginBatchClient:
+        def __init__(self) -> None:
+            self.batch_calls: list[list[dict[str, object]]] = []
+            self.single_calls: list[dict[str, object]] = []
+
+        def hydrate_forward_detail_batch(self, items):
+            self.batch_calls.append(list(items))
+            return {
+                "items": [
+                    {
+                        "ok": True,
+                        "data": {
+                            "messages": [
+                                {
+                                    "message_id": "nested-batch",
+                                    "message_seq": "1",
+                                    "sender": {"uin": "42", "nickname": "Alice"},
+                                    "rawMessage": {
+                                        "msgId": "nested-batch",
+                                        "msgSeq": "1",
+                                        "senderUin": "42",
+                                        "sendNickName": "Alice",
+                                        "peerUid": "922065597",
+                                        "chatType": 2,
+                                        "elements": [
+                                            {
+                                                "elementType": 1,
+                                                "textElement": {"content": "hello batch"},
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                    {
+                        "ok": False,
+                        "error": "temporary batch miss",
+                    },
+                ]
+            }
+
+        def hydrate_forward_detail(self, **kwargs):
+            self.single_calls.append(kwargs)
+            return {
+                "messages": [
+                    {
+                        "message_id": "nested-single",
+                        "message_seq": "2",
+                        "sender": {"uin": "42", "nickname": "Alice"},
+                        "rawMessage": {
+                            "msgId": "nested-single",
+                            "msgSeq": "2",
+                            "senderUin": "42",
+                            "sendNickName": "Alice",
+                            "peerUid": str(kwargs["peer_uid"]),
+                            "chatType": kwargs["chat_type_raw"],
+                            "elements": [
+                                {
+                                    "elementType": 1,
+                                    "textElement": {"content": "hello single"},
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+
+    client = _ForwardFailClient()
+    fast_client = _FastPluginBatchClient()
+    provider = NapCatHistoryProvider(client, fast_client=fast_client)
+    target_messages = [
+        {
+            "message_id": "m-forward-1",
+            "message_seq": "23388",
+            "raw_message": {
+                "msgId": "m-forward-1",
+                "msgSeq": "23388",
+                "peerUid": "922065597",
+                "chatType": 2,
+                "elements": [
+                    {
+                        "elementType": FORWARD_ELEMENT_TYPE,
+                        "elementId": "elem-forward-1",
+                        "multiForwardMsgElement": {"resId": "fwd-1"},
+                    }
+                ],
+            },
+        },
+        {
+            "message_id": "m-forward-2",
+            "message_seq": "23389",
+            "raw_message": {
+                "msgId": "m-forward-2",
+                "msgSeq": "23389",
+                "peerUid": "922065597",
+                "chatType": 2,
+                "elements": [
+                    {
+                        "elementType": FORWARD_ELEMENT_TYPE,
+                        "elementId": "elem-forward-2",
+                        "multiForwardMsgElement": {"resId": "fwd-2"},
+                    }
+                ],
+            },
+        },
+    ]
+
+    progress: list[dict[str, object]] = []
+    enriched, unavailable = provider._enrich_forward_details(
+        target_messages,
+        chat_type="group",
+        chat_id="922065597",
+        skip_history_retry=False,
+        progress_callback=progress.append,
+    )
+
+    assert enriched == 2
+    assert unavailable == 0
+    assert client.forward_calls == []
+    assert len(fast_client.batch_calls) == 1
+    assert len(fast_client.batch_calls[0]) == 2
+    assert len(fast_client.single_calls) == 1
+    assert fast_client.single_calls[0]["message_id_raw"] == "m-forward-2"
+    summary = next(row for row in progress if row.get("phase") == "forward_expand_summary")
+    assert summary["fast_plugin_calls"] == 2
+    assert summary["fast_plugin_hits"] == 2
     assert summary["history_retry_calls"] == 0
     assert summary["get_forward_msg_calls"] == 0
 
@@ -1010,6 +1532,118 @@ def test_hydrate_fast_history_tail_forwards_bulk_uses_sparse_history_strategy_fo
     assert forward_events[0]["history_calls"] == 1
     assert forward_events[0]["resolved_forward_ref_count"] == 0
     assert forward_events[0]["unresolved_forward_ref_count"] == 1
+
+
+def test_hydrate_fast_history_tail_forwards_bulk_uses_sparse_history_strategy_for_three_forward_refs() -> None:
+    class _SparseHydrateClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def get_group_msg_history(
+            self,
+            chat_id: str,
+            *,
+            message_seq: str | None,
+            count: int,
+            reverse_order: bool,
+            parse_mult_msg: bool,
+        ):
+            self.calls.append(
+                {
+                    "chat_id": chat_id,
+                    "message_seq": message_seq,
+                    "count": count,
+                    "reverse_order": reverse_order,
+                    "parse_mult_msg": parse_mult_msg,
+                }
+            )
+            return {
+                "messages": [
+                    {
+                        "message_id": message_seq,
+                        "message_seq": message_seq,
+                        "message": [
+                            {
+                                "type": "forward",
+                                "data": {"id": message_seq, "content": [{"text": "nested"}]},
+                            }
+                        ],
+                    }
+                ]
+            }
+
+    client = _SparseHydrateClient()
+    provider = NapCatHistoryProvider(client)
+    progress: list[dict[str, object]] = []
+    messages = [
+        {
+            "message_id": f"msg-{index}",
+            "message_seq": str(23000 + index),
+            "timestamp_iso": "2026-03-24T12:00:00+08:00",
+            "raw_message": {
+                "msgId": f"msg-{index}",
+                "msgSeq": str(23000 + index),
+                "elements": [],
+            },
+        }
+        for index in range(200)
+    ]
+    for offset in range(3):
+        messages[-(offset + 1)] = {
+            "message_id": f"msg-forward-{offset}",
+            "message_seq": str(23388 + offset),
+            "timestamp_iso": "2026-03-24T12:00:00+08:00",
+            "raw_message": {
+                "msgId": f"msg-forward-{offset}",
+                "msgSeq": str(23388 + offset),
+                "elements": [
+                    {
+                        "elementType": 16,
+                        "multiForwardMsgElement": {"resId": f"msg-forward-{offset}"},
+                    }
+                ],
+            },
+        }
+
+    hydrated = provider._hydrate_fast_history_tail_forwards_bulk(
+        _request(),
+        messages,
+        page_size=200,
+        progress_callback=progress.append,
+    )
+
+    assert hydrated == 3
+    assert client.calls == [
+        {
+            "chat_id": "922065597",
+            "message_seq": "23390",
+            "count": 1,
+            "reverse_order": True,
+            "parse_mult_msg": True,
+        },
+        {
+            "chat_id": "922065597",
+            "message_seq": "23389",
+            "count": 1,
+            "reverse_order": True,
+            "parse_mult_msg": True,
+        },
+        {
+            "chat_id": "922065597",
+            "message_seq": "23388",
+            "count": 1,
+            "reverse_order": True,
+            "parse_mult_msg": True,
+        },
+    ]
+    forward_events = [
+        row for row in progress if row.get("phase") == "tail_forward_hydrate_window"
+    ]
+    assert len(forward_events) == 1
+    assert forward_events[0]["strategy"] == "history_retry_sparse_forward"
+    assert forward_events[0]["history_calls"] == 3
+    assert forward_events[0]["forward_ref_count"] == 3
+    assert forward_events[0]["hydrated_count"] == 3
 
 
 def test_hydrate_fast_history_page_forwards_only_records_bulk_miss_for_exact_match() -> None:

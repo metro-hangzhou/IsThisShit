@@ -78,6 +78,18 @@ class _BlankPublicFileClient:
         return {"file": "", "url": ""}
 
 
+class _PublicImageClient:
+    def __init__(self) -> None:
+        self.get_image_calls = 0
+
+    def get_image(self, *args, **kwargs):
+        self.get_image_calls += 1
+        return {
+            "file": str(Path(__file__).resolve()),
+            "url": "",
+        }
+
+
 class _RemoteMediaDownloader(NapCatMediaDownloader):
     def __init__(self, remote_cache_dir: Path) -> None:
         super().__init__(_DummyClient(), remote_cache_dir=remote_cache_dir)
@@ -126,6 +138,20 @@ class _ResettingExecutor:
         return
 
 
+class _ImmediateExecutor:
+    def submit(self, fn, *args, **kwargs):
+        future: Future[dict[str, object] | None] = Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as exc:  # pragma: no cover - helper should stay simple
+            future.set_exception(exc)
+        return future
+
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False) -> None:
+        _ = wait, cancel_futures
+        return
+
+
 class _ResetDuringTokenPrefetchDownloader(NapCatMediaDownloader):
     def _create_prefetch_executors(self) -> None:  # type: ignore[override]
         self._remote_prefetch_runtime_disabled = True
@@ -165,6 +191,23 @@ def _workspace_temp_dir() -> Path:
     root = Path(".tmp") / f"pytest_remote_cache_{uuid.uuid4().hex}"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _second_pass_request(*, file_id: str = "live-token") -> dict[str, object]:
+    return {
+        "asset_type": "image",
+        "file_name": "sample-image.jpg",
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Pic\2025-08\Ori\sample-image",
+        "md5": "sample-md5",
+        "timestamp_ms": 1754057899000,
+        "download_hint": {
+            "file_id": file_id,
+            "message_id_raw": "7565810516712816523",
+            "element_id": "7565810516712816524",
+            "peer_uid": "922065597",
+            "chat_type_raw": "group",
+        },
+    }
 
 
 class _TimeoutForwardClient:
@@ -227,6 +270,10 @@ class _UnavailableContextClient:
         self.forward_calls: list[dict[str, object]] = []
         self.media_calls: list[dict[str, object]] = []
 
+    def hydrate_media(self, **kwargs):
+        self.media_calls.append(kwargs)
+        raise NapCatFastHistoryUnavailable("context route missing")
+
     def hydrate_forward_media(self, **kwargs):
         self.forward_calls.append(kwargs)
         return {
@@ -240,9 +287,15 @@ class _UnavailableContextClient:
             ]
         }
 
-    def hydrate_media(self, **kwargs):
-        self.media_calls.append(kwargs)
-        raise NapCatFastHistoryUnavailable("context route missing")
+
+class _NeighborProbeDownloader(NapCatMediaDownloader):
+    def __init__(self) -> None:
+        super().__init__(_DummyClient())
+        self.base_dir_index_builds = 0
+
+    def _ntqq_image_candidate_index_for_base_dir(self, base_dir: Path):  # type: ignore[override]
+        self.base_dir_index_builds += 1
+        return super()._ntqq_image_candidate_index_for_base_dir(base_dir)
 
 
 class _SuccessForwardClient:
@@ -274,9 +327,31 @@ class _TargetedForwardMetadataClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
+    def capabilities(self):
+        return {"features": {"forward_parent_metadata_scope": True}}
+
     def hydrate_forward_media(self, **kwargs):
         self.calls.append(kwargs)
         requested_file_name = str(kwargs.get("file_name") or "").strip()
+        if not requested_file_name:
+            return {
+                "assets": [
+                    {
+                        "asset_type": "image",
+                        "asset_role": "forward_media",
+                        "file_name": "A1111111111111111111111111111111.jpg",
+                        "md5": "a1111111111111111111111111111111",
+                        "file": str(Path(__file__).resolve()),
+                    },
+                    {
+                        "asset_type": "image",
+                        "asset_role": "forward_media",
+                        "file_name": "B2222222222222222222222222222222.jpg",
+                        "md5": "b2222222222222222222222222222222",
+                        "file": str(Path(__file__).resolve()),
+                    },
+                ],
+            }
         return {
             "targeted": True,
             "targeted_mode": "metadata_only",
@@ -356,6 +431,31 @@ class _OldForwardTokenOnlyClient:
         }
 
 
+class _ForwardMetadataOnlyVideoClient:
+    def __init__(self, stale_path: str) -> None:
+        self.stale_path = stale_path
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            raise AssertionError("targeted materialize should be skipped after direct public token proof")
+        return {
+            "targeted": True,
+            "targeted_mode": "metadata_only",
+            "assets": [
+                {
+                    "asset_type": "video",
+                    "file_name": str(kwargs.get("file_name") or "forward-video.mp4"),
+                    "file_id": str(kwargs.get("file_id") or ""),
+                    "file_size": "8551137",
+                    "file": self.stale_path,
+                    "url": self.stale_path,
+                }
+            ],
+        }
+
+
 def test_remote_payload_sync_rejects_json_api_failure_body() -> None:
     downloader = NapCatMediaDownloader(
         _DummyClient(),
@@ -421,6 +521,22 @@ class _ForwardImageMetadataTimeoutClient:
         if kwargs.get("materialize"):
             raise AssertionError("forward image targeted materialize should not run after metadata timeout")
         raise NapCatFastHistoryTimeoutError("timed out")
+
+
+class _ForwardImageMissingLocalPayloadClient:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = dict(payload)
+        self.calls: list[dict[str, object]] = []
+
+    def hydrate_forward_media(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs.get("materialize"):
+            raise AssertionError("forward image targeted materialize should not run when metadata already proves missing")
+        return {
+            "targeted": True,
+            "targeted_mode": "metadata_only",
+            "assets": [dict(self.payload)],
+        }
 
 
 class _OldForwardMaterializeOnlyTimeoutClient:
@@ -744,6 +860,84 @@ def test_forward_metadata_success_payload_is_reused_for_sibling_assets() -> None
     assert second == (Path(__file__).resolve(), "napcat_forward_hydrated")
 
 
+def test_forward_image_metadata_uses_parent_scoped_request_without_target_selectors() -> None:
+    fast_client = _SuccessForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader._fast_capabilities_loaded = True
+    downloader._fast_capabilities = {"features": {"forward_parent_metadata_scope": True}}
+
+    result = downloader._download_via_forward_context(
+        _build_forward_request("2C167901425EF469C0B1F0BF859E4B2C.jpg"),
+        materialize=False,
+    )
+
+    assert result == (Path(__file__).resolve(), "napcat_forward_hydrated")
+    assert len(fast_client.calls) == 1
+    call = fast_client.calls[0]
+    assert call.get("asset_type") == "image"
+    assert call.get("asset_role") == "forward_media"
+    assert call.get("file_name") is None
+    assert call.get("md5") is None
+    assert call.get("file_id") is None
+    assert call.get("url") is None
+
+
+def test_prefetch_forward_metadata_dedupes_parent_scoped_image_requests() -> None:
+    fast_client = _TargetedForwardMetadataClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader._fast_capabilities_loaded = True
+    downloader._fast_capabilities = {"features": {"forward_parent_metadata_scope": True}}
+    requests = [
+        _build_forward_request("A1111111111111111111111111111111.jpg"),
+        _build_forward_request("B2222222222222222222222222222222.jpg"),
+    ]
+    progress: list[dict[str, object]] = []
+
+    downloader._prefetch_forward_metadata_requests(
+        requests,
+        progress_callback=progress.append,
+    )
+
+    assert len(fast_client.calls) == 1
+    call = fast_client.calls[0]
+    assert call.get("file_name") is None
+    assert call.get("asset_type") is None
+    assert call.get("asset_role") is None
+    assert call.get("md5") is None
+    assert call.get("file_id") is None
+    assert call.get("url") is None
+    assert downloader._prefetched_forward_media[downloader._request_key(requests[0])] == (
+        Path(__file__).resolve(),
+        "napcat_forward_hydrated",
+    )
+    assert downloader._prefetched_forward_media[downloader._request_key(requests[1])] == (
+        Path(__file__).resolve(),
+        "napcat_forward_hydrated",
+    )
+    done_event = next(
+        row
+        for row in progress
+        if row.get("phase") == "prefetch_forward_metadata" and row.get("stage") == "done"
+    )
+    assert done_event["request_count"] == 2
+    assert done_event["group_count"] == 1
+    assert done_event["processed_request_count"] == 2
+
+
+def test_forward_image_can_resolve_via_direct_public_token_hint() -> None:
+    client = _PublicImageClient()
+    downloader = NapCatMediaDownloader(client)
+    request = _build_forward_request("forward-direct-token.jpg")
+    hint = dict(request["download_hint"])
+    hint["file_id"] = "forward-image-public-token"
+    request["download_hint"] = hint
+
+    result = downloader._resolve_via_direct_public_token_hint(request)
+
+    assert result == (Path(__file__).resolve(), "napcat_public_token_get_image")
+    assert client.get_image_calls == 1
+
+
 def test_forward_video_public_token_timeout_skips_later_retry_even_with_new_token() -> None:
     client = _TimeoutPublicFileClient()
     downloader = NapCatMediaDownloader(client)
@@ -975,6 +1169,59 @@ def test_recent_forward_video_public_token_timeout_is_classified_before_targeted
     assert resolved == (None, "qq_expired_after_napcat")
     assert client.get_file_calls == 1
     assert client.timeouts == [downloader.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S]
+    assert len(fast_client.calls) == 1
+    assert fast_client.calls[0].get("materialize") is False
+
+
+def test_forward_video_metadata_only_direct_public_token_file_not_found_skips_materialize() -> None:
+    stale_path = r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-09\Ori\forward-metadata-only.mp4"
+    fast_client = _ForwardMetadataOnlyVideoClient(stale_path)
+    client = _MissingPublicFileClient()
+    downloader = NapCatMediaDownloader(client, fast_client=fast_client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("forward-metadata-only.mp4"), days=180),
+        stale_path,
+    )
+    request["download_hint"]["file_id"] = "NTV2COMPAT.forward-metadata-only"
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert client.get_file_calls == 1
+    assert len(fast_client.calls) == 1
+    assert fast_client.calls[0].get("materialize") is False
+
+
+def test_prefetched_forward_video_terminal_token_miss_is_preserved_and_skips_materialize() -> None:
+    stale_path = r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-09\Ori\forward-prefetched-metadata-only.mp4"
+    fast_client = _ForwardMetadataOnlyVideoClient(stale_path)
+    client = _MissingPublicFileClient()
+    downloader = NapCatMediaDownloader(client, fast_client=fast_client)
+    downloader._public_token_executor = _ImmediateExecutor()
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("forward-prefetched-metadata-only.mp4"), days=180),
+        stale_path,
+    )
+    request["download_hint"]["file_id"] = "NTV2COMPAT.forward-prefetched-metadata-only"
+
+    downloader._schedule_request_direct_public_token_prefetch(request)
+    cache_key = downloader._public_token_prefetch_key(
+        request_data=request,
+        action="get_file",
+        token="NTV2COMPAT.forward-prefetched-metadata-only",
+    )
+    cached, future = downloader._public_token_prefetch_state(cache_key)
+
+    assert future is None
+    assert isinstance(cached, dict)
+    assert isinstance(cached.get("payload"), dict)
+    assert cached["payload"]["_known_missing_classification"] == "qq_expired_after_napcat"
+    assert cached["resolver"] == "qq_expired_after_napcat"
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert client.get_file_calls == 1
     assert len(fast_client.calls) == 1
     assert fast_client.calls[0].get("materialize") is False
 
@@ -1736,6 +1983,75 @@ def test_forward_image_metadata_timeout_does_not_force_targeted_materialize() ->
     assert [bool(call.get("materialize")) for call in fast_client.calls] in ([], [False])
 
 
+def test_resolve_from_forward_payload_candidate_prefers_existing_local_file_before_public_token_for_forward_image() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    workspace = _workspace_temp_dir()
+    local_path = workspace / "forward-local-hit.png"
+    local_path.write_bytes(b"png")
+    request = _build_forward_request("forward-local-hit.png")
+    payload = {
+        "asset_type": "image",
+        "file_name": "forward-local-hit.png",
+        "file": str(local_path),
+        "url": str(local_path),
+        "public_action": "get_image",
+        "public_file_token": "forward-local-token",
+        "_forward_targeted_mode": "metadata_only",
+    }
+
+    downloader._resolve_from_public_token = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("forward image should use local payload before public token"))
+    )
+
+    try:
+        resolved = downloader._resolve_from_forward_payload_candidate(request, payload=payload)
+        assert resolved == (local_path.resolve(), "napcat_context_hydrated")
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_resolve_for_export_classifies_forward_image_missing_local_payload_before_public_token_retry() -> None:
+    request = _build_forward_request("forward-missing-local.png")
+    request["source_path"] = r"C:\QQ\3956020260\nt_qq\nt_data\Pic\2026-03\Ori\forward-missing-local.png"
+    request["download_hint"]["file_id"] = "forward-missing-local-file-id"
+    request["download_hint"]["url"] = "/download?appid=1407&fileid=forward-missing-local-file-id&spec=0"
+    payload = {
+        "asset_type": "image",
+        "file_name": "forward-missing-local.png",
+        "file": r"C:\QQ\3956020260\nt_qq\nt_data\Pic\2026-03\Ori\forward-missing-local.png",
+        "url": r"C:\QQ\3956020260\nt_qq\nt_data\Pic\2026-03\Ori\forward-missing-local.png",
+        "remote_url": "/download?appid=1407&fileid=forward-missing-local-file-id&spec=0",
+        "public_action": "get_image",
+        "public_file_token": "forward-missing-local-public-token",
+    }
+    fast_client = _ForwardImageMissingLocalPayloadClient(payload)
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        fast_client=fast_client,
+        remote_base_url="http://127.0.0.1:3000",
+    )
+    cache_key = (
+        "image",
+        downloader._normalized_match_url(
+            "http://127.0.0.1:3000/download?appid=1407&fileid=forward-missing-local-file-id&spec=0"
+        ),
+    )
+    downloader._remote_media_resolution_cache[cache_key] = None
+    downloader._remember_remote_media_failure_reason(
+        "http://127.0.0.1:3000/download?appid=1407&fileid=forward-missing-local-file-id&spec=0",
+        "unsupported_local_download",
+    )
+    downloader._call_public_action_with_token = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("forward image public token should be skipped after metadata proves missing"))
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert len(fast_client.calls) == 1
+    assert [bool(call.get("materialize")) for call in fast_client.calls] == [False]
+
+
 def test_classify_missing_from_payload_marks_top_level_image_with_stale_local_and_terminal_remote_evidence_as_background() -> None:
     downloader = NapCatMediaDownloader(
         _DummyClient(),
@@ -1780,6 +2096,49 @@ def test_classify_missing_from_payload_marks_top_level_image_with_stale_local_an
     assert classification == "qq_expired_after_napcat"
 
 
+def test_resolve_from_public_token_marks_recent_top_level_image_dead_public_remote_as_background_without_age_gate() -> None:
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        remote_base_url="http://127.0.0.1:3000",
+    )
+    request = {
+        "asset_type": "image",
+        "file_name": "recent-top-terminal.jpg",
+        "timestamp_ms": int(datetime(2026, 1, 6, 9, 33, 24, tzinfo=timezone.utc).timestamp() * 1000),
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Pic\2026-01\Ori\recent-top-terminal.jpg",
+        "download_hint": {
+            "file_id": "2229606560",
+            "url": "/gchatpic_new/1002303945/922065597-2229606560-RECENTTOPTERMINAL/0?term=255&is_origin=0",
+            "message_id_raw": "7616401486576431266",
+            "element_id": "7616401486576431265",
+            "peer_uid": "922065597",
+            "chat_type_raw": "2",
+        },
+    }
+    payload = {
+        "asset_type": "image",
+        "public_action": "get_image",
+        "public_file_token": "recent-top-terminal-token",
+        "file_name": "recent-top-terminal.jpg",
+        "file_id": "2229606560",
+        "remote_url": "https://gchat.qpic.cn/gchatpic_new/0/0-0-RECENTTOPTERMINAL/0",
+    }
+    downloader._remember_remote_media_failure_reason(
+        "https://gchat.qpic.cn/gchatpic_new/0/0-0-RECENTTOPTERMINAL/0",
+        "expired_remote",
+    )
+    downloader._public_token_action_outcomes[("get_image", "recent-top-terminal-token")] = payload
+
+    resolved = downloader._resolve_from_public_token(
+        payload,
+        old_bucket=None,
+        expired_candidate=False,
+        request=request,
+    )
+
+    assert resolved == (None, "qq_expired_after_napcat")
+
+
 def test_recent_forward_video_blank_public_payload_is_classified_as_expired_without_age_gate() -> None:
     client = _MissingPublicFileClient()
     downloader = NapCatMediaDownloader(client)
@@ -1814,7 +2173,7 @@ def test_recent_forward_video_direct_file_not_found_is_classified_as_expired_wit
     assert resolved == (None, "qq_expired_after_napcat")
 
 
-def test_targeted_forward_metadata_payload_is_not_reused_across_siblings() -> None:
+def test_forward_image_metadata_uses_parent_scoped_payload_across_siblings() -> None:
     fast_client = _TargetedForwardMetadataClient()
     downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
     request_a = _build_forward_request("A1111111111111111111111111111111.jpg")
@@ -1827,11 +2186,11 @@ def test_targeted_forward_metadata_payload_is_not_reused_across_siblings() -> No
 
     assert resolved_a[0] is not None
     assert resolved_b[0] is not None
-    assert len(fast_client.calls) == 2
-    assert [str(call.get("file_name")) for call in fast_client.calls] == [
-        "A1111111111111111111111111111111.jpg",
-        "B2222222222222222222222222222222.jpg",
-    ]
+    assert len(fast_client.calls) == 1
+    assert fast_client.calls[0].get("file_name") in {None, ""}
+    assert fast_client.calls[0].get("md5") in {None, ""}
+    assert fast_client.calls[0].get("file_id") in {None, ""}
+    assert fast_client.calls[0].get("url") in {None, ""}
 
 
 def test_forward_file_shared_request_key_requires_strong_identity() -> None:
@@ -2072,6 +2431,65 @@ def test_classify_missing_from_payload_uses_placeholder_background_only_after_re
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def test_classify_missing_from_payload_uses_public_payload_remote_failure_for_placeholder_images() -> None:
+    temp_root = _workspace_temp_dir()
+    source_path = temp_root / "Pic" / "2025-12" / "Ori" / "PUBLIC_REMOTE_PLACEHOLDER.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"")
+    sibling_placeholder = source_path.parent.parent / "OriTemp" / source_path.name
+    sibling_placeholder.parent.mkdir(parents=True, exist_ok=True)
+    sibling_placeholder.write_bytes(b"")
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "image",
+        "file_name": source_path.name,
+        "source_path": str(source_path),
+        "download_hint": {
+            "file_id": "token-placeholder",
+            "url": "/gchatpic_new/3348513412/922065597-2566904540-D500DF0B776DD0EDF0B0B864B4F5A18E/0?term=255&is_origin=0",
+            "message_id_raw": "7616405939521354825",
+            "element_id": "7616405939521354824",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+    payload = {
+        "public_action": "get_image",
+        "public_file_token": "token-placeholder",
+        "file_name": source_path.name,
+        "asset_type": "image",
+        "remote_url": "https://gchat.qpic.cn/gchatpic_new/0/0-0-D500DF0B776DD0EDF0B0B864B4F5A18E/0",
+    }
+    try:
+        assert (
+            downloader._classify_image_placeholder_missing_from_evidence(
+                request,
+                payload=payload,
+            )
+            is None
+        )
+        resolved_remote = downloader._resolve_remote_url(str(payload["remote_url"]))
+        assert resolved_remote is not None
+        downloader._remember_remote_media_failure_reason(resolved_remote, "http_error")
+        assert (
+            downloader._classify_image_placeholder_missing_from_evidence(
+                request,
+                payload=payload,
+            )
+            == "qq_not_downloaded_local_placeholder"
+        )
+        assert (
+            downloader._classify_missing_from_payload(
+                payload,
+                old_bucket=("image", "2025-12"),
+                request=request,
+            )
+            == "qq_not_downloaded_local_placeholder"
+        )
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def test_resolve_for_export_prefers_existing_source_path_for_non_image_assets() -> None:
     temp_root = _workspace_temp_dir()
     downloader = NapCatMediaDownloader(_DummyClient())
@@ -2115,6 +2533,56 @@ def test_stale_image_neighbor_does_not_accept_zero_byte_source_self() -> None:
             }
         )
         assert resolved == (None, None)
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_stale_image_neighbor_lookup_is_cached_per_source_path() -> None:
+    temp_root = _workspace_temp_dir()
+    source_path = temp_root / "nt_qq" / "nt_data" / "Pic" / "2025-09" / "Ori" / "SHARED.png"
+    sibling_path = temp_root / "nt_qq" / "nt_data" / "Pic" / "2025-09" / "Thumb" / "SHARED_0.jpg"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    sibling_path.parent.mkdir(parents=True, exist_ok=True)
+    sibling_path.write_bytes(b"thumb-bytes")
+    downloader = _NeighborProbeDownloader()
+    request = {
+        "asset_type": "image",
+        "file_name": source_path.name,
+        "source_path": str(source_path),
+    }
+    try:
+        first = downloader._resolve_from_stale_local_neighbors(request)
+        first_probe_count = downloader.base_dir_index_builds
+        second = downloader._resolve_from_stale_local_neighbors(request)
+
+        assert first[0] == sibling_path.resolve()
+        assert second[0] == sibling_path.resolve()
+        assert first_probe_count > 0
+        assert downloader.base_dir_index_builds == first_probe_count
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_source_local_path_lookup_is_cached_per_source_path() -> None:
+    temp_root = _workspace_temp_dir()
+    source_path = temp_root / "source" / "cached-source.png"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source_path.write_bytes(b"image-bytes")
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "image",
+        "file_name": source_path.name,
+        "source_path": str(source_path),
+    }
+    try:
+        first = downloader._resolve_from_source_local_path(request)
+        cached_key = str(source_path).casefold()
+        assert first == (source_path.resolve(), "source_local_path")
+        assert downloader._source_local_resolution_cache[cached_key] == source_path.resolve()
+
+        source_path.unlink()
+        second = downloader._resolve_from_source_local_path(request)
+        assert second == (source_path.resolve(), "source_local_path")
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -2392,6 +2860,28 @@ def test_schedule_request_direct_public_token_prefetch_enqueues_top_level_video_
     ]
 
 
+def test_schedule_request_direct_public_token_prefetch_enqueues_forward_video_token() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _build_forward_video_request("forward-video.mp4")
+    request["download_hint"]["file_id"] = "NTV2COMPAT.forward-prefetch-token"  # type: ignore[index]
+    scheduled: list[dict[str, object]] = []
+
+    downloader._schedule_public_token_prefetch = (  # type: ignore[method-assign]
+        lambda **kwargs: scheduled.append(kwargs["payload"])
+    )
+
+    downloader._schedule_request_direct_public_token_prefetch(request)
+
+    assert scheduled == [
+        {
+            "asset_type": "video",
+            "public_action": "get_file",
+            "public_file_token": "NTV2COMPAT.forward-prefetch-token",
+            "file_name": "forward-video.mp4",
+        }
+    ]
+
+
 def test_schedule_request_direct_public_token_prefetch_enqueues_top_level_image_token() -> None:
     downloader = NapCatMediaDownloader(_DummyClient())
     request = {
@@ -2419,6 +2909,149 @@ def test_schedule_request_direct_public_token_prefetch_enqueues_top_level_image_
     ]
 
 
+def test_schedule_public_token_prefetch_does_not_skip_napcat_local_download_image_hint() -> None:
+    client = _PublicImageClient()
+    downloader = NapCatMediaDownloader(client)
+    downloader._public_token_executor = _ImmediateExecutor()
+    request = {
+        "asset_type": "image",
+        "file_name": "old-image.png",
+        "download_hint": {
+            "file_id": "1528803331",
+            "url": "/download?appid=1407&fileid=1528803331&spec=0",
+        },
+    }
+    payload = {
+        "asset_type": "image",
+        "public_action": "get_image",
+        "public_file_token": "1528803331",
+        "file_name": "old-image.png",
+        "remote_url": "/download?appid=1407&fileid=1528803331&spec=0",
+        "url": "/download?appid=1407&fileid=1528803331&spec=0",
+    }
+
+    downloader._schedule_public_token_prefetch(
+        request=request,
+        request_data=request,
+        payload=payload,
+    )
+
+    cache_key = downloader._public_token_prefetch_key(
+        request_data=request,
+        action="get_image",
+        token="1528803331",
+    )
+    cached, future = downloader._public_token_prefetch_state(cache_key)
+
+    assert future is None
+    assert isinstance(cached, dict)
+    assert client.get_image_calls == 1
+
+
+def test_schedule_public_token_prefetch_stores_completed_result_without_explicit_consume() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    downloader._public_token_executor = _ImmediateExecutor()
+    downloader._call_public_action_with_token = (  # type: ignore[method-assign]
+        lambda action, token, **kwargs: {
+            "asset_type": "image",
+            "public_action": "get_image",
+            "public_file_token": token,
+            "file": str(Path(__file__).resolve()),
+            "file_name": "old-image.png",
+        }
+    )
+    request = {
+        "asset_type": "image",
+        "file_name": "old-image.png",
+        "download_hint": {
+            "file_id": "1528803331",
+            "message_id_raw": "7565810521148991491",
+            "element_id": "7565810521148991492",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+
+    downloader._schedule_request_direct_public_token_prefetch(request)
+
+    cache_key = downloader._public_token_prefetch_key(
+        request_data=request,
+        action="get_image",
+        token="1528803331",
+    )
+    cached, future = downloader._public_token_prefetch_state(cache_key)
+
+    assert future is None
+    assert isinstance(cached, dict)
+    assert str(cached.get("resolved_path") or "").strip() == str(Path(__file__).resolve())
+    assert str(cached.get("resolver") or "").strip() == "napcat_public_token_get_image_prefetched"
+
+
+def test_should_skip_eager_remote_prefetch_for_placeholder_image_with_direct_public_token() -> None:
+    workspace = _workspace_temp_dir()
+    downloader = NapCatMediaDownloader(_DummyClient(), remote_base_url="http://127.0.0.1:3000")
+    source_path = workspace / "Pic" / "2026-01" / "Ori" / "dead-image.png"
+    thumb_dir = source_path.parent.parent / "Thumb"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+    thumb_path = thumb_dir / "dead-image_0.png"
+    thumb_path.write_bytes(b"")
+    request = {
+        "asset_type": "image",
+        "file_name": "dead-image.png",
+        "source_path": str(source_path),
+        "download_hint": {
+            "file_id": "1528803331",
+            "url": "/download?appid=1407&fileid=1528803331&spec=0",
+        },
+    }
+
+    try:
+        assert downloader._should_skip_eager_remote_prefetch(request, old_bucket=None) is True
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def test_prepare_prefetched_top_level_image_token_is_reused_by_resolve_without_second_public_call() -> None:
+    client = _PublicImageClient()
+    downloader = NapCatMediaDownloader(client, fast_client=_BatchFastClient())
+    downloader._public_token_executor = _ImmediateExecutor()
+    downloader._schedule_request_remote_prefetch = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    downloader._resolve_via_context_only = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("context route should not run"))  # type: ignore[method-assign]
+    downloader.PREFETCH_LARGE_REQUEST_THRESHOLD = 1
+    request = {
+        "asset_type": "image",
+        "file_name": "old-image.png",
+        "timestamp_ms": 1757142395000,
+        "download_hint": {
+            "file_id": "1528803331",
+            "message_id_raw": "7565810521148991491",
+            "element_id": "7565810521148991492",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+
+    downloader.prepare_for_export([request])
+    cache_key = downloader._public_token_prefetch_key(
+        request_data=request,
+        action="get_image",
+        token="1528803331",
+    )
+    cached, future = downloader._public_token_prefetch_state(cache_key)
+    assert future is None
+    assert isinstance(cached, dict)
+    assert str(cached.get("resolved_path") or "").strip() == str(Path(__file__).resolve())
+
+    downloader._call_public_action_with_token = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resolve should reuse prefetched token result"))
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (Path(__file__).resolve(), "napcat_public_token_get_image_prefetched")
+    assert client.get_image_calls == 1
+
+
 def test_schedule_request_direct_public_token_prefetch_skips_direct_file_id_shape() -> None:
     downloader = NapCatMediaDownloader(_DummyClient())
     request = {
@@ -2437,6 +3070,21 @@ def test_schedule_request_direct_public_token_prefetch_skips_direct_file_id_shap
     downloader._schedule_request_direct_public_token_prefetch(request)
 
     assert scheduled == []
+
+
+def test_direct_public_token_payload_for_forward_video_request_is_preserved() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _build_forward_video_request("forward-token-video.mp4")
+    request["download_hint"]["file_id"] = "NTV2COMPAT.forward-token-video"  # type: ignore[index]
+
+    payload = downloader._direct_public_token_payload_for_request(request)
+
+    assert payload == {
+        "asset_type": "video",
+        "public_action": "get_file",
+        "public_file_token": "NTV2COMPAT.forward-token-video",
+        "file_name": "forward-token-video.mp4",
+    }
 
 
 def test_prepare_for_export_large_run_still_prefetches_strong_old_image_hints_before_batch_skip() -> None:
@@ -2632,3 +3280,28 @@ def test_ensure_remote_media_future_drops_future_submitted_before_reset_boundary
     assert created is False
     assert downloader._remote_media_resolution_futures == {}
     assert downloader._remote_media_resolution_cache == {}
+
+
+def test_second_pass_public_retry_only_runs_when_prefetch_state_is_pending() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _second_pass_request()
+
+    assert downloader.should_attempt_second_pass_public_retry(request) is False
+
+    direct_payload = downloader._direct_public_token_payload_for_request(request)
+    assert direct_payload is not None
+    cache_key = downloader._public_token_prefetch_key(
+        request_data=request,
+        action=str(direct_payload["public_action"]),
+        token=str(direct_payload["public_file_token"]),
+    )
+
+    pending_future: Future[dict[str, object] | None] = Future()
+    downloader._public_token_prefetch_futures[cache_key] = pending_future
+    assert downloader.should_attempt_second_pass_public_retry(request) is True
+
+    pending_future.set_result(None)
+    assert downloader.should_attempt_second_pass_public_retry(request) is True
+
+    downloader._store_public_token_prefetch_result(cache_key, None, future=pending_future)
+    assert downloader.should_attempt_second_pass_public_retry(request) is False

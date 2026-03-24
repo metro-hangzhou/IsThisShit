@@ -7,7 +7,12 @@ import os
 import re
 import shutil
 from threading import Event, Lock, Thread
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    as_completed,
+)
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -60,6 +65,7 @@ class NapCatMediaDownloader:
     REMOTE_MEDIA_FETCH_TIMEOUT_S = 8.0
     REMOTE_MEDIA_FETCH_WORKERS = 6
     PUBLIC_TOKEN_PREFETCH_WORKERS = 3
+    FORWARD_METADATA_PREFETCH_WORKERS = 6
     REMOTE_PREFETCHABLE_ASSET_TYPES = frozenset({"image", "file", "video", "speech"})
 
     def __init__(
@@ -116,7 +122,13 @@ class NapCatMediaDownloader:
         ] = {}
         self._known_bad_public_tokens: dict[tuple[str, str], str] = {}
         self._image_placeholder_missing_cache: dict[str, str | None] = {}
+        self._source_local_resolution_cache: dict[str, Path | None] = {}
+        self._stale_image_neighbor_cache: dict[str, Path | None] = {}
+        self._hint_local_resolution_cache: dict[tuple[str, str, str], Path | None] = {}
+        self._ntqq_image_candidate_index_cache: dict[str, dict[str, tuple[Path | None, bool]]] = {}
         self._public_token_action_outcomes: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self._fast_capabilities: dict[str, Any] | None = None
+        self._fast_capabilities_loaded = False
         self._remote_base_url = (
             remote_base_url
             or getattr(client, "_base_url", None)
@@ -250,6 +262,10 @@ class NapCatMediaDownloader:
             self._forward_timeout_storm_counts.clear()
             self._forward_timeout_storm_open.clear()
             self._image_placeholder_missing_cache.clear()
+            self._source_local_resolution_cache.clear()
+            self._stale_image_neighbor_cache.clear()
+            self._hint_local_resolution_cache.clear()
+            self._ntqq_image_candidate_index_cache.clear()
         with self._download_progress_lock:
             self._download_progress = self._new_download_progress_state()
             self._download_operation_states.clear()
@@ -393,6 +409,7 @@ class NapCatMediaDownloader:
         )
         large_prefetch_run = len(requests) >= int(self.PREFETCH_LARGE_REQUEST_THRESHOLD)
         batch_items: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        forward_prefetch_requests: list[dict[str, Any]] = []
         seen: set[tuple[Any, ...]] = set()
         skipped_old_bucket_prefetch = 0
         prefetched_local_count = 0
@@ -427,6 +444,12 @@ class NapCatMediaDownloader:
                     last_prepare_emit = monotonic()
                 continue
             if self._has_forward_parent_hint(hint):
+                self._schedule_request_direct_public_token_prefetch(request)
+                if str(request.get("asset_type") or "").strip() == "image":
+                    key = self._request_key(request)
+                    if key not in self._prefetched_forward_media and key not in seen:
+                        seen.add(key)
+                        forward_prefetch_requests.append(request)
                 if progress_callback is not None and (
                     index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
                 ):
@@ -518,7 +541,7 @@ class NapCatMediaDownloader:
             ):
                 _emit_prepare_progress("progress", index)
                 last_prepare_emit = monotonic()
-        if not batch_items:
+        if not batch_items and not forward_prefetch_requests:
             _emit_prepare_progress("done", overall_request_count)
             return
         if skipped_old_bucket_prefetch > 0:
@@ -702,6 +725,11 @@ class NapCatMediaDownloader:
                         "slow_threshold_s": self.PREFETCH_SLOW_CHUNK_WARN_S,
                     }
                 )
+        if forward_prefetch_requests:
+            self._prefetch_forward_metadata_requests(
+                forward_prefetch_requests,
+                progress_callback=progress_callback,
+            )
 
     def _prefetch_batch_size_for_request_count(self, request_count: int) -> int:
         if request_count >= int(self.PREFETCH_LARGE_REQUEST_THRESHOLD):
@@ -711,6 +739,249 @@ class NapCatMediaDownloader:
     def _prefetch_batch_timeout_s(self, chunk_size: int, request_count: int) -> float:
         _ = chunk_size, request_count
         return float(self.PREFETCH_BATCH_TIMEOUT_S)
+
+    def _prefetch_forward_metadata_request_payload(
+        self,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        hint = self._request_hint(request)
+        parent = hint.get("_forward_parent")
+        if not isinstance(parent, dict) or not self._has_context_hint(parent):
+            return {"status": "skip"}
+        parent_element_id = str(parent.get("element_id") or "").strip()
+        if not parent_element_id:
+            return {"status": "skip"}
+        parent_scoped_metadata = (
+            self._should_use_parent_scoped_forward_metadata(request)
+            and self._fast_plugin_supports_forward_parent_metadata()
+        )
+        timeout_s = self._forward_context_timeout_s(request, materialize=False)
+        started = monotonic()
+        try:
+            payload = self._fast_client.hydrate_forward_media(  # type: ignore[union-attr]
+                message_id_raw=str(parent["message_id_raw"]),
+                element_id=parent_element_id,
+                peer_uid=str(parent["peer_uid"]),
+                chat_type_raw=int(parent["chat_type_raw"]),
+                asset_type=(
+                    None if parent_scoped_metadata else str(request.get("asset_type") or "").strip() or None
+                ),
+                asset_role=(
+                    None if parent_scoped_metadata else str(request.get("asset_role") or "").strip() or None
+                ),
+                file_name=(
+                    None if parent_scoped_metadata else str(request.get("file_name") or "").strip() or None
+                ),
+                md5=(
+                    None if parent_scoped_metadata else str(request.get("md5") or "").strip() or None
+                ),
+                file_id=(
+                    None if parent_scoped_metadata else str(hint.get("file_id") or "").strip() or None
+                ),
+                url=(
+                    None
+                    if parent_scoped_metadata
+                    else str(hint.get("remote_url") or hint.get("url") or "").strip() or None
+                ),
+                materialize=False,
+                timeout=timeout_s,
+            )
+        except NapCatFastHistoryUnavailable as exc:
+            return {
+                "status": "unavailable",
+                "timeout_s": timeout_s,
+                "elapsed_s": monotonic() - started,
+                "detail": str(exc),
+            }
+        except NapCatFastHistoryTimeoutError as exc:
+            return {
+                "status": "timeout",
+                "timeout_s": timeout_s,
+                "elapsed_s": monotonic() - started,
+                "detail": str(exc),
+            }
+        except Exception as exc:
+            return {
+                "status": "error",
+                "timeout_s": timeout_s,
+                "elapsed_s": monotonic() - started,
+                "detail": str(exc),
+            }
+        return {
+            "status": "ok",
+            "timeout_s": timeout_s,
+            "elapsed_s": monotonic() - started,
+            "payload": payload if isinstance(payload, dict) else None,
+        }
+
+    def _remember_forward_prefetch_result(
+        self,
+        request: dict[str, Any],
+        outcome: dict[str, Any],
+    ) -> None:
+        key = self._request_key(request)
+        timeout_cache_key = self._forward_context_timeout_key(request, materialize=False)
+        status = str(outcome.get("status") or "").strip().lower()
+        if status in {"skip", ""}:
+            return
+        if status == "unavailable":
+            self._fast_forward_context_route_disabled = True
+            if timeout_cache_key is not None:
+                self._forward_context_unavailable_cache.add(timeout_cache_key)
+                self._forward_context_payload_cache.pop(timeout_cache_key, None)
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return
+        if status == "timeout":
+            if timeout_cache_key is not None:
+                self._forward_context_timeout_cache.add(timeout_cache_key)
+                self._forward_context_payload_cache.pop(timeout_cache_key, None)
+            self._note_forward_timeout_storm(request, route="forward_context_metadata")
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return
+        if status == "error":
+            if timeout_cache_key is not None:
+                self._forward_context_error_cache.add(timeout_cache_key)
+                self._forward_context_payload_cache.pop(timeout_cache_key, None)
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return
+        payload = outcome.get("payload")
+        if not isinstance(payload, dict):
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return
+        if timeout_cache_key is not None:
+            self._forward_context_timeout_cache.discard(timeout_cache_key)
+            self._forward_context_empty_cache.discard(timeout_cache_key)
+            self._forward_context_error_cache.discard(timeout_cache_key)
+            self._forward_context_unavailable_cache.discard(timeout_cache_key)
+            if self._is_forward_context_payload_cacheable(payload):
+                self._forward_context_payload_cache[timeout_cache_key] = payload
+            else:
+                self._forward_context_payload_cache.pop(timeout_cache_key, None)
+        assets = payload.get("assets")
+        assets_list = assets if isinstance(assets, list) else []
+        if not assets_list:
+            if timeout_cache_key is not None:
+                self._forward_context_empty_cache.add(timeout_cache_key)
+                self._forward_context_payload_cache.pop(timeout_cache_key, None)
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return
+        matched, matched_payload = self._pick_forward_asset_match(request, assets_list)
+        if isinstance(matched_payload, dict):
+            enriched_payload = dict(matched_payload)
+            enriched_payload["_forward_targeted_mode"] = str(payload.get("targeted_mode") or "").strip()
+            matched_payload = enriched_payload
+            self._schedule_remote_media_prefetch(
+                request=request,
+                request_data=request,
+                payload=matched_payload,
+            )
+            self._schedule_public_token_prefetch(
+                request=request,
+                request_data=request,
+                payload=matched_payload,
+            )
+        self._note_forward_timeout_storm_success(request, route="forward_context_metadata")
+        self._prefetched_forward_media[key] = matched
+        self._prefetched_forward_media_payloads[key] = matched_payload
+
+    def _prefetch_forward_metadata_requests(
+        self,
+        requests: list[dict[str, Any]],
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
+        if self._fast_client is None or not requests:
+            return
+        grouped_requests: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for request in requests:
+            group_key = self._forward_metadata_prefetch_group_key(request)
+            grouped_requests.setdefault(group_key, []).append(request)
+        grouped_items = list(grouped_requests.items())
+        worker_count = max(
+            2,
+            min(int(self.FORWARD_METADATA_PREFETCH_WORKERS), len(grouped_items)),
+        )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "prefetch_forward_metadata",
+                    "stage": "start",
+                    "request_count": len(requests),
+                    "group_count": len(grouped_items),
+                    "worker_count": worker_count,
+                }
+            )
+        started = monotonic()
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="forward-metadata-prefetch",
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    self._prefetch_forward_metadata_request_payload,
+                    request_group[1][0],
+                ): request_group
+                for request_group in grouped_items
+            }
+            processed = 0
+            for future in as_completed(future_map):
+                request_group = future_map[future]
+                try:
+                    outcome = future.result()
+                except Exception as exc:  # pragma: no cover - defensive
+                    outcome = {"status": "error", "detail": str(exc)}
+                for request in request_group[1]:
+                    self._remember_forward_prefetch_result(request, outcome)
+                processed += len(request_group[1])
+                if progress_callback is not None and (
+                    processed == len(requests) or processed % 25 == 0
+                ):
+                    progress_callback(
+                        {
+                            "phase": "prefetch_forward_metadata",
+                            "stage": "progress",
+                            "request_count": len(requests),
+                            "group_count": len(grouped_items),
+                            "processed_request_count": processed,
+                            "elapsed_s": round(monotonic() - started, 4),
+                        }
+                    )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "prefetch_forward_metadata",
+                    "stage": "done",
+                    "request_count": len(requests),
+                    "group_count": len(grouped_items),
+                    "processed_request_count": len(requests),
+                    "elapsed_s": round(monotonic() - started, 4),
+                }
+            )
+
+    def _forward_metadata_prefetch_group_key(
+        self,
+        request: dict[str, Any],
+    ) -> tuple[Any, ...]:
+        hint = self._request_hint(request)
+        parent = hint.get("_forward_parent")
+        if (
+            isinstance(parent, dict)
+            and self._should_use_parent_scoped_forward_metadata(request)
+            and self._fast_plugin_supports_forward_parent_metadata()
+        ):
+            return (
+                "parent_scoped_forward_metadata",
+                str(parent.get("message_id_raw") or "").strip(),
+                str(parent.get("element_id") or "").strip(),
+                str(parent.get("peer_uid") or "").strip(),
+                str(parent.get("chat_type_raw") or "").strip(),
+            )
+        return ("request_scoped_forward_metadata", self._request_key(request))
 
     def resolve_for_export(
         self,
@@ -911,6 +1182,16 @@ class NapCatMediaDownloader:
                     request,
                     (None, classified_old_forward_missing),
                 )
+            direct_public_token_resolved = self._resolve_via_direct_public_token_hint(
+                request,
+                trace_callback=trace_callback,
+            )
+            if direct_public_token_resolved not in {None, (None, None)}:
+                return self._remember_shared_outcome(
+                    shared_key,
+                    request,
+                    direct_public_token_resolved,
+                )
             attempted_direct_forward_file_id = False
             if asset_type in {"video", "file"} and self._should_prefer_direct_file_id_before_targeted_materialize(
                 request,
@@ -989,12 +1270,10 @@ class NapCatMediaDownloader:
                     )
                     return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
         context_resolved = None
-        direct_public_token_resolved = None
-        if not self._has_forward_parent_hint(hint):
-            direct_public_token_resolved = self._resolve_via_direct_public_token_hint(
-                request,
-                trace_callback=trace_callback,
-            )
+        direct_public_token_resolved = self._resolve_via_direct_public_token_hint(
+            request,
+            trace_callback=trace_callback,
+        )
         if direct_public_token_resolved not in {None, (None, None)}:
             return self._remember_shared_outcome(shared_key, request, direct_public_token_resolved)
         if not self._has_forward_parent_hint(hint):
@@ -1139,6 +1418,29 @@ class NapCatMediaDownloader:
         if resolved in {None, (None, None)}:
             return None, None
         return resolved
+
+    def should_attempt_second_pass_public_retry(
+        self,
+        request: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return True
+        direct_payload = self._direct_public_token_payload_for_request(request)
+        if direct_payload is None:
+            return True
+        action = str(direct_payload.get("public_action") or "").strip().lower()
+        token = str(direct_payload.get("public_file_token") or "").strip()
+        if not action or not token:
+            return True
+        cache_key = self._public_token_prefetch_key(
+            request_data=request,
+            action=action,
+            token=token,
+        )
+        cached_result, future = self._public_token_prefetch_state(cache_key)
+        if cached_result is not ...:
+            return False
+        return future is not None
 
     def _emit_asset_substep_trace(
         self,
@@ -1751,6 +2053,11 @@ class NapCatMediaDownloader:
             request,
             materialize=materialize,
         )
+        parent_scoped_metadata = (
+            not materialize
+            and self._should_use_parent_scoped_forward_metadata(request)
+            and self._fast_plugin_supports_forward_parent_metadata()
+        )
         substep = "forward_context_materialize" if materialize else "forward_context_metadata"
         if self._should_skip_forward_timeout_storm(
             request,
@@ -1786,10 +2093,20 @@ class NapCatMediaDownloader:
                 chat_type_raw=int(parent["chat_type_raw"]),
                 asset_type=str(request.get("asset_type") or "").strip() or None,
                 asset_role=str(request.get("asset_role") or "").strip() or None,
-                file_name=str(request.get("file_name") or "").strip() or None,
-                md5=str(request.get("md5") or "").strip() or None,
-                file_id=str(hint.get("file_id") or "").strip() or None,
-                url=str(hint.get("remote_url") or hint.get("url") or "").strip() or None,
+                file_name=(
+                    None if parent_scoped_metadata else str(request.get("file_name") or "").strip() or None
+                ),
+                md5=(
+                    None if parent_scoped_metadata else str(request.get("md5") or "").strip() or None
+                ),
+                file_id=(
+                    None if parent_scoped_metadata else str(hint.get("file_id") or "").strip() or None
+                ),
+                url=(
+                    None
+                    if parent_scoped_metadata
+                    else str(hint.get("remote_url") or hint.get("url") or "").strip() or None
+                ),
                 materialize=materialize,
                 download_timeout_ms=(
                     self.FORWARD_TARGET_DOWNLOAD_TIMEOUT_MS if materialize else None
@@ -1956,6 +2273,38 @@ class NapCatMediaDownloader:
                 route=substep,
             )
         return matched
+
+    @staticmethod
+    def _should_use_parent_scoped_forward_metadata(request: dict[str, Any]) -> bool:
+        asset_type = str(request.get("asset_type") or "").strip()
+        if asset_type != "image":
+            return False
+        hint = NapCatMediaDownloader._request_hint(request)
+        return NapCatMediaDownloader._has_forward_parent_hint(hint)
+
+    def _fast_plugin_supports_forward_parent_metadata(self) -> bool:
+        if self._fast_client is None:
+            return False
+        if self._fast_capabilities_loaded:
+            features = (
+                self._fast_capabilities.get("features")
+                if isinstance(self._fast_capabilities, dict)
+                else None
+            )
+            if isinstance(features, dict):
+                return bool(features.get("forward_parent_metadata_scope"))
+            return False
+        self._fast_capabilities_loaded = True
+        try:
+            capabilities = self._fast_client.capabilities()
+        except Exception:
+            self._fast_capabilities = {}
+            return False
+        self._fast_capabilities = capabilities if isinstance(capabilities, dict) else {}
+        features = self._fast_capabilities.get("features")
+        if isinstance(features, dict):
+            return bool(features.get("forward_parent_metadata_scope"))
+        return False
 
     def _download_via_context(
         self,
@@ -2844,7 +3193,12 @@ class NapCatMediaDownloader:
         source_path = str(request.get("source_path") or "").strip()
         if not source_path:
             return None, None
-        resolved = self._resolved_path_from_payload({"file": source_path})
+        cache_key = source_path.casefold()
+        if cache_key in self._source_local_resolution_cache:
+            resolved = self._source_local_resolution_cache[cache_key]
+        else:
+            resolved = self._resolved_path_from_payload({"file": source_path})
+            self._source_local_resolution_cache[cache_key] = resolved
         if resolved is None:
             return None, None
         return resolved, "source_local_path"
@@ -2855,44 +3209,60 @@ class NapCatMediaDownloader:
     ) -> tuple[Path | None, str | None]:
         if not isinstance(hint, dict):
             return None, None
+        cache_key = (
+            str(hint.get("file") or "").strip().casefold(),
+            str(hint.get("path") or "").strip().casefold(),
+            str(hint.get("url") or "").strip().casefold(),
+        )
+        if cache_key in self._hint_local_resolution_cache:
+            cached = self._hint_local_resolution_cache[cache_key]
+            if cached is None:
+                return None, None
+            return cached, "hint_local_path"
         for key in ("file", "path", "url"):
             resolved = self._resolved_path_from_payload({key: hint.get(key)})
             if resolved is not None:
+                self._hint_local_resolution_cache[cache_key] = resolved
                 return resolved, "hint_local_path"
+        self._hint_local_resolution_cache[cache_key] = None
         return None, None
 
     def _find_stale_image_neighbor(self, source_path: str) -> Path | None:
+        cache_key = source_path.casefold()
+        if cache_key in self._stale_image_neighbor_cache:
+            return self._stale_image_neighbor_cache[cache_key]
         source = Path(source_path)
         if source.exists() and source.is_file():
             try:
                 if source.stat().st_size > 0:
-                    return source.resolve()
+                    resolved = source.resolve()
+                    self._stale_image_neighbor_cache[cache_key] = resolved
+                    return resolved
             except OSError:
+                self._stale_image_neighbor_cache[cache_key] = None
                 return None
         parts = list(PureWindowsPath(source_path).parts)
         lowered = [part.casefold() for part in parts]
         if "nt_qq" not in lowered or "nt_data" not in lowered:
+            self._stale_image_neighbor_cache[cache_key] = None
             return None
         parent = source.parent
         parent_name = parent.name.casefold()
         if parent_name not in {"ori", "oritemp", "thumb"}:
+            self._stale_image_neighbor_cache[cache_key] = None
             return None
         stem = self._strip_thumb_suffix(source.stem)
         if not stem:
+            self._stale_image_neighbor_cache[cache_key] = None
             return None
         base_dir = parent.parent
-        matches: list[Path] = []
-        for sibling_name in ("Ori", "OriTemp", "Thumb"):
-            sibling_dir = base_dir / sibling_name
-            if not sibling_dir.exists() or not sibling_dir.is_dir():
-                continue
-            match = self._find_image_candidate_in_directory(sibling_dir, stem=stem)
-            if match is not None:
-                matches.append(match)
-        if not matches:
+        index = self._ntqq_image_candidate_index_for_base_dir(base_dir)
+        best_match, has_any_match = index.get(stem.casefold(), (None, False))
+        if not has_any_match or best_match is None:
+            self._stale_image_neighbor_cache[cache_key] = None
             return None
-        unique_matches = {match.resolve(): None for match in matches}
-        return sorted(unique_matches, key=self._neighbor_candidate_priority)[0]
+        self._stale_image_neighbor_cache[cache_key] = best_match
+        return best_match
 
     @staticmethod
     def _strip_thumb_suffix(value: str) -> str:
@@ -3533,6 +3903,7 @@ class NapCatMediaDownloader:
                 action,
                 token,
                 file_name,
+                request,
                 generation,
             )
         with self._prefetch_state_lock:
@@ -3562,8 +3933,6 @@ class NapCatMediaDownloader:
         if not isinstance(request, dict):
             return None
         hint = self._request_hint(request)
-        if self._has_forward_parent_hint(hint):
-            return None
         asset_type = str(request.get("asset_type") or "").strip().lower()
         if asset_type == "image":
             action = "get_image"
@@ -3701,9 +4070,15 @@ class NapCatMediaDownloader:
         action: str,
         token: str,
         file_name: str | None,
+        request: dict[str, Any] | None,
         generation: int,
     ) -> dict[str, Any] | None:
-        payload = self._call_public_action_with_token(action, token)
+        payload = self._call_public_action_with_token(
+            action,
+            token,
+            file_name=file_name,
+            request=request,
+        )
         result: dict[str, Any] = {
             "payload": payload if isinstance(payload, dict) else None,
             "resolved_path": None,
@@ -3711,6 +4086,10 @@ class NapCatMediaDownloader:
             "remote_attempted": False,
         }
         if not isinstance(payload, dict):
+            return result
+        known_missing_classification = str(payload.get("_known_missing_classification") or "").strip()
+        if known_missing_classification:
+            result["resolver"] = known_missing_classification
             return result
         self._record_prefetch_feedback("token_payload")
         resolved = self._resolved_path_from_payload(payload)
@@ -6076,29 +6455,54 @@ class NapCatMediaDownloader:
             return None
 
         base_dir = parent.parent
-        matches: list[Path] = []
-        for sibling_name in ("Ori", "OriTemp", "Thumb"):
-            sibling_dir = base_dir / sibling_name
-            if not sibling_dir.exists() or not sibling_dir.is_dir():
-                continue
-            matches.extend(
-                self._iter_image_candidates_in_directory(
-                    sibling_dir,
-                    stem=stem,
-                )
-            )
-        if not matches:
+        index = self._ntqq_image_candidate_index_for_base_dir(base_dir)
+        best_match, has_any_match = index.get(stem.casefold(), (None, False))
+        if not has_any_match:
             self._image_placeholder_missing_cache[cache_key] = None
             return None
-
-        unique_matches = {match.resolve(): match.resolve() for match in matches}
-        if any(match.stat().st_size > 0 for match in unique_matches.values()):
+        if best_match is not None:
             self._image_placeholder_missing_cache[cache_key] = None
             return None
 
         result = "qq_not_downloaded_local_placeholder"
         self._image_placeholder_missing_cache[cache_key] = result
         return result
+
+    def _ntqq_image_candidate_index_for_base_dir(
+        self,
+        base_dir: Path,
+    ) -> dict[str, tuple[Path | None, bool]]:
+        cache_key = str(base_dir).casefold()
+        cached = self._ntqq_image_candidate_index_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        index: dict[str, tuple[Path | None, bool]] = {}
+        for sibling_name in ("Ori", "OriTemp", "Thumb"):
+            sibling_dir = base_dir / sibling_name
+            if not sibling_dir.exists() or not sibling_dir.is_dir():
+                continue
+            with suppress(OSError):
+                for candidate in sibling_dir.iterdir():
+                    if not candidate.is_file():
+                        continue
+                    if not self._image_extension_allowed(candidate):
+                        continue
+                    stem = self._strip_thumb_suffix(candidate.stem if candidate.suffix else candidate.name)
+                    if not stem:
+                        continue
+                    stem_key = stem.casefold()
+                    best_match, has_any_match = index.get(stem_key, (None, False))
+                    has_any_match = True
+                    resolved_path: Path | None = None
+                    with suppress(OSError):
+                        if candidate.stat().st_size > 0:
+                            resolved_path = candidate.resolve()
+                    if resolved_path is not None:
+                        if best_match is None or self._neighbor_candidate_priority(resolved_path) < self._neighbor_candidate_priority(best_match):
+                            best_match = resolved_path
+                    index[stem_key] = (best_match, has_any_match)
+        self._ntqq_image_candidate_index_cache[cache_key] = index
+        return index
 
     @staticmethod
     def _old_context_bucket(asset_type: str, request: dict[str, Any]) -> tuple[str, str] | None:
