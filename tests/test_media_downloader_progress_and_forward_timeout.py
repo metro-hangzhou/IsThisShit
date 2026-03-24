@@ -2226,6 +2226,108 @@ def test_resolve_via_direct_file_id_keeps_top_level_old_file_not_found_unclassif
     assert resolved is None
 
 
+def test_resolve_for_export_prefers_direct_hint_public_token_before_context_for_top_level_old_video() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "video",
+        "file_name": "old-video.mp4",
+        "timestamp_ms": 1757142395000,
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Video\2025-09\Ori\old-video.mp4",
+        "download_hint": {
+            "file_id": "NTV2COMPAT.direct-token",
+            "message_id_raw": "7565810521148991491",
+            "element_id": "7565810521148991492",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+
+    def _direct_public_only(payload, **kwargs):
+        assert payload["public_file_token"] == "NTV2COMPAT.direct-token"
+        return Path(__file__).resolve(), "napcat_public_token_get_file"
+
+    downloader._resolve_from_public_token = _direct_public_only  # type: ignore[method-assign]
+    downloader._resolve_via_context_only = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("context route should not run first"))
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (Path(__file__).resolve(), "napcat_public_token_get_file")
+
+
+def test_resolve_for_export_allows_direct_hint_public_token_to_classify_terminal_old_video() -> None:
+    downloader = NapCatMediaDownloader(_BlankPublicFileClient())
+    request = {
+        "asset_type": "video",
+        "file_name": "old-video.mp4",
+        "timestamp_ms": 1757142395000,
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Video\2025-09\Ori\missing-old-video.mp4",
+        "download_hint": {
+            "file_id": "NTV2COMPAT.old-video-token",
+            "message_id_raw": "7565810521148991491",
+            "element_id": "7565810521148991492",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+
+    downloader._resolve_via_context_only = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("context route should not run after terminal token proof"))
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+
+
+def test_schedule_request_direct_public_token_prefetch_enqueues_top_level_video_token() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "video",
+        "file_name": "old-video.mp4",
+        "download_hint": {
+            "file_id": "NTV2COMPAT.prefetch-token",
+        },
+    }
+    scheduled: list[dict[str, object]] = []
+
+    downloader._schedule_public_token_prefetch = (  # type: ignore[method-assign]
+        lambda **kwargs: scheduled.append(kwargs["payload"])
+    )
+
+    downloader._schedule_request_direct_public_token_prefetch(request)
+
+    assert scheduled == [
+        {
+            "asset_type": "video",
+            "public_action": "get_file",
+            "public_file_token": "NTV2COMPAT.prefetch-token",
+            "file_name": "old-video.mp4",
+        }
+    ]
+
+
+def test_schedule_request_direct_public_token_prefetch_skips_direct_file_id_shape() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "file",
+        "file_name": "old-uploaded.jpg",
+        "download_hint": {
+            "file_id": "/494603f2-038f-4fd0-bffa-934b4553f019",
+        },
+    }
+    scheduled: list[dict[str, object]] = []
+
+    downloader._schedule_public_token_prefetch = (  # type: ignore[method-assign]
+        lambda **kwargs: scheduled.append(kwargs["payload"])
+    )
+
+    downloader._schedule_request_direct_public_token_prefetch(request)
+
+    assert scheduled == []
+
+
 def test_resolve_from_public_token_marks_old_video_blank_payload_as_background() -> None:
     downloader = NapCatMediaDownloader(_BlankPublicFileClient())
     request = {
