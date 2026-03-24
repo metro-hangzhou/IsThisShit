@@ -498,6 +498,7 @@ class NapCatMediaDownloader:
                 old_bucket=old_bucket,
             ):
                 self._schedule_request_remote_prefetch(request)
+            self._schedule_request_direct_public_token_prefetch(request)
             key = self._request_key(request)
             if key in self._prefetched_media or key in seen:
                 continue
@@ -988,6 +989,14 @@ class NapCatMediaDownloader:
                     )
                     return self._remember_shared_outcome(shared_key, request, (None, classified_forward_missing))
         context_resolved = None
+        direct_public_token_resolved = None
+        if not self._has_forward_parent_hint(hint):
+            direct_public_token_resolved = self._resolve_via_direct_public_token_hint(
+                request,
+                trace_callback=trace_callback,
+            )
+        if direct_public_token_resolved not in {None, (None, None)}:
+            return self._remember_shared_outcome(shared_key, request, direct_public_token_resolved)
         if not self._has_forward_parent_hint(hint):
             context_resolved = self._resolve_via_context_only(
                 request,
@@ -1460,6 +1469,25 @@ class NapCatMediaDownloader:
         if fast_resolved != (None, None):
             return fast_resolved
         return None
+
+    def _resolve_via_direct_public_token_hint(
+        self,
+        request: dict[str, Any],
+        *,
+        trace_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> tuple[Path | None, str | None] | None:
+        payload = self._direct_public_token_payload_for_request(request)
+        if payload is None:
+            return None
+        asset_type = str(request.get("asset_type") or "").strip()
+        old_bucket = self._old_context_bucket(asset_type, request)
+        return self._resolve_from_public_token(
+            payload,
+            old_bucket=old_bucket,
+            expired_candidate=self._should_share_missing_outcome(request),
+            request=request,
+            trace_callback=trace_callback,
+        )
 
     def _resolve_via_direct_file_id(
         self,
@@ -3415,6 +3443,19 @@ class NapCatMediaDownloader:
             },
         )
 
+    def _schedule_request_direct_public_token_prefetch(
+        self,
+        request: dict[str, Any],
+    ) -> None:
+        payload = self._direct_public_token_payload_for_request(request)
+        if payload is None:
+            return
+        self._schedule_public_token_prefetch(
+            request=request,
+            request_data=request,
+            payload=payload,
+        )
+
     def _schedule_public_token_prefetch(
         self,
         *,
@@ -3476,6 +3517,39 @@ class NapCatMediaDownloader:
                 future.cancel()
                 return
             self._public_token_prefetch_futures[cache_key] = future
+
+    def _direct_public_token_payload_for_request(
+        self,
+        request: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(request, dict):
+            return None
+        hint = self._request_hint(request)
+        if self._has_forward_parent_hint(hint):
+            return None
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type == "speech":
+            action = "get_record"
+        elif asset_type in {"file", "video"}:
+            action = "get_file"
+        else:
+            return None
+        token = str(hint.get("file_id") or "").strip()
+        if not token or token.startswith("/"):
+            return None
+        payload: dict[str, Any] = {
+            "asset_type": asset_type,
+            "public_action": action,
+            "public_file_token": token,
+        }
+        file_name = str(request.get("file_name") or "").strip()
+        if file_name:
+            payload["file_name"] = file_name
+        remote_url = str(hint.get("remote_url") or hint.get("url") or "").strip()
+        if remote_url:
+            payload["remote_url"] = remote_url
+            payload["url"] = remote_url
+        return payload
 
     def _peek_public_token_prefetch(
         self,
