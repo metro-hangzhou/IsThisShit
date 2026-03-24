@@ -150,6 +150,9 @@ class NapCatFastHistoryClient:
         data_count: int,
         page_size: int = FAST_HISTORY_MAX_PAGE_SIZE,
         anchor_message_id: str | None = None,
+        anchor_message_seq: str | None = None,
+        history_fetch_strategy: str | None = None,
+        include_debug_stats: bool = False,
         timeout: float | httpx.Timeout | None = None,
     ) -> Any:
         payload: dict[str, Any] = {
@@ -160,7 +163,37 @@ class NapCatFastHistoryClient:
         }
         if anchor_message_id not in {None, "", "0", 0}:
             payload["anchor_message_id"] = str(anchor_message_id)
+        if anchor_message_seq not in {None, "", "0", 0}:
+            payload["anchor_message_seq"] = str(anchor_message_seq)
+        if history_fetch_strategy:
+            payload["history_fetch_strategy"] = str(history_fetch_strategy)
+        if include_debug_stats:
+            payload["include_debug_stats"] = True
         response = self._post("/history-tail-bulk", json=payload, timeout=timeout)
+        return self._extract_data(response)
+
+    def get_history_full_bulk(
+        self,
+        chat_type: str,
+        chat_id: str,
+        *,
+        data_count: int,
+        page_size: int = FAST_HISTORY_MAX_PAGE_SIZE,
+        history_fetch_strategy: str | None = None,
+        include_debug_stats: bool = False,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "chat_type": normalize_chat_type(chat_type),
+            "chat_id": str(chat_id),
+            "data_count": int(data_count),
+            "page_size": int(page_size),
+        }
+        if history_fetch_strategy:
+            payload["history_fetch_strategy"] = str(history_fetch_strategy)
+        if include_debug_stats:
+            payload["include_debug_stats"] = True
+        response = self._post("/history-full-bulk", json=payload, timeout=timeout)
         return self._extract_data(response)
 
     def hydrate_media(
@@ -254,6 +287,19 @@ class NapCatFastHistoryClient:
             "chat_type_raw": int(chat_type_raw),
         }
         response = self._post("/hydrate-forward-detail", json=payload, timeout=timeout)
+        return self._extract_data(response)
+
+    def hydrate_forward_detail_batch(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> Any:
+        response = self._post(
+            "/hydrate-forward-detail-batch",
+            json={"items": items},
+            timeout=timeout,
+        )
         return self._extract_data(response)
 
     def _extract_data(self, response: httpx.Response, *, require_code: bool = True) -> Any:
