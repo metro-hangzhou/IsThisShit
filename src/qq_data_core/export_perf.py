@@ -6,18 +6,138 @@ from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from time import perf_counter
 
 from .models import EXPORT_TIMEZONE
 from .paths import build_timestamp_token
 
-MATERIALIZE_STEP_TRACE_SAMPLE_INTERVAL = 100
 MATERIALIZE_SLOW_STEP_WARN_S = 5.0
+TOP_PERF_EVENT_LIMIT = 20
+SCAN_PHASE_KINDS = {
+    "bounds_scan",
+    "interval_scan",
+    "interval_tail_scan",
+    "tail_scan",
+    "full_scan",
+}
 
 
 def _json_default(value: Any) -> str:
     if isinstance(value, datetime):
         return value.astimezone(EXPORT_TIMEZONE).isoformat()
     return str(value)
+
+
+def _compact_payload(payload: dict[str, Any], *, omit: set[str] | None = None) -> dict[str, Any]:
+    omitted = omit or set()
+    compact: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in omitted:
+            continue
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        if isinstance(value, float):
+            compact[key] = round(value, 4)
+            continue
+        compact[key] = value
+    return compact
+
+
+def _update_timing_bucket(
+    bucket: dict[str, Any],
+    *,
+    elapsed_s: float,
+    payload: dict[str, Any],
+    max_payload_omit: set[str] | None = None,
+) -> None:
+    bucket["count"] = int(bucket.get("count") or 0) + 1
+    bucket["total_s"] = float(bucket.get("total_s") or 0.0) + elapsed_s
+    current_max = float(bucket.get("max_s") or 0.0)
+    if elapsed_s >= current_max:
+        bucket["max_s"] = elapsed_s
+        bucket["max_payload"] = _compact_payload(payload, omit=max_payload_omit)
+
+
+def _summarize_timing_bucket(name: str, bucket: dict[str, Any]) -> dict[str, Any]:
+    count = int(bucket.get("count") or 0)
+    total_s = float(bucket.get("total_s") or 0.0)
+    max_s = float(bucket.get("max_s") or 0.0)
+    average_s = total_s / count if count else 0.0
+    result = {
+        "name": name,
+        "count": count,
+        "total_s": round(total_s, 4),
+        "average_s": round(average_s, 4),
+        "max_s": round(max_s, 4),
+    }
+    if bucket.get("errors"):
+        result["errors"] = int(bucket.get("errors") or 0)
+    if bucket.get("max_payload"):
+        result["max_payload"] = bucket["max_payload"]
+    return result
+
+
+def _append_top_event(
+    entries: list[dict[str, Any]],
+    *,
+    elapsed_s: float,
+    limit: int = TOP_PERF_EVENT_LIMIT,
+    **payload: Any,
+) -> None:
+    event = {
+        **payload,
+        "elapsed_s": round(elapsed_s, 4),
+        "elapsed_ms": int(round(elapsed_s * 1000)),
+    }
+    entries.append(event)
+    entries.sort(key=lambda item: float(item.get("elapsed_s") or 0.0), reverse=True)
+    if len(entries) > limit:
+        del entries[limit:]
+
+
+class _TimedStage:
+    def __init__(
+        self,
+        writer: "ExportPerfTraceWriter",
+        stage: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._writer = writer
+        self._stage = stage
+        self._payload = dict(payload or {})
+        self._started = 0.0
+        self._extra: dict[str, Any] = {}
+
+    def add(self, **payload: Any) -> None:
+        self._extra.update(payload)
+
+    def __enter__(self) -> "_TimedStage":
+        self._started = perf_counter()
+        self._writer.write_event(
+            "pipeline_stage",
+            {
+                "stage": self._stage,
+                "status": "start",
+                **self._payload,
+            },
+        )
+        return self
+
+    def __exit__(self, exc_type, exc, _tb) -> bool:
+        elapsed_s = perf_counter() - self._started
+        payload = {
+            "stage": self._stage,
+            "elapsed_s": round(elapsed_s, 4),
+            **self._payload,
+            **self._extra,
+        }
+        if exc is not None:
+            payload["status"] = "error"
+            payload["error"] = str(exc)
+        else:
+            payload["status"] = "done"
+        self._writer.write_event("pipeline_stage", payload)
+        return False
 
 
 class ExportPerfTraceWriter:
@@ -51,7 +171,27 @@ class ExportPerfTraceWriter:
         self._slowest_prefetch_chunk_s = 0.0
         self._prefetch_timeout_count = 0
         self._prefetch_degraded = False
+        self._stage_buckets: dict[str, dict[str, Any]] = {}
+        self._history_page_buckets: dict[str, dict[str, Any]] = {}
+        self._scan_phase_buckets: dict[str, dict[str, Any]] = {}
+        self._scan_summaries: list[dict[str, Any]] = []
+        self._page_size_adapt_events: list[dict[str, Any]] = []
+        self._forward_expand_runs: list[dict[str, Any]] = []
+        self._top_materialize_steps: list[dict[str, Any]] = []
+        self._top_materialize_substeps: list[dict[str, Any]] = []
+        self._substep_buckets: dict[str, dict[str, Any]] = {}
+        self._materialize_asset_buckets: dict[str, dict[str, Any]] = {}
+        self._materialize_stage_buckets: dict[str, dict[str, Any]] = {}
         self._closed = False
+        self.report_path = self.path.with_suffix(".report.json")
+
+    def timed_stage(
+        self,
+        stage: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> _TimedStage:
+        return _TimedStage(self, stage, payload)
 
     def write_event(self, kind: str, payload: dict[str, Any]) -> None:
         event = {
@@ -77,11 +217,44 @@ class ExportPerfTraceWriter:
                 self._handle.flush()
 
     def _observe_event(self, kind: str, payload: dict[str, Any]) -> None:
-        if kind in {"bounds_scan", "interval_scan", "interval_tail_scan", "tail_scan", "full_scan"}:
+        if kind == "pipeline_stage":
+            stage = str(payload.get("stage") or "").strip() or "unknown"
+            status = str(payload.get("status") or "").strip() or "done"
+            bucket = self._stage_buckets.setdefault(
+                stage,
+                {"count": 0, "total_s": 0.0, "max_s": 0.0, "errors": 0},
+            )
+            if status == "error":
+                bucket["errors"] = int(bucket.get("errors") or 0) + 1
+            if status in {"done", "error"}:
+                _update_timing_bucket(
+                    bucket,
+                    elapsed_s=float(payload.get("elapsed_s") or 0.0),
+                    payload=payload,
+                    max_payload_omit={"status", "elapsed_s", "stage"},
+                )
+            return
+        if kind in SCAN_PHASE_KINDS:
             self._pages_scanned = max(self._pages_scanned, int(payload.get("pages_scanned") or 0))
             page_duration_s = float(payload.get("page_duration_s") or 0.0)
             self._page_time_sum += page_duration_s
             self._slowest_page_s = max(self._slowest_page_s, page_duration_s)
+            history_source = str(payload.get("history_source") or "").strip()
+            if page_duration_s > 0 and history_source:
+                bucket_name = f"{kind}:{history_source}"
+                bucket = self._history_page_buckets.setdefault(
+                    bucket_name,
+                    {"count": 0, "total_s": 0.0, "max_s": 0.0, "page_messages": 0},
+                )
+                _update_timing_bucket(
+                    bucket,
+                    elapsed_s=page_duration_s,
+                    payload=payload,
+                    max_payload_omit={"page_duration_s"},
+                )
+                bucket["page_messages"] = int(bucket.get("page_messages") or 0) + int(
+                    payload.get("page_message_count") or 0
+                )
             self._last_record_count = max(
                 self._last_record_count,
                 int(payload.get("collected_messages") or payload.get("matched_messages") or 0),
@@ -89,6 +262,49 @@ class ExportPerfTraceWriter:
             return
         if kind == "page_retry":
             self._retry_events += 1
+            return
+        if kind == "history_page_done":
+            mode = str(payload.get("mode") or "").strip() or "unknown"
+            history_source = str(payload.get("history_source") or "").strip() or "unknown"
+            bucket_name = f"{mode}:{history_source}"
+            bucket = self._history_page_buckets.setdefault(
+                bucket_name,
+                {"count": 0, "total_s": 0.0, "max_s": 0.0, "page_messages": 0},
+            )
+            elapsed_s = float(payload.get("page_duration_s") or 0.0)
+            _update_timing_bucket(
+                bucket,
+                elapsed_s=elapsed_s,
+                payload=payload,
+                max_payload_omit={"page_duration_s"},
+            )
+            bucket["page_messages"] = int(bucket.get("page_messages") or 0) + int(
+                payload.get("page_message_count") or 0
+            )
+            return
+        if kind == "scan_summary":
+            scan_phase = str(payload.get("scan_phase") or "").strip() or "unknown"
+            bucket = self._scan_phase_buckets.setdefault(
+                scan_phase,
+                {"count": 0, "total_s": 0.0, "max_s": 0.0, "errors": 0},
+            )
+            _update_timing_bucket(
+                bucket,
+                elapsed_s=float(payload.get("elapsed_s") or 0.0),
+                payload=payload,
+                max_payload_omit={"elapsed_s", "elapsed_ms", "scan_phase"},
+            )
+            self._scan_summaries.append(_compact_payload(payload))
+            return
+        if kind == "page_size_adapt":
+            self._page_size_adapt_events.append(_compact_payload(payload))
+            if len(self._page_size_adapt_events) > TOP_PERF_EVENT_LIMIT:
+                del self._page_size_adapt_events[:-TOP_PERF_EVENT_LIMIT]
+            return
+        if kind == "forward_expand_summary":
+            self._forward_expand_runs.append(_compact_payload(payload))
+            if len(self._forward_expand_runs) > TOP_PERF_EVENT_LIMIT:
+                del self._forward_expand_runs[:-TOP_PERF_EVENT_LIMIT]
             return
         if kind == "prefetch_media_chunk":
             stage = str(payload.get("stage") or "")
@@ -107,6 +323,57 @@ class ExportPerfTraceWriter:
             step_elapsed_s = float(payload.get("step_elapsed_s") or 0.0)
             self._materialize_step_count += 1
             self._materialize_step_time_sum += step_elapsed_s
+            asset_type = str(payload.get("asset_type") or "").strip() or "unknown"
+            asset_role = str(payload.get("asset_role") or "").strip() or "unknown"
+            status = str(payload.get("status") or "").strip() or "unknown"
+            resolver = str(payload.get("resolver") or "").strip() or "-"
+            missing_kind = str(payload.get("missing_kind") or "").strip() or "-"
+            bucket_name = (
+                f"{asset_type}:{asset_role}:status={status}:resolver={resolver}:missing={missing_kind}"
+            )
+            asset_bucket = self._materialize_asset_buckets.setdefault(
+                bucket_name,
+                {
+                    "count": 0,
+                    "total_s": 0.0,
+                    "max_s": 0.0,
+                    "errors": 0,
+                    "asset_type": asset_type,
+                    "asset_role": asset_role,
+                    "status": status,
+                    "resolver": resolver,
+                    "missing_kind": missing_kind,
+                },
+            )
+            if status == "error":
+                asset_bucket["errors"] = int(asset_bucket.get("errors") or 0) + 1
+            _update_timing_bucket(
+                asset_bucket,
+                elapsed_s=step_elapsed_s,
+                payload=payload,
+                max_payload_omit={"step_elapsed_s", "step_elapsed_ms"},
+            )
+            _append_top_event(
+                self._top_materialize_steps,
+                elapsed_s=step_elapsed_s,
+                current=int(payload.get("current") or 0),
+                total=int(payload.get("total") or 0),
+                asset_type=payload.get("asset_type"),
+                asset_role=payload.get("asset_role"),
+                file_name=payload.get("file_name"),
+                timestamp_iso=payload.get("timestamp_iso"),
+                message_id_raw=payload.get("message_id_raw"),
+                element_id=payload.get("element_id"),
+                status=payload.get("status"),
+                resolver=payload.get("resolver"),
+                missing_kind=payload.get("missing_kind"),
+                md5=payload.get("md5"),
+                source_path=payload.get("source_path"),
+                source_path_kind=payload.get("source_path_kind"),
+                hint_url=payload.get("hint_url"),
+                hint_url_kind=payload.get("hint_url_kind"),
+                resolved_source_path=payload.get("resolved_source_path"),
+            )
             if step_elapsed_s >= self._slowest_materialize_step_s:
                 self._slowest_materialize_step_s = step_elapsed_s
                 self._slowest_materialize_step = {
@@ -127,21 +394,70 @@ class ExportPerfTraceWriter:
                     "hint_url_kind": payload.get("hint_url_kind"),
                     "resolved_source_path": payload.get("resolved_source_path"),
                 }
+            return
+        if kind == "materialize_asset_substep":
+            substep = str(payload.get("substep") or "").strip() or "unknown"
+            elapsed_s = float(payload.get("elapsed_s") or 0.0)
+            if elapsed_s <= 0:
+                return
+            bucket = self._substep_buckets.setdefault(
+                substep,
+                {"count": 0, "total_s": 0.0, "max_s": 0.0, "errors": 0},
+            )
+            status = str(payload.get("status") or "").strip()
+            if status in {"error", "timeout"}:
+                bucket["errors"] = int(bucket.get("errors") or 0) + 1
+            _update_timing_bucket(
+                bucket,
+                elapsed_s=elapsed_s,
+                payload=payload,
+                max_payload_omit={"elapsed_s", "elapsed_ms"},
+            )
+            asset_type = str(payload.get("asset_type") or "").strip() or "unknown"
+            stage_bucket_name = f"{asset_type}:{substep}:status={status or 'unknown'}"
+            stage_bucket = self._materialize_stage_buckets.setdefault(
+                stage_bucket_name,
+                {
+                    "count": 0,
+                    "total_s": 0.0,
+                    "max_s": 0.0,
+                    "errors": 0,
+                    "asset_type": asset_type,
+                    "substep": substep,
+                    "status": status or "unknown",
+                },
+            )
+            if status in {"error", "timeout", "cached_error"}:
+                stage_bucket["errors"] = int(stage_bucket.get("errors") or 0) + 1
+            _update_timing_bucket(
+                stage_bucket,
+                elapsed_s=elapsed_s,
+                payload=payload,
+                max_payload_omit={"elapsed_s", "elapsed_ms"},
+            )
+            _append_top_event(
+                self._top_materialize_substeps,
+                elapsed_s=elapsed_s,
+                substep=substep,
+                status=status,
+                asset_type=payload.get("asset_type"),
+                asset_role=payload.get("asset_role"),
+                file_name=payload.get("file_name"),
+                message_id_raw=payload.get("message_id_raw"),
+                element_id=payload.get("element_id"),
+                forward_parent_message_id_raw=payload.get("forward_parent_message_id_raw"),
+                detail=payload.get("detail"),
+                hint_file_id=payload.get("hint_file_id"),
+                hint_url=payload.get("hint_url"),
+                timestamp_iso=payload.get("timestamp_iso"),
+                source_path_kind=payload.get("source_path_kind"),
+                hint_url_kind=payload.get("hint_url_kind"),
+            )
 
     def _should_persist_event(self, kind: str, payload: dict[str, Any]) -> bool:
         if kind != "materialize_asset_step":
             return True
-        stage = str(payload.get("stage") or "")
-        current = int(payload.get("current") or 0)
-        total = int(payload.get("total") or 0)
-        step_elapsed_s = float(payload.get("step_elapsed_s") or 0.0)
-        sampled = (
-            current in {1, total}
-            or (current > 0 and current % MATERIALIZE_STEP_TRACE_SAMPLE_INTERVAL == 0)
-        )
-        if stage == "done":
-            return sampled or step_elapsed_s >= MATERIALIZE_SLOW_STEP_WARN_S
-        return sampled
+        return str(payload.get("stage") or "") == "done"
 
     def _should_flush_event(self, kind: str, payload: dict[str, Any]) -> bool:
         if kind != "materialize_asset_step":
@@ -149,38 +465,147 @@ class ExportPerfTraceWriter:
         step_elapsed_s = float(payload.get("step_elapsed_s") or 0.0)
         return step_elapsed_s >= MATERIALIZE_SLOW_STEP_WARN_S
 
+    def _build_summary_unlocked(self, *, record_count: int | None = None) -> dict[str, Any]:
+        elapsed_s = (datetime.now(EXPORT_TIMEZONE) - self._started_at).total_seconds()
+        average_page_s = self._page_time_sum / self._pages_scanned if self._pages_scanned else 0.0
+        average_materialize_step_s = (
+            self._materialize_step_time_sum / self._materialize_step_count
+            if self._materialize_step_count
+            else 0.0
+        )
+        average_prefetch_chunk_s = (
+            self._prefetch_chunk_time_sum / self._prefetch_chunk_count
+            if self._prefetch_chunk_count
+            else 0.0
+        )
+        return {
+            "started_at": self._started_at.isoformat(),
+            "elapsed_s": round(elapsed_s, 3),
+            "total_elapsed_s": round(elapsed_s, 3),
+            "pages_scanned": self._pages_scanned,
+            "retry_events": self._retry_events,
+            "average_page_s": round(average_page_s, 4),
+            "slowest_page_s": round(self._slowest_page_s, 4),
+            "prefetch_chunk_count": self._prefetch_chunk_count,
+            "average_prefetch_chunk_s": round(average_prefetch_chunk_s, 4),
+            "slowest_prefetch_chunk_s": round(self._slowest_prefetch_chunk_s, 4),
+            "prefetch_timeout_count": self._prefetch_timeout_count,
+            "prefetch_degraded": self._prefetch_degraded,
+            "materialize_step_count": self._materialize_step_count,
+            "average_materialize_step_s": round(average_materialize_step_s, 4),
+            "slowest_materialize_step_s": round(self._slowest_materialize_step_s, 4),
+            "slowest_materialize_step": self._slowest_materialize_step,
+            "record_count": self._last_record_count if record_count is None else record_count,
+            "stage_breakdown": [
+                _summarize_timing_bucket(name, bucket)
+                for name, bucket in sorted(
+                    self._stage_buckets.items(),
+                    key=lambda item: float(item[1].get("total_s") or 0.0),
+                    reverse=True,
+                )[:10]
+            ],
+        }
+
     def build_summary(self, *, record_count: int | None = None) -> dict[str, Any]:
         with self._lock:
-            elapsed_s = (datetime.now(EXPORT_TIMEZONE) - self._started_at).total_seconds()
-            average_page_s = self._page_time_sum / self._pages_scanned if self._pages_scanned else 0.0
-            average_materialize_step_s = (
-                self._materialize_step_time_sum / self._materialize_step_count
-                if self._materialize_step_count
-                else 0.0
-            )
-            average_prefetch_chunk_s = (
-                self._prefetch_chunk_time_sum / self._prefetch_chunk_count
-                if self._prefetch_chunk_count
-                else 0.0
-            )
+            return self._build_summary_unlocked(record_count=record_count)
+
+    def build_report(self, *, record_count: int | None = None) -> dict[str, Any]:
+        with self._lock:
+            summary = self._build_summary_unlocked(record_count=record_count)
+            stage_breakdown = [
+                _summarize_timing_bucket(name, bucket)
+                for name, bucket in sorted(
+                    self._stage_buckets.items(),
+                    key=lambda item: float(item[1].get("total_s") or 0.0),
+                    reverse=True,
+                )
+            ]
+            fetch_stage_breakdown = [
+                row
+                for row in stage_breakdown
+                if row["name"].startswith("app.fetch_")
+                or row["name"].startswith("provider.fetch_")
+                or row["name"].startswith("provider.fast_")
+                or row["name"].startswith("provider.finalize_")
+            ]
+            history_page_breakdown = []
+            for name, bucket in sorted(
+                self._history_page_buckets.items(),
+                key=lambda item: float(item[1].get("total_s") or 0.0),
+                reverse=True,
+            ):
+                row = _summarize_timing_bucket(name, bucket)
+                row["page_messages"] = int(bucket.get("page_messages") or 0)
+                history_page_breakdown.append(row)
+            scan_phase_breakdown = [
+                _summarize_timing_bucket(name, bucket)
+                for name, bucket in sorted(
+                    self._scan_phase_buckets.items(),
+                    key=lambda item: float(item[1].get("total_s") or 0.0),
+                    reverse=True,
+                )
+            ]
+            substep_breakdown = [
+                _summarize_timing_bucket(name, bucket)
+                for name, bucket in sorted(
+                    self._substep_buckets.items(),
+                    key=lambda item: float(item[1].get("total_s") or 0.0),
+                    reverse=True,
+                )
+            ]
+            materialize_asset_breakdown = []
+            for name, bucket in sorted(
+                self._materialize_asset_buckets.items(),
+                key=lambda item: float(item[1].get("total_s") or 0.0),
+                reverse=True,
+            ):
+                row = _summarize_timing_bucket(name, bucket)
+                row["asset_type"] = bucket.get("asset_type")
+                row["asset_role"] = bucket.get("asset_role")
+                row["status"] = bucket.get("status")
+                row["resolver"] = bucket.get("resolver")
+                row["missing_kind"] = bucket.get("missing_kind")
+                materialize_asset_breakdown.append(row)
+            materialize_stage_breakdown = []
+            for name, bucket in sorted(
+                self._materialize_stage_buckets.items(),
+                key=lambda item: float(item[1].get("total_s") or 0.0),
+                reverse=True,
+            ):
+                row = _summarize_timing_bucket(name, bucket)
+                row["asset_type"] = bucket.get("asset_type")
+                row["substep"] = bucket.get("substep")
+                row["status"] = bucket.get("status")
+                materialize_stage_breakdown.append(row)
             return {
-                "started_at": self._started_at.isoformat(),
-                "elapsed_s": round(elapsed_s, 3),
-                "pages_scanned": self._pages_scanned,
-                "retry_events": self._retry_events,
-                "average_page_s": round(average_page_s, 4),
-                "slowest_page_s": round(self._slowest_page_s, 4),
-                "prefetch_chunk_count": self._prefetch_chunk_count,
-                "average_prefetch_chunk_s": round(average_prefetch_chunk_s, 4),
-                "slowest_prefetch_chunk_s": round(self._slowest_prefetch_chunk_s, 4),
-                "prefetch_timeout_count": self._prefetch_timeout_count,
-                "prefetch_degraded": self._prefetch_degraded,
-                "materialize_step_count": self._materialize_step_count,
-                "average_materialize_step_s": round(average_materialize_step_s, 4),
-                "slowest_materialize_step_s": round(self._slowest_materialize_step_s, 4),
-                "slowest_materialize_step": self._slowest_materialize_step,
-                "record_count": self._last_record_count if record_count is None else record_count,
+                **summary,
+                "total_elapsed_s": summary["elapsed_s"],
+                "stage_breakdown": stage_breakdown,
+                "fetch_stage_breakdown": fetch_stage_breakdown,
+                "trace_path": str(self.path),
+                "report_path": str(self.report_path),
+                "history_page_breakdown": history_page_breakdown,
+                "scan_phase_breakdown": scan_phase_breakdown,
+                "materialize_stage_breakdown": materialize_stage_breakdown,
+                "materialize_asset_breakdown": materialize_asset_breakdown,
+                "scan_summaries": list(self._scan_summaries),
+                "page_size_adapt_events": list(self._page_size_adapt_events),
+                "forward_expand_runs": list(self._forward_expand_runs),
+                "substep_breakdown": substep_breakdown,
+                "top_materialize_steps": list(self._top_materialize_steps),
+                "top_materialize_substeps": list(self._top_materialize_substeps),
             }
+
+    def persist_report(self, *, record_count: int | None = None) -> Path:
+        report = self.build_report(record_count=record_count)
+        temp_path = self.report_path.with_name(f"{self.report_path.name}.tmp")
+        temp_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
+        os.replace(temp_path, self.report_path)
+        return self.report_path
 
     def close(self) -> None:
         with self._lock:

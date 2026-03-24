@@ -66,6 +66,38 @@
 
 ## 4. 里程碑日志
 
+### [2026-03-24][053] export perf report now exposes fetch/page/materialize views directly, and the current full-export hotspots have been pinned down
+
+- `export_perf` report schema has been extended so operator review no longer needs to hand-parse raw trace lines for:
+  - fetch-stage cost
+  - scan-phase cost
+  - bulk tail page cost
+- the current performance backlog is now tracked in:
+  - [TODOs.export-performance.md](../todos/TODOs.export-performance.md)
+- the latest audited full export on group `922065597` still shows the main cost surface as:
+  - fetch/page scan: `~47.9s`
+  - materialize/write bundle: `~61.0s`
+- the audit also made the current top hotspots explicit:
+  - `tail_scan.forward_hydrate_s ~= 35.4s`
+  - forward/history enrichment had many retries but near-zero yield in the audited run
+  - materialize no longer looks timeout-dominated; it is now mostly aggregate-volume dominated with repeated `image` remote/public-token work
+- next phase is therefore:
+  - reduce forward enrichment cost when yields stay near zero
+  - reduce repeated image materialize substeps at volume
+  - keep comparing against the last `actionable_missing=0` 13000 baseline
+
+### [2026-03-24][052] Performance instrumentation is now live, but full-export correctness must be baseline-compared before release
+
+- exporter now emits a dedicated performance report alongside the raw trace for full export runs
+- this instrumentation pass also exposed a new release rule:
+  - keep `actionable_missing=0` as a hard correctness gate
+  - treat report completeness as part of exporter validation, not just observability polish
+- next phase is:
+  - baseline replay
+  - regression triage
+  - targeted fixes
+  - not another blind full rerun
+
 ### [2026-03-23][050] 新增 evidence-first simulator exhaustive 规划面板
 
 - 为了把 simulator 从“强手写矩阵 + 历史回归样本”推进到“接近数学意义上的充分覆盖”，新增执行面板：
@@ -1529,3 +1561,34 @@
     - placeholder 的 authoritative-proof 化
     - bucket-style timeout/cache scope 的完全 evidence 化
     - actionable-composition 驱动的 prefetch/pool shaping
+
+### [2026-03-24][049] full-export performance report 已补齐 fast-bulk page rows 与 materialize grouped breakdown，下一阶段热点已从 timeout storm 缩到 fetch-side forward hydrate 与 materialize 小步累积
+
+- 本轮先确认了 broad perf audit 里还没闭环的点：
+  - `history_page_breakdown` 之前为空，不是 report 坏了，而是 fast-bulk 路径没有发 `history_page_done`
+  - report 也缺少显式：
+    - `materialize_stage_breakdown`
+    - `materialize_asset_breakdown`
+- 当前已落地：
+  - fast-bulk chunk 现在会补发 synthetic `history_page_done`
+  - report 现在稳定保留：
+    - `total_elapsed_s`
+    - `history_page_breakdown`
+    - `materialize_stage_breakdown`
+    - `materialize_asset_breakdown`
+  - `media_bundle.py` 也新增了 local materialization 子步骤时间针：
+    - `allocate_export_path`
+    - `ensure_export_parent`
+    - `copy_asset_file`
+    - `second_pass_identity_reuse`
+    - `second_pass_public_retry`
+    - `second_pass_copy_asset_file`
+- 当前 reviewer 结论已经比较集中：
+  - fetch 侧主要热点不是 raw `fast_tail_bulk`，而是 bulk fetch 后的 `forward_hydrate_s`
+  - materialize 侧不再被单资产 timeout storm 主导，而是：
+    - 很多小的 image public/remote 检查
+    - 再加上之前不可见的 local copy/finalize I/O
+- 下一阶段 perf action board：
+  - 把 bulk forward hydrate 的 per-window/per-chunk 成本单独打出来
+  - 收窄 finalize / forward retry 里 `0 hit` 的无效工作
+  - 基于新的 copy/finalize telemetry 决定是否还值得继续优化本地 I/O
