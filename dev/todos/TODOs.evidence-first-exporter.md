@@ -258,6 +258,50 @@ The latest strict audit found the remaining non-evidence decisions concentrated 
     - forward ref count
     - hydrated count
     - oldest/newest message ids
+
+## [2026-03-24] Post-Restart Forward-Image Regression Was A Route-Ordering Bug, Not A New Fetch/Page Problem
+
+- after a real NapCat restart and plugin refresh, the next live `limit=300` probe regressed badly:
+  - old report:
+    - `state/export_perf/cli_export_group_922065597_20260324_211731_189427_48916.report.json`
+  - result:
+    - `records=300`
+    - `elapsed=92.606s`
+    - `history_source=napcat_fast_history_bulk`
+    - `actionable_missing=0`
+    - `bundle.materialize_snapshot_media ~= 87.301s`
+    - `slowest_materialize_step_s ~= 12.103s`
+- root cause was not bulk page scanning or tail fetch itself:
+  - forward `image` route ordering still allowed repeated `public_token_get_image` timeout work to survive even after forward metadata/local evidence had already proved there was no usable local recovery
+  - the same failure shape could reappear through both:
+    - `_resolve_from_forward_payload_candidate(...)`
+    - `_pick_forward_asset_match(...)`
+- the route plan is now tightened so that:
+  - forward-image terminal classification runs before public-token retry once forward metadata/local evidence already proves the asset is dead
+  - after a public-token remote-url attempt fails, downloader re-runs evidence-first missing classification immediately instead of drifting back to `missing_after_napcat`
+- live probe after the fix:
+  - new report:
+    - `state/export_perf/cli_export_group_922065597_20260324_215702_598580_49144.report.json`
+  - result:
+    - `records=300`
+    - `elapsed=8.734s`
+    - `history_source=napcat_fast_history_bulk`
+    - `actionable_missing=0`
+    - `background_missing=21`
+    - `bundle.materialize_snapshot_media ~= 3.321s`
+    - `slowest_materialize_step_s ~= 0.315s`
+- observed effect on the previously bad forward-image family:
+  - no `public_token_get_image timeout` chain remains
+  - `forward_remote_url:error` is now `~7-10ms`
+  - `forward_context_metadata:ok` is now `~20-51ms`
+  - final outcome is terminal background classification instead of a 12s timeout loop
+- next hotspot interpretation after this fix:
+  - fetch-side bulk/page work is no longer masked by forward-image storms
+  - the current visible tops on the same `300`-message slice are now:
+    - `app.fetch_snapshot ~= 1.607s`
+    - `provider.fast_tail_bulk ~= 1.557s`
+    - `bundle.materialize_snapshot_media ~= 3.321s`
+    - `app.write_bundle ~= 3.355s`
     - oldest/newest seqs
     - oldest/newest timestamps
   - `materialize_stage_breakdown` and `materialize_asset_breakdown` are non-empty

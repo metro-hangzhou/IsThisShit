@@ -85,6 +85,29 @@ Without that formal layer, we can still miss:
   - this suite must run for both `recent` and `old` ages
   - the result must be invariant to age once the proof chain is complete
 
+## [2026-03-24] Post-Restart Regression Lockdown Added In This Pass
+
+- the latest post-restart forward-image regression was reproduced against the bounded evidence matrix and reduced to two concrete simulator gaps:
+  - valid NapCat relative HTTP recovery paths must use canonical `/download?...` shapes
+  - top-level dead-public-remote image terminality must stay invariant across both `recent` and `old` ages once the proof chain is complete
+- simulator-side fixes now in place:
+  - relative HTTP route modeling now emits valid NapCat-style `/download?...` paths instead of unsupported pseudo-relative shapes
+  - relative remote URL joining now uses canonical `urljoin(...)` normalization so the simulated remote map matches the exporter's actual URL resolution path
+  - the matrix now explicitly locks:
+    - `top_level_image_public_token_dead_remote_recent`
+    - `top_level_image_public_token_dead_remote_old`
+- exporter-side rule now mirrored by simulator oracle:
+  - if `public_token_get_image` yields only a remote URL
+  - and that authoritative remote URL fails
+  - and there is still no recovered local path / no remaining live handle
+  - outcome must be:
+    - `actual_resolver = qq_expired_after_napcat`
+    - `actual_path_kind = missing`
+- validation after this pass:
+  - bounded resolution matrix mismatches: `0`
+  - changed simulator guard subset:
+    - `test_asset_simulator.py -k "matrix_matches_expectations or matrix_includes_core_failure_and_remote_recovery_paths"` -> `8 passed`
+
 ## [2026-03-24] Perf-Driven Simulator Extension Targets
 
 - the latest maintainer live perf slice:
