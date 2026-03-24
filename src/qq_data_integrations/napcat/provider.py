@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from time import perf_counter
 from typing import Any, Callable
@@ -28,7 +29,9 @@ FAST_HISTORY_RECOVERY_STEP = 50
 MAX_HISTORY_TIMEOUT_RETRIES = 3
 FORWARD_ELEMENT_TYPE = 16
 SPARSE_TAIL_FORWARD_HYDRATE_MIN_WINDOW_MESSAGES = 100
-SPARSE_TAIL_FORWARD_HYDRATE_MAX_FORWARD_REFS = 2
+SPARSE_TAIL_FORWARD_HYDRATE_MAX_FORWARD_REFS = 4
+FORWARD_DETAIL_PREFETCH_WORKERS = 6
+FAST_HISTORY_BULK_FETCH_STRATEGY = "seq_window"
 
 
 class NapCatHistoryProvider:
@@ -1216,8 +1219,79 @@ class NapCatHistoryProvider:
     ) -> dict[str, Any] | None:
         if self._fast_client is None or self._fast_mode == "off":
             return None
+        target_count = max(int(request.limit or 0), FAST_HISTORY_BULK_SAFE_DATA_COUNT)
+        direct_full_payload = self._fetch_fast_history_full_bulk(
+            request,
+            data_count=target_count,
+            page_size=page_size,
+        )
+        if direct_full_payload is not None:
+            chunk_messages = _sorted_messages(self._extract_messages(direct_full_payload.get("messages")))
+            final_content_at = _message_datetime(chunk_messages[-1]) if chunk_messages else None
+            earliest_content_at = _message_datetime(chunk_messages[0]) if chunk_messages else None
+            pages_scanned = int(direct_full_payload.get("pages_scanned") or 0)
+            next_anchor = (
+                str(direct_full_payload.get("next_anchor") or "").strip()
+                or (_history_anchor(chunk_messages[0]) if chunk_messages else None)
+            )
+            next_anchor_seq = (
+                str(direct_full_payload.get("next_anchor_message_seq") or "").strip()
+                or (_message_seq(chunk_messages[0]) if chunk_messages else None)
+            )
+            elapsed_s = round(float(direct_full_payload.get("elapsed_ms") or 0) / 1000.0, 4)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": "history_page_done",
+                        "mode": "full_scan",
+                        "history_source": "napcat_fast_history_bulk",
+                        "status": "done",
+                        "page_duration_s": elapsed_s,
+                        "page_message_count": len(chunk_messages),
+                        "page_size": int(direct_full_payload.get("page_size") or page_size),
+                        "requested_count": int(direct_full_payload.get("requested_data_count") or len(chunk_messages)),
+                        "retry_count": 0,
+                        "chunk_index": 1,
+                        "chunk_added": len(chunk_messages),
+                        "pages_scanned": pages_scanned,
+                        "next_anchor": next_anchor,
+                        "next_anchor_message_seq": next_anchor_seq,
+                        "oldest_content_at": earliest_content_at,
+                        "newest_content_at": final_content_at,
+                        "route": "history_full_bulk",
+                    }
+                )
+            self._emit_pipeline_stage(
+                progress_callback,
+                stage="provider.fast_full_bulk",
+                status="done",
+                elapsed_s=elapsed_s,
+                pages_scanned=pages_scanned,
+                bulk_chunks=1,
+                message_count=len(chunk_messages),
+                exit_reason="exhausted" if bool(direct_full_payload.get("exhausted")) else "completed",
+                route="history_full_bulk",
+            )
+            return {
+                "messages": chunk_messages,
+                "seen_keys": {_message_key(item) for item in chunk_messages},
+                "next_anchor": next_anchor,
+                "next_anchor_message_seq": next_anchor_seq,
+                "pages_scanned": pages_scanned,
+                "completed": bool(direct_full_payload.get("exhausted")),
+                "history_source": "napcat_fast_history_bulk",
+                "bulk_duration_s": elapsed_s,
+                "bulk_chunks": 1,
+                "bulk_chunk_limit": int(direct_full_payload.get("requested_data_count") or len(chunk_messages)),
+                "partial_fallback": False,
+                "page_size": int(direct_full_payload.get("page_size") or page_size),
+                "earliest_content_at": earliest_content_at,
+                "final_content_at": final_content_at,
+                "route": "history_full_bulk",
+            }
         chunk_limit = FAST_HISTORY_BULK_SAFE_DATA_COUNT
         anchor: str | None = None
+        anchor_seq: str | None = None
         seen_keys: set[str] = set()
         seen_anchors: set[str] = set()
         collected_messages: list[dict[str, Any]] = []
@@ -1241,6 +1315,7 @@ class NapCatHistoryProvider:
                 data_count=chunk_limit,
                 page_size=page_size,
                 anchor_message_id=anchor,
+                anchor_message_seq=anchor_seq,
             )
             if payload is None:
                 if chunk_count <= 0:
@@ -1267,6 +1342,7 @@ class NapCatHistoryProvider:
                     "messages": collected_messages,
                     "seen_keys": seen_keys,
                     "next_anchor": anchor,
+                    "next_anchor_message_seq": anchor_seq,
                     "pages_scanned": pages_scanned,
                     "completed": False,
                     "history_source": "napcat_fast_history_bulk",
@@ -1302,6 +1378,10 @@ class NapCatHistoryProvider:
                 str(payload.get("next_anchor") or "").strip()
                 or (_history_anchor(chunk_messages[0]) if chunk_messages else None)
             )
+            next_anchor_seq = (
+                str(payload.get("next_anchor_message_seq") or "").strip()
+                or (_message_seq(chunk_messages[0]) if chunk_messages else None)
+            )
             exhausted = bool(payload.get("exhausted"))
             total_duration_s = round(perf_counter() - total_started, 4)
             self._emit_progress(
@@ -1320,6 +1400,7 @@ class NapCatHistoryProvider:
                     "chunk_added": added,
                     "pages_scanned": pages_scanned,
                     "next_anchor": next_anchor,
+                    "next_anchor_message_seq": next_anchor_seq,
                     "oldest_content_at": oldest_dt,
                     "newest_content_at": newest_dt,
                 },
@@ -1338,6 +1419,7 @@ class NapCatHistoryProvider:
                     "total_duration_s": total_duration_s,
                     "pages_scanned": pages_scanned,
                     "next_anchor": next_anchor,
+                    "next_anchor_message_seq": next_anchor_seq,
                     "exhausted": exhausted,
                     "requested_data_count": len(collected_messages),
                 },
@@ -1351,6 +1433,7 @@ class NapCatHistoryProvider:
                         "earliest_content_at": earliest_content_at,
                         "final_content_at": final_content_at,
                         "anchor": next_anchor,
+                        "anchor_message_seq": next_anchor_seq,
                         "history_source": "napcat_fast_history_bulk",
                         "page_duration_s": chunk_duration_s,
                         "bulk_duration_s": total_duration_s,
@@ -1377,6 +1460,7 @@ class NapCatHistoryProvider:
                     "messages": collected_messages,
                     "seen_keys": seen_keys,
                     "next_anchor": next_anchor,
+                    "next_anchor_message_seq": next_anchor_seq,
                     "pages_scanned": pages_scanned,
                     "completed": True,
                     "history_source": "napcat_fast_history_bulk",
@@ -1404,6 +1488,7 @@ class NapCatHistoryProvider:
                     "messages": collected_messages,
                     "seen_keys": seen_keys,
                     "next_anchor": anchor,
+                    "next_anchor_message_seq": anchor_seq,
                     "pages_scanned": pages_scanned,
                     "completed": False,
                     "history_source": "napcat_fast_history_bulk",
@@ -1418,6 +1503,37 @@ class NapCatHistoryProvider:
 
             seen_anchors.add(next_anchor)
             anchor = next_anchor
+            anchor_seq = next_anchor_seq
+
+    def _fetch_fast_history_full_bulk(
+        self,
+        request: ExportRequest,
+        *,
+        data_count: int,
+        page_size: int,
+    ) -> Any | None:
+        if self._fast_client is None or self._fast_mode == "off":
+            return None
+        get_history_full_bulk = getattr(self._fast_client, "get_history_full_bulk", None)
+        if not callable(get_history_full_bulk):
+            return None
+        if self._fast_tail_bulk_available is False and self._fast_mode != "force":
+            return None
+        try:
+            payload = get_history_full_bulk(
+                request.chat_type,
+                request.chat_id,
+                data_count=data_count,
+                page_size=page_size,
+                history_fetch_strategy=FAST_HISTORY_BULK_FETCH_STRATEGY,
+            )
+        except NapCatFastHistoryError:
+            if self._fast_mode == "force":
+                raise
+            return None
+        self._fast_available = True
+        self._fast_tail_bulk_available = True
+        return payload
 
     def _extract_messages(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
@@ -1601,6 +1717,7 @@ class NapCatHistoryProvider:
         total_targets = already_resolved + len(targets)
         if total_targets <= 0:
             return 0, 0
+        prefetched_fast_plugin = self._prefetch_forward_details_via_fast_plugin(targets)
 
         def _history_outcome(message_key: str) -> dict[str, Any] | None:
             if not message_key:
@@ -1660,10 +1777,15 @@ class NapCatHistoryProvider:
             fast_plugin_messages: list[dict[str, Any]] | None = None
             fast_plugin_reason: str | None = None
             if not skip_history_retry:
-                fast_plugin_calls += 1
-                fast_plugin_messages, fast_plugin_reason = (
-                    self._hydrate_forward_message_via_fast_plugin(target)
-                )
+                prefetched_key = self._forward_detail_prefetch_key(target)
+                if prefetched_key in prefetched_fast_plugin:
+                    fast_plugin_calls += 1
+                    fast_plugin_messages, fast_plugin_reason = prefetched_fast_plugin[prefetched_key]
+                else:
+                    fast_plugin_calls += 1
+                    fast_plugin_messages, fast_plugin_reason = (
+                        self._hydrate_forward_message_via_fast_plugin(target)
+                    )
                 if fast_plugin_messages:
                     fast_plugin_hits += 1
                     cache[forward_id] = fast_plugin_messages
@@ -1870,6 +1992,154 @@ class NapCatHistoryProvider:
         return enriched, structure_unavailable
 
     @staticmethod
+    def _forward_detail_prefetch_key(target: dict[str, Any]) -> tuple[str, str]:
+        forward_id = str(target.get("forward_id") or "").strip()
+        message_id = str(target.get("message_id") or "").strip()
+        element_id = str(target.get("element_id") or "").strip()
+        if forward_id:
+            return ("forward_id", forward_id)
+        return ("message_element", f"{message_id}:{element_id}")
+
+    @staticmethod
+    def _forward_detail_context_from_target(target: dict[str, Any]) -> dict[str, Any] | None:
+        message = target.get("message")
+        if not isinstance(message, dict):
+            return None
+        raw_message = _message_raw(message)
+        message_id_raw = str(
+            target.get("message_id")
+            or message.get("message_id")
+            or message.get("messageId")
+            or raw_message.get("msgId")
+            or ""
+        ).strip()
+        element_id = str(target.get("element_id") or "").strip()
+        peer_uid = str(raw_message.get("peerUid") or "").strip()
+        chat_type_raw = raw_message.get("chatType")
+        if (
+            not message_id_raw
+            or not element_id
+            or not peer_uid
+            or chat_type_raw in {None, ""}
+        ):
+            return None
+        return {
+            "message_id_raw": message_id_raw,
+            "element_id": element_id,
+            "peer_uid": peer_uid,
+            "chat_type_raw": chat_type_raw,
+        }
+
+    def _prefetch_forward_details_via_fast_plugin_batch(
+        self,
+        unique_targets: dict[tuple[str, str], dict[str, Any]],
+    ) -> dict[tuple[str, str], tuple[list[dict[str, Any]] | None, str | None]] | None:
+        if self._fast_client is None or self._fast_mode == "off":
+            return None
+        hydrate_forward_detail_batch = getattr(
+            self._fast_client,
+            "hydrate_forward_detail_batch",
+            None,
+        )
+        if not callable(hydrate_forward_detail_batch):
+            return None
+        if self._fast_forward_detail_available is False and self._fast_mode != "force":
+            return None
+
+        ordered_items: list[tuple[tuple[str, str], dict[str, Any]]] = []
+        for key, target in unique_targets.items():
+            context = self._forward_detail_context_from_target(target)
+            if context is None:
+                continue
+            ordered_items.append((key, context))
+        if len(ordered_items) <= 1:
+            return {}
+
+        try:
+            payload = hydrate_forward_detail_batch(
+                [context for _key, context in ordered_items]
+            )
+        except NapCatFastHistoryUnavailable:
+            if self._fast_mode == "force":
+                raise
+            return None
+        except NapCatFastHistoryError:
+            if self._fast_mode == "force":
+                raise
+            return None
+        except httpx.HTTPError:
+            return None
+
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return {}
+
+        self._fast_available = True
+        self._fast_forward_detail_available = True
+        results: dict[tuple[str, str], tuple[list[dict[str, Any]] | None, str | None]] = {}
+        for index, (key, _context) in enumerate(ordered_items):
+            item = items[index] if index < len(items) else None
+            if not isinstance(item, dict):
+                continue
+            if not item.get("ok"):
+                continue
+            nested_messages = self._extract_messages(item.get("data"))
+            results[key] = ((nested_messages or None), None)
+        return results
+
+    def _prefetch_forward_details_via_fast_plugin(
+        self,
+        targets: list[dict[str, Any]],
+    ) -> dict[tuple[str, str], tuple[list[dict[str, Any]] | None, str | None]]:
+        if (
+            self._fast_client is None
+            or self._fast_mode == "off"
+            or len(targets) <= 1
+        ):
+            return {}
+        hydrate_forward_detail = getattr(self._fast_client, "hydrate_forward_detail", None)
+        if not callable(hydrate_forward_detail):
+            return {}
+        if self._fast_forward_detail_available is False and self._fast_mode != "force":
+            return {}
+        unique_targets: dict[tuple[str, str], dict[str, Any]] = {}
+        for target in targets:
+            unique_targets.setdefault(self._forward_detail_prefetch_key(target), target)
+        if len(unique_targets) <= 1:
+            return {}
+        batch_results = self._prefetch_forward_details_via_fast_plugin_batch(unique_targets)
+        if batch_results is not None:
+            remaining_targets = {
+                key: target
+                for key, target in unique_targets.items()
+                if key not in batch_results
+            }
+            if not remaining_targets:
+                return batch_results
+            unique_targets = remaining_targets
+            results = dict(batch_results)
+        else:
+            results = {}
+        worker_count = max(2, min(FORWARD_DETAIL_PREFETCH_WORKERS, len(unique_targets)))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="forward-detail-prefetch",
+        ) as executor:
+            future_map = {
+                executor.submit(self._hydrate_forward_message_via_fast_plugin, target): key
+                for key, target in unique_targets.items()
+            }
+            for future in as_completed(future_map):
+                key = future_map[future]
+                try:
+                    results[key] = future.result()
+                except Exception:
+                    if self._fast_mode == "force":
+                        raise
+                    results[key] = (None, None)
+        return results
+
+    @staticmethod
     def _mark_forward_target_unavailable(
         target: dict[str, Any],
         *,
@@ -1911,35 +2181,12 @@ class NapCatHistoryProvider:
         if self._fast_forward_detail_available is False and self._fast_mode != "force":
             return None, "forward_structure_unavailable_fast_plugin_route"
 
-        message = target.get("message")
-        if not isinstance(message, dict):
-            return None, None
-        raw_message = _message_raw(message)
-        message_id_raw = str(
-            target.get("message_id")
-            or message.get("message_id")
-            or message.get("messageId")
-            or raw_message.get("msgId")
-            or ""
-        ).strip()
-        element_id = str(target.get("element_id") or "").strip()
-        peer_uid = str(raw_message.get("peerUid") or "").strip()
-        chat_type_raw = raw_message.get("chatType")
-        if (
-            not message_id_raw
-            or not element_id
-            or not peer_uid
-            or chat_type_raw in {None, ""}
-        ):
+        context = self._forward_detail_context_from_target(target)
+        if context is None:
             return None, None
 
         try:
-            payload = hydrate_forward_detail(
-                message_id_raw=message_id_raw,
-                element_id=element_id,
-                peer_uid=peer_uid,
-                chat_type_raw=chat_type_raw,
-            )
+            payload = hydrate_forward_detail(**context)
         except NapCatFastHistoryUnavailable:
             if self._fast_mode == "force":
                 raise
@@ -2490,6 +2737,7 @@ class NapCatHistoryProvider:
         data_count: int,
         page_size: int,
         anchor_message_id: str | None = None,
+        anchor_message_seq: str | None = None,
     ) -> Any | None:
         if self._fast_client is None or self._fast_mode == "off":
             return None
@@ -2505,6 +2753,8 @@ class NapCatHistoryProvider:
                 data_count=data_count,
                 page_size=page_size,
                 anchor_message_id=anchor_message_id,
+                anchor_message_seq=anchor_message_seq,
+                history_fetch_strategy=FAST_HISTORY_BULK_FETCH_STRATEGY,
             )
         except NapCatFastHistoryError:
             if self._fast_mode == "force":
@@ -2524,7 +2774,111 @@ class NapCatHistoryProvider:
         progress_callback: HistoryProgressCallback | None,
     ) -> dict[str, Any] | None:
         chunk_limit = self._normalize_requested_bulk_data_count(data_count)
+        if data_count > chunk_limit:
+            direct_full_payload = self._fetch_fast_history_full_bulk(
+                request,
+                data_count=data_count,
+                page_size=page_size,
+            )
+            if direct_full_payload is not None:
+                chunk_messages = _sorted_messages(self._extract_messages(direct_full_payload.get("messages")))
+                selected_messages = chunk_messages[-data_count:] if data_count > 0 else chunk_messages
+                oldest_dt = _message_datetime(selected_messages[0]) if selected_messages else None
+                newest_dt = _message_datetime(selected_messages[-1]) if selected_messages else None
+                pages_scanned = int(direct_full_payload.get("pages_scanned") or 0)
+                next_anchor = (
+                    str(direct_full_payload.get("next_anchor") or "").strip()
+                    or (_history_anchor(selected_messages[0]) if selected_messages else None)
+                )
+                next_anchor_seq = (
+                    str(direct_full_payload.get("next_anchor_message_seq") or "").strip()
+                    or (_message_seq(selected_messages[0]) if selected_messages else None)
+                )
+                exhausted = bool(direct_full_payload.get("exhausted"))
+                elapsed_s = round(float(direct_full_payload.get("elapsed_ms") or 0) / 1000.0, 4)
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "phase": "history_page_done",
+                            "mode": "tail_scan",
+                            "history_source": "napcat_fast_history_bulk",
+                            "status": "done",
+                            "page_duration_s": elapsed_s,
+                            "page_message_count": len(selected_messages),
+                            "page_size": int(direct_full_payload.get("page_size") or page_size),
+                            "requested_count": int(direct_full_payload.get("requested_data_count") or data_count),
+                            "retry_count": 0,
+                            "chunk_index": 1,
+                            "chunk_added": len(selected_messages),
+                            "pages_scanned": pages_scanned,
+                            "next_anchor": next_anchor,
+                            "next_anchor_message_seq": next_anchor_seq,
+                            "oldest_content_at": oldest_dt,
+                            "newest_content_at": newest_dt,
+                            "route": "history_full_bulk",
+                        }
+                    )
+                self._emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "tail_bulk_chunk",
+                        "status": "done",
+                        "chunk_index": 1,
+                        "chunk_target": data_count,
+                        "chunk_added": len(selected_messages),
+                        "chunk_messages": len(selected_messages),
+                        "chunk_duration_s": elapsed_s,
+                        "total_duration_s": elapsed_s,
+                        "pages_scanned": pages_scanned,
+                        "next_anchor": next_anchor,
+                        "next_anchor_message_seq": next_anchor_seq,
+                        "exhausted": exhausted,
+                        "requested_data_count": data_count,
+                        "route": "history_full_bulk",
+                    },
+                )
+                self._emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "tail_bulk_summary",
+                        "status": "done",
+                        "requested_data_count": data_count,
+                        "pages_scanned": pages_scanned,
+                        "bulk_chunks": 1,
+                        "bulk_chunk_limit": data_count,
+                        "elapsed_s": elapsed_s,
+                        "exit_reason": "direct_full_bulk_completed",
+                        "route": "history_full_bulk",
+                    },
+                )
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fast_tail_bulk",
+                    status="done",
+                    elapsed_s=elapsed_s,
+                    requested_data_count=data_count,
+                    pages_scanned=pages_scanned,
+                    bulk_chunks=1,
+                    exit_reason="direct_full_bulk_completed",
+                    route="history_full_bulk",
+                )
+                return {
+                    "messages": selected_messages,
+                    "seen_keys": {_message_key(item) for item in selected_messages},
+                    "next_anchor": next_anchor,
+                    "next_anchor_message_seq": next_anchor_seq,
+                    "pages_scanned": pages_scanned,
+                    "completed": bool(selected_messages) and (len(selected_messages) >= data_count or exhausted),
+                    "history_source": "napcat_fast_history_bulk",
+                    "bulk_duration_s": elapsed_s,
+                    "bulk_chunks": 1,
+                    "bulk_chunk_limit": data_count,
+                    "partial_fallback": False,
+                    "page_size": int(direct_full_payload.get("page_size") or page_size),
+                    "route": "history_full_bulk",
+                }
         anchor: str | None = None
+        anchor_seq: str | None = None
         seen_keys: set[str] = set()
         seen_anchors: set[str] = set()
         collected_messages: list[dict[str, Any]] = []
@@ -2549,6 +2903,7 @@ class NapCatHistoryProvider:
                 data_count=chunk_target,
                 page_size=page_size,
                 anchor_message_id=anchor,
+                anchor_message_seq=anchor_seq,
             )
             if payload is None:
                 if chunk_count <= 0:
@@ -2621,6 +2976,10 @@ class NapCatHistoryProvider:
                 str(payload.get("next_anchor") or "").strip()
                 or (_history_anchor(chunk_messages[0]) if chunk_messages else None)
             )
+            next_anchor_seq = (
+                str(payload.get("next_anchor_message_seq") or "").strip()
+                or (_message_seq(chunk_messages[0]) if chunk_messages else None)
+            )
             exhausted = bool(payload.get("exhausted"))
             total_duration_s = round(perf_counter() - total_started, 4)
             self._emit_progress(
@@ -2639,6 +2998,7 @@ class NapCatHistoryProvider:
                     "chunk_added": added,
                     "pages_scanned": pages_scanned,
                     "next_anchor": next_anchor,
+                    "next_anchor_message_seq": next_anchor_seq,
                     "oldest_content_at": oldest_dt,
                     "newest_content_at": newest_dt,
                 },
@@ -2656,6 +3016,7 @@ class NapCatHistoryProvider:
                     "total_duration_s": total_duration_s,
                     "pages_scanned": pages_scanned,
                     "next_anchor": next_anchor,
+                    "next_anchor_message_seq": next_anchor_seq,
                     "exhausted": exhausted,
                     "requested_data_count": data_count,
                 },
@@ -2670,6 +3031,7 @@ class NapCatHistoryProvider:
                         "oldest_content_at": oldest_dt,
                         "newest_content_at": newest_dt,
                         "anchor": next_anchor,
+                        "anchor_message_seq": next_anchor_seq,
                         "history_source": "napcat_fast_history_bulk",
                         "page_duration_s": chunk_duration_s,
                         "bulk_duration_s": total_duration_s,
@@ -2762,6 +3124,7 @@ class NapCatHistoryProvider:
                             "messages": collected_messages,
                             "seen_keys": seen_keys,
                             "next_anchor": bridged["next_anchor"],
+                            "next_anchor_message_seq": bridged.get("next_anchor_message_seq"),
                             "pages_scanned": pages_scanned,
                             "completed": True,
                             "history_source": _merge_history_source(
@@ -2778,6 +3141,7 @@ class NapCatHistoryProvider:
                     if bridge_next_anchor and bridge_next_anchor not in seen_anchors:
                         seen_anchors.add(bridge_next_anchor)
                         anchor = bridge_next_anchor
+                        anchor_seq = str(bridged.get("next_anchor_message_seq") or "").strip() or anchor_seq
                         continue
                 self._emit_progress(
                     progress_callback,
@@ -2806,6 +3170,7 @@ class NapCatHistoryProvider:
                     "messages": collected_messages,
                     "seen_keys": seen_keys,
                     "next_anchor": anchor,
+                    "next_anchor_message_seq": anchor_seq,
                     "pages_scanned": pages_scanned,
                     "completed": False,
                     "history_source": "napcat_fast_history_bulk",
@@ -2817,6 +3182,7 @@ class NapCatHistoryProvider:
                 }
             seen_anchors.add(next_anchor)
             anchor = next_anchor
+            anchor_seq = next_anchor_seq
 
         self._emit_progress(
             progress_callback,
@@ -2845,6 +3211,7 @@ class NapCatHistoryProvider:
             "messages": collected_messages,
             "seen_keys": seen_keys,
             "next_anchor": anchor,
+            "next_anchor_message_seq": anchor_seq,
             "pages_scanned": pages_scanned,
             "completed": True,
             "history_source": "napcat_fast_history_bulk",
@@ -2920,6 +3287,7 @@ class NapCatHistoryProvider:
             collected_messages.append(message)
             added += 1
         next_anchor = _history_anchor(page_messages[0])
+        next_anchor_seq = _message_seq(page_messages[0])
         if progress_callback is not None:
             progress_callback(
                 {
@@ -2945,6 +3313,7 @@ class NapCatHistoryProvider:
                 "pages_scanned": pages_scanned,
                 "added": added,
                 "next_anchor": next_anchor,
+                "next_anchor_message_seq": next_anchor_seq,
                 "elapsed_s": round(perf_counter() - started, 4),
                 "history_source": snapshot.metadata.get("source"),
                 "page_duration_s": page_metrics.get("page_duration_s"),
@@ -2956,6 +3325,7 @@ class NapCatHistoryProvider:
             "added": added,
             "pages_scanned": pages_scanned,
             "next_anchor": next_anchor,
+            "next_anchor_message_seq": next_anchor_seq,
             "history_source": snapshot.metadata.get("source"),
             "page_size": page_metrics.get("page_size"),
             "completed": len(collected_messages) >= data_count,
@@ -3085,6 +3455,17 @@ def _history_anchor(message: dict[str, Any]) -> str | None:
         or message.get("message_id")
         or message.get("messageId")
         or raw_message.get("msgId")
+    )
+    text = str(value or "").strip()
+    return text or None
+
+
+def _message_seq(message: dict[str, Any]) -> str | None:
+    raw_message = _message_raw(message)
+    value = (
+        message.get("message_seq")
+        or message.get("messageSeq")
+        or raw_message.get("msgSeq")
     )
     text = str(value or "").strip()
     return text or None
