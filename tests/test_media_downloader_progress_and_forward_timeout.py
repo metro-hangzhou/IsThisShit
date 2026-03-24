@@ -2256,6 +2256,37 @@ def test_resolve_for_export_prefers_direct_hint_public_token_before_context_for_
     assert resolved == (Path(__file__).resolve(), "napcat_public_token_get_file")
 
 
+def test_resolve_for_export_prefers_direct_hint_public_token_before_context_for_top_level_old_image() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "image",
+        "file_name": "old-image.png",
+        "timestamp_ms": 1757142395000,
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Pic\2025-09\Ori\old-image.png",
+        "download_hint": {
+            "file_id": "1528803331",
+            "message_id_raw": "7565810521148991491",
+            "element_id": "7565810521148991492",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+
+    def _direct_public_only(payload, **kwargs):
+        assert payload["public_action"] == "get_image"
+        assert payload["public_file_token"] == "1528803331"
+        return Path(__file__).resolve(), "napcat_public_token_get_image"
+
+    downloader._resolve_from_public_token = _direct_public_only  # type: ignore[method-assign]
+    downloader._resolve_via_context_only = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("context route should not run first"))
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (Path(__file__).resolve(), "napcat_public_token_get_image")
+
+
 def test_resolve_for_export_allows_direct_hint_public_token_to_classify_terminal_old_video() -> None:
     downloader = NapCatMediaDownloader(_BlankPublicFileClient())
     request = {
@@ -2308,6 +2339,33 @@ def test_schedule_request_direct_public_token_prefetch_enqueues_top_level_video_
     ]
 
 
+def test_schedule_request_direct_public_token_prefetch_enqueues_top_level_image_token() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = {
+        "asset_type": "image",
+        "file_name": "old-image.png",
+        "download_hint": {
+            "file_id": "1528803331",
+        },
+    }
+    scheduled: list[dict[str, object]] = []
+
+    downloader._schedule_public_token_prefetch = (  # type: ignore[method-assign]
+        lambda **kwargs: scheduled.append(kwargs["payload"])
+    )
+
+    downloader._schedule_request_direct_public_token_prefetch(request)
+
+    assert scheduled == [
+        {
+            "asset_type": "image",
+            "public_action": "get_image",
+            "public_file_token": "1528803331",
+            "file_name": "old-image.png",
+        }
+    ]
+
+
 def test_schedule_request_direct_public_token_prefetch_skips_direct_file_id_shape() -> None:
     downloader = NapCatMediaDownloader(_DummyClient())
     request = {
@@ -2326,6 +2384,41 @@ def test_schedule_request_direct_public_token_prefetch_skips_direct_file_id_shap
     downloader._schedule_request_direct_public_token_prefetch(request)
 
     assert scheduled == []
+
+
+def test_prepare_for_export_large_run_still_prefetches_strong_old_image_hints_before_batch_skip() -> None:
+    fast_client = _BatchFastClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader.PREFETCH_LARGE_REQUEST_THRESHOLD = 1
+    request = _mark_request_old(_build_context_hint_request("old-image.png"), days=240)
+    request["download_hint"]["file_id"] = "1528803331"
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=1528803331&spec=0"
+    )
+    remote_scheduled: list[str] = []
+    token_scheduled: list[dict[str, object]] = []
+
+    downloader._schedule_request_remote_prefetch = (  # type: ignore[method-assign]
+        lambda scheduled_request: remote_scheduled.append(str(scheduled_request.get("file_name") or ""))
+    )
+    downloader._schedule_public_token_prefetch = (  # type: ignore[method-assign]
+        lambda **kwargs: token_scheduled.append(kwargs["payload"])
+    )
+
+    downloader.prepare_for_export([request])
+
+    assert fast_client.calls == []
+    assert remote_scheduled == ["old-image.png"]
+    assert token_scheduled == [
+        {
+            "asset_type": "image",
+            "public_action": "get_image",
+            "public_file_token": "1528803331",
+            "file_name": "old-image.png",
+            "remote_url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=1528803331&spec=0",
+            "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=1528803331&spec=0",
+        }
+    ]
 
 
 def test_resolve_from_public_token_marks_old_video_blank_payload_as_background() -> None:
