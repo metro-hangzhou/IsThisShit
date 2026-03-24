@@ -16,6 +16,7 @@ class _MissingAssetManager:
         tracked_asset_types: set[str] | None = None,
     ) -> None:
         self.public_retry_calls = 0
+        self.resolve_calls = 0
         self.missing_resolver = missing_resolver
         self.tracked_asset_types = tracked_asset_types or {"image"}
 
@@ -35,6 +36,7 @@ class _MissingAssetManager:
     def resolve_for_export(self, request, *, trace_callback=None):
         _ = trace_callback
         if str(request.get("asset_type") or "").strip() in self.tracked_asset_types:
+            self.resolve_calls += 1
             return None, self.missing_resolver
         return None, None
 
@@ -56,6 +58,23 @@ class _RecoveringPublicRetryManager(_MissingAssetManager):
         self.public_retry_calls += 1
         _ = request
         return self.resolved_path, "napcat_public_token_get_image_remote_url_prefetched"
+
+
+class _ResolvedAssetManager(_MissingAssetManager):
+    def __init__(self, resolved_path: Path, *, tracked_asset_types: set[str] | None = None) -> None:
+        super().__init__(
+            missing_resolver="missing_after_napcat",
+            tracked_asset_types=tracked_asset_types,
+        )
+        self.resolved_path = resolved_path
+        self.resolve_calls = 0
+
+    def resolve_for_export(self, request, *, trace_callback=None):
+        _ = trace_callback
+        if str(request.get("asset_type") or "").strip() not in self.tracked_asset_types:
+            return None, None
+        self.resolve_calls += 1
+        return self.resolved_path, "napcat_forward_remote_url"
 
 
 def _forward_image_message(*, file_name: str, md5: str, timestamp_ms: int) -> NormalizedMessage:
@@ -382,6 +401,93 @@ def test_recent_forward_image_missing_reuses_later_file_id_backed_success() -> N
         assert assets[0].exported_rel_path == assets[1].exported_rel_path
         assert assets[0].missing_kind is None
         assert assets[0].note is None
+        assert manager.public_retry_calls == 0
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_first_pass_top_level_image_uses_future_local_identity_evidence() -> None:
+    temp_root = Path(".") / "state" / "test_temp_future_local_identity_top_level_image"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        actual_image_path = temp_root / "SHARED-TOP-LEVEL.jpg"
+        actual_image_path.write_bytes(b"image-bytes")
+        manager = _MissingAssetManager(missing_resolver="missing_after_napcat")
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _top_level_image_message(
+                    file_name="SHARED-TOP-LEVEL.jpg",
+                    md5="shared-top-level-md5",
+                    source_path=str(temp_root / "missing" / "SHARED-TOP-LEVEL.jpg"),
+                    timestamp_ms=1768035294000,
+                ),
+                _top_level_image_message(
+                    file_name="SHARED-TOP-LEVEL.jpg",
+                    md5="shared-top-level-md5",
+                    source_path=str(actual_image_path),
+                    timestamp_ms=1768035301000,
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["copied", "reused"]
+        assert assets[0].resolver == "bundle_future_local_identity_evidence"
+        assert assets[0].exported_rel_path == assets[1].exported_rel_path
+        assert manager.resolve_calls == 0
+        assert manager.public_retry_calls == 0
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_first_pass_recent_identity_reuse_skips_duplicate_forward_resolution() -> None:
+    temp_root = Path(".") / "state" / "test_temp_first_pass_recent_identity_reuse"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        image_path = temp_root / "shared-forward.jpg"
+        image_path.write_bytes(b"image-bytes")
+        manager = _ResolvedAssetManager(image_path)
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _forward_image_message(
+                    file_name="shared-forward.jpg",
+                    md5="shared-forward-md5",
+                    timestamp_ms=1768035294000,
+                ),
+                _forward_image_message(
+                    file_name="shared-forward.jpg",
+                    md5="shared-forward-md5",
+                    timestamp_ms=1768035295000,
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["copied", "reused"]
+        assert assets[0].exported_rel_path == assets[1].exported_rel_path
+        assert manager.resolve_calls == 1
         assert manager.public_retry_calls == 0
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
