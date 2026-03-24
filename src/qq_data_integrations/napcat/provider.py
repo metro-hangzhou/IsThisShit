@@ -2756,6 +2756,17 @@ class NapCatHistoryProvider:
                 anchor_message_seq=anchor_message_seq,
                 history_fetch_strategy=FAST_HISTORY_BULK_FETCH_STRATEGY,
             )
+        except TypeError as exc:
+            if "anchor_message_seq" not in str(exc):
+                raise
+            payload = get_history_tail_bulk(
+                request.chat_type,
+                request.chat_id,
+                data_count=data_count,
+                page_size=page_size,
+                anchor_message_id=anchor_message_id,
+                history_fetch_strategy=FAST_HISTORY_BULK_FETCH_STRATEGY,
+            )
         except NapCatFastHistoryError:
             if self._fast_mode == "force":
                 raise

@@ -494,6 +494,60 @@ def test_fetch_fast_history_tail_bulk_uses_seq_window_strategy() -> None:
     ]
 
 
+def test_fetch_fast_history_tail_bulk_retries_without_anchor_message_seq_for_older_client() -> None:
+    class _OlderFastClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def get_history_tail_bulk(
+            self,
+            chat_type: str,
+            chat_id: str,
+            *,
+            data_count: int,
+            page_size: int,
+            anchor_message_id: str | None = None,
+            history_fetch_strategy: str | None = None,
+            include_debug_stats: bool = False,
+            timeout=None,
+        ):
+            self.calls.append(
+                {
+                    "chat_type": chat_type,
+                    "chat_id": chat_id,
+                    "data_count": data_count,
+                    "page_size": page_size,
+                    "anchor_message_id": anchor_message_id,
+                    "history_fetch_strategy": history_fetch_strategy,
+                    "include_debug_stats": include_debug_stats,
+                }
+            )
+            return {"messages": [], "pages_scanned": 0, "exhausted": True, "page_size": page_size}
+
+    older_fast_client = _OlderFastClient()
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=older_fast_client)
+
+    provider._fetch_fast_history_tail_bulk(  # type: ignore[attr-defined]
+        _request(),
+        data_count=2000,
+        page_size=500,
+        anchor_message_id="anchor-msg",
+        anchor_message_seq="7473",
+    )
+
+    assert older_fast_client.calls == [
+        {
+            "chat_type": "group",
+            "chat_id": "922065597",
+            "data_count": 2000,
+            "page_size": 500,
+            "anchor_message_id": "anchor-msg",
+            "history_fetch_strategy": "seq_window",
+            "include_debug_stats": False,
+        }
+    ]
+
+
 def test_fetch_snapshot_tail_prefers_plugin_full_bulk_route_for_large_request() -> None:
     class _FastClient:
         def __init__(self) -> None:
