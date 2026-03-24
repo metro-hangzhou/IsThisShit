@@ -43,12 +43,68 @@ class NapCatHistoryProvider:
         self._fast_tail_bulk_available: bool | None = None
         self._known_unavailable_forward_ids: dict[str, str] = {}
         self._known_unavailable_history_keys: dict[str, str] = {}
+        self._forward_history_probe_outcomes: dict[str, dict[str, Any]] = {}
 
     def reset_export_state(self) -> None:
         self._fast_available = None
         self._fast_tail_bulk_available = None
         self._known_unavailable_forward_ids.clear()
         self._known_unavailable_history_keys.clear()
+        self._forward_history_probe_outcomes.clear()
+
+    @staticmethod
+    def _forward_message_key(message: dict[str, Any]) -> str:
+        raw_message = _message_raw(message)
+        return str(
+            message.get("message_seq")
+            or message.get("messageSeq")
+            or message.get("message_id")
+            or message.get("messageId")
+            or raw_message.get("msgSeq")
+            or raw_message.get("msgId")
+            or ""
+        ).strip()
+
+    def _record_forward_history_probe_outcome(
+        self,
+        message: dict[str, Any],
+        *,
+        has_content: bool,
+        route: str,
+        terminal_reason: str | None = None,
+    ) -> dict[str, Any] | None:
+        message_key = self._forward_message_key(message)
+        if not message_key:
+            return None
+        outcome = {
+            "attempted": True,
+            "has_content": bool(has_content),
+            "terminal_reason": terminal_reason,
+            "route": route,
+        }
+        self._forward_history_probe_outcomes[message_key] = outcome
+        return outcome
+
+    def _get_forward_history_probe_outcome(
+        self,
+        message_key: str,
+    ) -> dict[str, Any] | None:
+        if not message_key:
+            return None
+        outcome = self._forward_history_probe_outcomes.get(message_key)
+        if outcome is not None:
+            return outcome
+        known_history_unavailable = self._known_unavailable_history_keys.get(message_key)
+        if not known_history_unavailable:
+            return None
+        outcome = {
+            "attempted": True,
+            "has_content": False,
+            "terminal_reason": known_history_unavailable,
+            "route": "known_history_unavailable",
+        }
+        self._forward_history_probe_outcomes[message_key] = outcome
+        return outcome
 
     def _emit_progress(
         self,
@@ -189,6 +245,7 @@ class NapCatHistoryProvider:
                     request,
                     selected_messages,
                     page_size=bulk_page_size,
+                    progress_callback=progress_callback,
                 )
                 forward_hydrate_s = perf_counter() - forward_hydrate_started
                 selected_messages.sort(
@@ -307,6 +364,7 @@ class NapCatHistoryProvider:
             request,
             selected_messages,
             page_size=effective_base_page_size,
+            progress_callback=progress_callback,
         )
         if bulk_tail_metadata is not None:
             bulk_tail_metadata = {
@@ -1197,7 +1255,7 @@ class NapCatHistoryProvider:
     ) -> tuple[int, int]:
         started = perf_counter()
         cache: dict[str, list[dict[str, Any]] | None] = {}
-        parse_mult_cache: dict[str, bool] = {}
+        parse_mult_cache: dict[str, dict[str, Any] | None] = {}
         structure_unavailable = 0
         history_retry_calls = 0
         history_retry_hits = 0
@@ -1216,47 +1274,67 @@ class NapCatHistoryProvider:
         if total_targets <= 0:
             return 0, 0
 
+        def _history_outcome(message_key: str) -> dict[str, Any] | None:
+            if not message_key:
+                return None
+            if (
+                message_key not in parse_mult_cache
+                or parse_mult_cache[message_key] is None
+            ):
+                parse_mult_cache[message_key] = self._get_forward_history_probe_outcome(
+                    message_key
+                )
+            return parse_mult_cache[message_key]
+
         processed = already_resolved
         enriched = already_resolved
         for target in targets:
             processed += 1
-            message_key = str(
-                target.get("message_seq") or target.get("message_id") or ""
-            )
+            attach = target.get("attach")
+            if isinstance(attach, dict) and str(
+                attach.get("_qq_data_forward_unavailable_reason") or ""
+            ).strip():
+                if progress_callback is not None and (
+                    processed == total_targets or processed % 10 == 0
+                ):
+                    progress_callback(
+                        {
+                            "phase": "forward_expand",
+                            "processed_forwards": processed,
+                            "total_forwards": total_targets,
+                            "resolved_forwards": enriched,
+                        }
+                    )
+                continue
+
+            message_key = self._forward_message_key(target["message"])
+            history_outcome = _history_outcome(message_key)
             if (
                 not skip_history_retry
                 and message_key
-                and message_key not in parse_mult_cache
+                and history_outcome is None
             ):
-                if message_key in self._known_unavailable_history_keys:
-                    parse_mult_cache[message_key] = False
-                    known_history_unavailable_hits += 1
-                    if self._mark_forward_target_unavailable(
-                        target,
-                        reason=self._known_unavailable_history_keys[message_key]
-                        or "forward_structure_unavailable_via_history",
-                    ):
-                        structure_unavailable += 1
-                else:
-                    history_retry_calls += 1
-                    hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
+                history_retry_calls += 1
+                hydrated_via_history, known_history_unavailable = (
+                    self._hydrate_forward_message_via_history(
                         target["message"],
                         chat_type=chat_type,
                         chat_id=chat_id,
                     )
-                    parse_mult_cache[message_key] = hydrated_via_history
-                    if hydrated_via_history:
-                        history_retry_hits += 1
-                    if known_history_unavailable:
-                        self._known_unavailable_history_keys[message_key] = known_history_unavailable
-                        if self._mark_forward_target_unavailable(
-                            target,
-                            reason=known_history_unavailable,
-                        ):
-                            structure_unavailable += 1
-                if parse_mult_cache[message_key]:
+                )
+                history_outcome = _history_outcome(message_key)
+                if hydrated_via_history:
+                    history_retry_hits += 1
+                elif known_history_unavailable:
+                    known_history_unavailable_hits += 1
+                if history_outcome and history_outcome.get("has_content"):
                     enriched += 1
-            if parse_mult_cache.get(message_key):
+            elif (
+                history_outcome is not None
+                and history_outcome.get("route") == "known_history_unavailable"
+            ):
+                known_history_unavailable_hits += 1
+            if history_outcome and history_outcome.get("has_content"):
                 if progress_callback is not None and (
                     processed == total_targets or processed % 10 == 0
                 ):
@@ -1275,22 +1353,39 @@ class NapCatHistoryProvider:
                 known_forward_unavailable_hits += 1
                 cache[forward_id] = None
                 recovered_via_history = False
-                if message_key:
+                if history_outcome and history_outcome.get("attempted"):
+                    if self._mark_forward_target_unavailable(
+                        target,
+                        reason=str(
+                            history_outcome.get("terminal_reason")
+                            or self._known_unavailable_forward_ids[forward_id]
+                            or "forward_structure_unavailable_via_get_forward_msg"
+                        ),
+                    ):
+                        structure_unavailable += 1
+                elif message_key:
                     history_retry_calls += 1
-                    hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
-                        target["message"],
-                        chat_type=chat_type,
-                        chat_id=chat_id,
+                    hydrated_via_history, known_history_unavailable = (
+                        self._hydrate_forward_message_via_history(
+                            target["message"],
+                            chat_type=chat_type,
+                            chat_id=chat_id,
+                        )
                     )
-                    parse_mult_cache[message_key] = hydrated_via_history
+                    history_outcome = _history_outcome(message_key)
                     if hydrated_via_history:
                         history_retry_hits += 1
                         enriched += 1
                         cache[forward_id] = []
                         recovered_via_history = True
-                    elif known_history_unavailable and self._mark_forward_target_unavailable(
+                    elif self._mark_forward_target_unavailable(
                         target,
-                        reason=known_history_unavailable,
+                        reason=str(
+                            (history_outcome or {}).get("terminal_reason")
+                            or known_history_unavailable
+                            or self._known_unavailable_forward_ids[forward_id]
+                            or "forward_structure_unavailable_via_get_forward_msg"
+                        ),
                     ):
                         structure_unavailable += 1
                 elif self._mark_forward_target_unavailable(
@@ -1309,22 +1404,37 @@ class NapCatHistoryProvider:
                     if known_forward_unavailable:
                         self._known_unavailable_forward_ids[forward_id] = known_forward_unavailable
                         recovered_via_history = False
-                        if message_key:
+                        if history_outcome and history_outcome.get("attempted"):
+                            if self._mark_forward_target_unavailable(
+                                target,
+                                reason=str(
+                                    history_outcome.get("terminal_reason")
+                                    or known_forward_unavailable
+                                ),
+                            ):
+                                structure_unavailable += 1
+                        elif message_key:
                             history_retry_calls += 1
-                            hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
-                                target["message"],
-                                chat_type=chat_type,
-                                chat_id=chat_id,
+                            hydrated_via_history, known_history_unavailable = (
+                                self._hydrate_forward_message_via_history(
+                                    target["message"],
+                                    chat_type=chat_type,
+                                    chat_id=chat_id,
+                                )
                             )
-                            parse_mult_cache[message_key] = hydrated_via_history
+                            history_outcome = _history_outcome(message_key)
                             if hydrated_via_history:
                                 history_retry_hits += 1
                                 enriched += 1
                                 cache[forward_id] = []
                                 recovered_via_history = True
-                            elif known_history_unavailable and self._mark_forward_target_unavailable(
+                            elif self._mark_forward_target_unavailable(
                                 target,
-                                reason=known_history_unavailable,
+                                reason=str(
+                                    (history_outcome or {}).get("terminal_reason")
+                                    or known_history_unavailable
+                                    or known_forward_unavailable
+                                ),
                             ):
                                 structure_unavailable += 1
                         elif self._mark_forward_target_unavailable(
@@ -1448,13 +1558,30 @@ class NapCatHistoryProvider:
                     parse_mult_msg=True,
                 )
         except (NapCatApiError, httpx.HTTPError) as exc:
-            return False, self._known_forward_history_unavailable_reason(exc)
+            known_unavailable = self._known_forward_history_unavailable_reason(exc)
+            self._record_forward_history_probe_outcome(
+                message,
+                has_content=False,
+                route="history_retry",
+                terminal_reason=known_unavailable,
+            )
+            return False, known_unavailable
 
         candidate = self._match_message_by_seq(payload, message_seq, target_message=message)
         if candidate is None:
+            self._record_forward_history_probe_outcome(
+                message,
+                has_content=False,
+                route="history_retry",
+            )
             return False, None
         onebot_segments = candidate.get("message")
         if not isinstance(onebot_segments, list) or not onebot_segments:
+            self._record_forward_history_probe_outcome(
+                message,
+                has_content=False,
+                route="history_retry",
+            )
             return False, None
         forward_segments = [
             segment
@@ -1462,15 +1589,30 @@ class NapCatHistoryProvider:
             if isinstance(segment, dict) and segment.get("type") == "forward"
         ]
         if not forward_segments:
+            self._record_forward_history_probe_outcome(
+                message,
+                has_content=False,
+                route="history_retry",
+            )
             return False, None
         if not any(
             (segment.get("data") or {}).get("content") for segment in forward_segments
         ):
+            self._record_forward_history_probe_outcome(
+                message,
+                has_content=False,
+                route="history_retry",
+            )
             return False, None
         message["message"] = onebot_segments
         if candidate.get("raw_message") not in {None, ""}:
             message["raw_message"] = candidate.get("raw_message")
         message["message_format"] = candidate.get("message_format") or "array"
+        self._record_forward_history_probe_outcome(
+            message,
+            has_content=True,
+            route="history_retry",
+        )
         return True, None
 
     def _known_forward_history_unavailable_reason(self, exc: Exception) -> str | None:
@@ -1553,6 +1695,9 @@ class NapCatHistoryProvider:
         count: int,
         reverse_order: bool,
     ) -> int:
+        forward_messages = [
+            message for message in messages if self._message_has_forward_reference(message)
+        ]
         forward_message_ids = {
             str(
                 message.get("message_id")
@@ -1560,8 +1705,7 @@ class NapCatHistoryProvider:
                 or _message_raw(message).get("msgId")
                 or ""
             ).strip()
-            for message in messages
-            if self._message_has_forward_reference(message)
+            for message in forward_messages
         }
         forward_message_ids.discard("")
         if not forward_message_ids:
@@ -1597,7 +1741,7 @@ class NapCatHistoryProvider:
                     public_forward_map[forward_id] = public_message
 
         hydrated = 0
-        for message in messages:
+        for message in forward_messages:
             raw_message = _message_raw(message)
             message_id = str(
                 message.get("message_id")
@@ -1607,11 +1751,37 @@ class NapCatHistoryProvider:
             ).strip()
             public_message = public_forward_map.get(message_id)
             if public_message is None:
+                message_seq = str(
+                    message.get("message_seq")
+                    or message.get("messageSeq")
+                    or raw_message.get("msgSeq")
+                    or ""
+                ).strip()
+                matched_public_message = (
+                    self._match_message_by_seq(
+                        payload,
+                        message_seq,
+                        target_message=message,
+                    )
+                    if message_seq
+                    else None
+                )
+                if matched_public_message is not None:
+                    self._record_forward_history_probe_outcome(
+                        message,
+                        has_content=False,
+                        route="bulk_parse_mult",
+                    )
                 continue
             message["message"] = public_message.get("message") or []
             if public_message.get("raw_message") not in {None, ""}:
                 message["raw_message"] = public_message.get("raw_message")
             message["message_format"] = public_message.get("message_format") or "array"
+            self._record_forward_history_probe_outcome(
+                message,
+                has_content=True,
+                route="bulk_parse_mult",
+            )
             hydrated += 1
         return hydrated
 
@@ -1621,6 +1791,7 @@ class NapCatHistoryProvider:
         messages: list[dict[str, Any]],
         *,
         page_size: int,
+        progress_callback: HistoryProgressCallback | None = None,
     ) -> int:
         if not messages:
             return 0
@@ -1629,17 +1800,60 @@ class NapCatHistoryProvider:
         reverse_order = False
         end = len(messages)
         effective_page_size = max(1, page_size)
+        window_index = 0
         while end > 0:
             start = max(0, end - effective_page_size)
             window = messages[start:end]
             if not window:
                 break
-            hydrated += self._hydrate_fast_history_page_forwards(
+            window_index += 1
+            forward_ref_count = sum(
+                1 for message in window if self._message_has_forward_reference(message)
+            )
+            oldest_message = window[0]
+            newest_message = window[-1]
+            oldest_dt = _message_datetime(oldest_message)
+            newest_dt = _message_datetime(newest_message)
+            window_started = perf_counter()
+            hydrated_in_window = self._hydrate_fast_history_page_forwards(
                 request,
                 window,
                 before_message_seq=anchor,
                 count=len(window),
                 reverse_order=reverse_order,
+            )
+            hydrated += hydrated_in_window
+            window_elapsed_s = perf_counter() - window_started
+            self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "tail_forward_hydrate_window",
+                    "status": "done",
+                    "window_index": window_index,
+                    "window_message_count": len(window),
+                    "forward_ref_count": forward_ref_count,
+                    "hydrated_count": hydrated_in_window,
+                    "before_message_seq": anchor,
+                    "reverse_order": reverse_order,
+                    "oldest_message_id": oldest_message.get("message_id")
+                    or oldest_message.get("messageId")
+                    or _message_raw(oldest_message).get("msgId"),
+                    "oldest_message_seq": oldest_message.get("message_seq")
+                    or oldest_message.get("messageSeq")
+                    or _message_raw(oldest_message).get("msgSeq"),
+                    "newest_message_id": newest_message.get("message_id")
+                    or newest_message.get("messageId")
+                    or _message_raw(newest_message).get("msgId"),
+                    "newest_message_seq": newest_message.get("message_seq")
+                    or newest_message.get("messageSeq")
+                    or _message_raw(newest_message).get("msgSeq"),
+                    "oldest_timestamp_iso": oldest_message.get("timestamp_iso")
+                    or oldest_dt.isoformat(),
+                    "newest_timestamp_iso": newest_message.get("timestamp_iso")
+                    or newest_dt.isoformat(),
+                    "elapsed_s": round(window_elapsed_s, 4),
+                    "elapsed_ms": int(round(window_elapsed_s * 1000)),
+                },
             )
             oldest_anchor = _history_anchor(window[0])
             if not oldest_anchor:

@@ -85,6 +85,43 @@ Without that formal layer, we can still miss:
   - this suite must run for both `recent` and `old` ages
   - the result must be invariant to age once the proof chain is complete
 
+## [2026-03-24] Perf-Driven Simulator Extension Targets
+
+- the latest maintainer live perf slice:
+  - `state/export_perf/cli_export_group_922065597_20260324_194611_882045_41096.report.json`
+  shows two cost families that now deserve first-class simulator/replay coverage:
+  - sparse forward-hydrate overfetch
+    - `200` messages
+    - `1` forward ref
+    - `1` hydrated
+    - `0.4453s`
+  - repeated top-level `image` public-token remote-url failure
+    - `16` calls
+    - `1.0048s` total
+    - all landing in `qq_not_downloaded_local_placeholder`
+- simulator/replay next requirement:
+  - classify not only outcome correctness, but also whether a given proof chain should:
+    - skip repeated dead remote-url work
+    - or avoid oversized forward-hydrate spans once forward density is known
+- new bounded suites to add:
+  - `top_level_image_public_remote_dead`
+    - stale local path
+    - public-token payload returns remote-only result
+    - authoritative remote failure
+    - no remaining live handle
+    - expected result:
+      - background missing
+      - zero actionable drift
+      - bounded low retry cost
+  - `sparse_forward_hydrate_span`
+    - vary:
+      - window size
+      - forward density
+      - clustered vs isolated forward positions
+    - expected result:
+      - same final forward detail correctness
+      - cost class should penalize over-wide hydrate windows when narrower exact evidence is available
+
 ## Hard Rule
 
 From this point onward, simulator work should be driven by evidence dimensions, not by ad hoc "interesting scenarios".
@@ -448,6 +485,8 @@ Acceptance:
   - baseline vs regressed route-plan divergence
   - report completeness invariants
   - same asset, different stage timing surface cost drift
+  - sparse forward-hydrate span cost divergence
+  - top-level image public-remote dead-route cost divergence
 
 ## Track J. Performance Report Completeness As A Replay Contract
 

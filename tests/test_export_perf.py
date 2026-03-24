@@ -49,6 +49,29 @@ def test_export_perf_report_includes_stage_page_and_materialize_breakdown(tmp_pa
         },
     )
     writer.write_event(
+        "tail_bulk_chunk",
+        {
+            "status": "done",
+            "chunk_index": 1,
+            "collected_messages": 200,
+            "page_message_count": 200,
+            "effective_page_size": 200,
+            "elapsed_s": 0.333,
+        },
+    )
+    writer.write_event(
+        "tail_forward_hydrate_window",
+        {
+            "status": "done",
+            "window_index": 1,
+            "window_message_count": 80,
+            "forward_ref_count": 3,
+            "hydrated_count": 2,
+            "elapsed_s": 0.444,
+            "before_message_seq": "123",
+        },
+    )
+    writer.write_event(
         "materialize_asset_step",
         {
             "stage": "done",
@@ -87,6 +110,9 @@ def test_export_perf_report_includes_stage_page_and_materialize_breakdown(tmp_pa
     assert report["materialize_stage_breakdown"][0]["substep"] == "public_token_get_image"
     assert report["scan_phase_breakdown"][0]["name"] == "tail_scan"
     assert report["scan_summaries"][0]["scan_phase"] == "tail_scan"
+    assert report["tail_bulk_chunk_breakdown"][0]["chunk_index"] == 1
+    assert report["tail_forward_hydrate_windows"][0]["window_index"] == 1
+    assert report["tail_forward_hydrate_windows"][0]["forward_ref_count"] == 3
     assert report["top_materialize_steps"][0]["file_name"] == "A.png"
     assert report["top_materialize_substeps"][0]["substep"] == "public_token_get_image"
 

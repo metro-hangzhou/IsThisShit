@@ -66,6 +66,31 @@
 
 ## 4. 里程碑日志
 
+### [2026-03-24][054] targeted perf probes now expose real fetch/materialize hotspots directly, and the next ROI buckets have shifted again
+
+- exporter perf report no longer double-counts `tail_scan` summary rows inside `history_page_breakdown`
+- tail forward-hydrate windows now expose concrete window bounds:
+  - oldest/newest message ids
+  - oldest/newest seqs
+  - oldest/newest timestamps
+- a fresh maintainer live probe on group `922065597` with `--limit 300` now shows:
+  - `records=300`
+  - `elapsed=7.856s`
+  - `history_source=napcat_fast_history_bulk`
+  - `actionable_missing=0`
+  - `background_missing=14`
+- the current measured hotspot order on the maintainer runtime has shifted to:
+  - `public_token_get_image_remote_url:error ~= 1.00s`
+  - `forward_remote_url:ok ~= 0.82s`
+  - sparse forward hydrate window:
+    - `200 messages / 1 forward / 0.445s`
+- interpretation:
+  - local copy/finalize I/O is no longer the highest ROI next target
+  - next perf work should focus on:
+    - top-level image public-token remote-failure cost
+    - sparse forward-hydrate overfetch
+    - baseline-vs-current report completeness/diff automation
+
 ### [2026-03-24][053] export perf report now exposes fetch/page/materialize views directly, and the current full-export hotspots have been pinned down
 
 - `export_perf` report schema has been extended so operator review no longer needs to hand-parse raw trace lines for:

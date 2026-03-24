@@ -471,6 +471,221 @@ def test_enrich_forward_details_does_not_poison_later_forward_after_single_known
     assert messages[1]["message"][0]["data"]["content"] == [{"message_id": "resolved-good"}]  # type: ignore[index]
 
 
+def test_enrich_forward_details_skips_duplicate_history_retry_after_bulk_parse_mult_miss() -> None:
+    class _ForwardFailClient:
+        def get_forward_msg(self, message_id: str):
+            raise NapCatApiError("找不到相关的聊天记录")
+
+    provider = NapCatHistoryProvider(_ForwardFailClient())
+    target_message = {
+        "message_id": "msg-forward",
+        "message_seq": "23388",
+        "message": [
+            {
+                "type": "forward",
+                "data": {"id": "fwd-1"},
+                "extra": {"forward_messages": [], "detailed_text": None},
+            }
+        ],
+    }
+    provider._record_forward_history_probe_outcome(
+        target_message,
+        has_content=False,
+        route="bulk_parse_mult",
+    )
+    history_calls = 0
+
+    def fake_hydrate_forward_message_via_history(message: dict[str, object], *, chat_type: str, chat_id: str):
+        nonlocal history_calls
+        history_calls += 1
+        return False, "forward_structure_unavailable_via_history"
+
+    provider._hydrate_forward_message_via_history = fake_hydrate_forward_message_via_history  # type: ignore[method-assign]
+
+    enriched, unavailable = provider._enrich_forward_details(
+        [target_message],
+        chat_type="group",
+        chat_id="922065597",
+        skip_history_retry=False,
+        progress_callback=None,
+    )
+
+    assert history_calls == 0
+    assert enriched == 0
+    assert unavailable == 1
+    assert (
+        target_message["message"][0]["data"]["_qq_data_forward_unavailable_reason"]  # type: ignore[index]
+        == "forward_structure_unavailable_protocol_fallback"
+    )
+
+
+def test_hydrate_fast_history_tail_forwards_bulk_emits_window_progress() -> None:
+    class _HydrateClient:
+        def get_group_msg_history(
+            self,
+            chat_id: str,
+            *,
+            message_seq: str | None,
+            count: int,
+            reverse_order: bool,
+            parse_mult_msg: bool,
+        ):
+            return {
+                "messages": [
+                    {
+                        "message_id": "msg-forward",
+                        "message": [
+                            {
+                                "type": "forward",
+                                "data": {"id": "msg-forward", "content": [{"text": "nested"}]},
+                            }
+                        ],
+                    }
+                ]
+            }
+
+    provider = NapCatHistoryProvider(_HydrateClient())
+    progress: list[dict[str, object]] = []
+    messages = [
+        {
+            "message_id": "msg-forward",
+            "message_seq": "23388",
+            "timestamp_iso": "2026-03-24T12:00:00+08:00",
+            "raw_message": {
+                "msgId": "msg-forward",
+                "msgSeq": "23388",
+                "elements": [
+                    {
+                        "elementType": 16,
+                        "multiForwardMsgElement": {"resId": "msg-forward"},
+                    }
+                ],
+            },
+        }
+    ]
+
+    hydrated = provider._hydrate_fast_history_tail_forwards_bulk(
+        _request(),
+        messages,
+        page_size=200,
+        progress_callback=progress.append,
+    )
+
+    assert hydrated == 1
+    forward_events = [
+        row for row in progress if row.get("phase") == "tail_forward_hydrate_window"
+    ]
+    assert len(forward_events) == 1
+    assert forward_events[0]["status"] == "done"
+    assert forward_events[0]["window_index"] == 1
+    assert forward_events[0]["forward_ref_count"] == 1
+    assert forward_events[0]["hydrated_count"] == 1
+
+
+def test_hydrate_fast_history_page_forwards_only_records_bulk_miss_for_exact_match() -> None:
+    class _HydrateClient:
+        def get_group_msg_history(
+            self,
+            chat_id: str,
+            *,
+            message_seq: str | None,
+            count: int,
+            reverse_order: bool,
+            parse_mult_msg: bool,
+        ):
+            return {
+                "messages": [
+                    {
+                        "message_id": "other-message",
+                        "message_seq": "99999",
+                        "message": [
+                            {
+                                "type": "forward",
+                                "data": {"id": "other-message"},
+                            }
+                        ],
+                    }
+                ]
+            }
+
+    provider = NapCatHistoryProvider(_HydrateClient())
+    messages = [
+        {
+            "message_id": "msg-forward",
+            "message_seq": "23388",
+            "raw_message": {
+                "msgId": "msg-forward",
+                "msgSeq": "23388",
+                "elements": [
+                    {
+                        "elementType": 16,
+                        "multiForwardMsgElement": {"resId": "msg-forward"},
+                    }
+                ],
+            },
+        }
+    ]
+
+    hydrated = provider._hydrate_fast_history_page_forwards(
+        _request(),
+        messages,
+        before_message_seq=None,
+        count=1,
+        reverse_order=False,
+    )
+
+    assert hydrated == 0
+    assert provider._get_forward_history_probe_outcome("23388") is None
+
+
+def test_enrich_forward_details_does_not_retry_history_twice_after_initial_miss() -> None:
+    class _ForwardFailClient:
+        def get_forward_msg(self, message_id: str):
+            raise NapCatApiError("找不到相关的聊天记录")
+
+    provider = NapCatHistoryProvider(_ForwardFailClient())
+    target_message = {
+        "message_id": "msg-forward",
+        "message_seq": "23388",
+        "message": [
+            {
+                "type": "forward",
+                "data": {"id": "fwd-1"},
+                "extra": {"forward_messages": [], "detailed_text": None},
+            }
+        ],
+    }
+    history_calls = 0
+
+    def fake_hydrate_forward_message_via_history(message: dict[str, object], *, chat_type: str, chat_id: str):
+        nonlocal history_calls
+        history_calls += 1
+        provider._record_forward_history_probe_outcome(
+            message,
+            has_content=False,
+            route="history_retry",
+        )
+        return False, None
+
+    provider._hydrate_forward_message_via_history = fake_hydrate_forward_message_via_history  # type: ignore[method-assign]
+
+    enriched, unavailable = provider._enrich_forward_details(
+        [target_message],
+        chat_type="group",
+        chat_id="922065597",
+        skip_history_retry=False,
+        progress_callback=None,
+    )
+
+    assert history_calls == 1
+    assert enriched == 0
+    assert unavailable == 1
+    assert (
+        target_message["message"][0]["data"]["_qq_data_forward_unavailable_reason"]  # type: ignore[index]
+        == "forward_structure_unavailable_protocol_fallback"
+    )
+
+
 def test_match_message_by_seq_does_not_accept_single_mismatched_message_with_seq() -> None:
     provider = NapCatHistoryProvider(_DummyClient())
     payload = [{"message_seq": "9999", "message": [{"type": "forward", "data": {"content": "x"}}]}]

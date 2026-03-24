@@ -177,6 +177,8 @@ class ExportPerfTraceWriter:
         self._scan_summaries: list[dict[str, Any]] = []
         self._page_size_adapt_events: list[dict[str, Any]] = []
         self._forward_expand_runs: list[dict[str, Any]] = []
+        self._tail_bulk_chunk_breakdown: list[dict[str, Any]] = []
+        self._tail_forward_hydrate_windows: list[dict[str, Any]] = []
         self._top_materialize_steps: list[dict[str, Any]] = []
         self._top_materialize_substeps: list[dict[str, Any]] = []
         self._substep_buckets: dict[str, dict[str, Any]] = {}
@@ -239,22 +241,6 @@ class ExportPerfTraceWriter:
             page_duration_s = float(payload.get("page_duration_s") or 0.0)
             self._page_time_sum += page_duration_s
             self._slowest_page_s = max(self._slowest_page_s, page_duration_s)
-            history_source = str(payload.get("history_source") or "").strip()
-            if page_duration_s > 0 and history_source:
-                bucket_name = f"{kind}:{history_source}"
-                bucket = self._history_page_buckets.setdefault(
-                    bucket_name,
-                    {"count": 0, "total_s": 0.0, "max_s": 0.0, "page_messages": 0},
-                )
-                _update_timing_bucket(
-                    bucket,
-                    elapsed_s=page_duration_s,
-                    payload=payload,
-                    max_payload_omit={"page_duration_s"},
-                )
-                bucket["page_messages"] = int(bucket.get("page_messages") or 0) + int(
-                    payload.get("page_message_count") or 0
-                )
             self._last_record_count = max(
                 self._last_record_count,
                 int(payload.get("collected_messages") or payload.get("matched_messages") or 0),
@@ -305,6 +291,16 @@ class ExportPerfTraceWriter:
             self._forward_expand_runs.append(_compact_payload(payload))
             if len(self._forward_expand_runs) > TOP_PERF_EVENT_LIMIT:
                 del self._forward_expand_runs[:-TOP_PERF_EVENT_LIMIT]
+            return
+        if kind == "tail_bulk_chunk" and str(payload.get("status") or "") == "done":
+            self._tail_bulk_chunk_breakdown.append(_compact_payload(payload))
+            if len(self._tail_bulk_chunk_breakdown) > TOP_PERF_EVENT_LIMIT:
+                del self._tail_bulk_chunk_breakdown[:-TOP_PERF_EVENT_LIMIT]
+            return
+        if kind == "tail_forward_hydrate_window" and str(payload.get("status") or "") == "done":
+            self._tail_forward_hydrate_windows.append(_compact_payload(payload))
+            if len(self._tail_forward_hydrate_windows) > 100:
+                del self._tail_forward_hydrate_windows[:-100]
             return
         if kind == "prefetch_media_chunk":
             stage = str(payload.get("stage") or "")
@@ -592,6 +588,8 @@ class ExportPerfTraceWriter:
                 "scan_summaries": list(self._scan_summaries),
                 "page_size_adapt_events": list(self._page_size_adapt_events),
                 "forward_expand_runs": list(self._forward_expand_runs),
+                "tail_bulk_chunk_breakdown": list(self._tail_bulk_chunk_breakdown),
+                "tail_forward_hydrate_windows": list(self._tail_forward_hydrate_windows),
                 "substep_breakdown": substep_breakdown,
                 "top_materialize_steps": list(self._top_materialize_steps),
                 "top_materialize_substeps": list(self._top_materialize_substeps),

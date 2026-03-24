@@ -232,6 +232,54 @@ The latest strict audit found the remaining non-evidence decisions concentrated 
   - then run targeted retests for the 6 new retry windows
   - only when those windows return `actionable_missing=0` should broad full-export validation be paid again
 
+## [2026-03-24] Latest Perf Probe After Report/Provider Hardening
+
+- fresh live validation slice:
+  - command: `app.py export-history group 922065597 --limit 300 --format jsonl`
+  - data:
+    - `exports/group_922065597_20260324_194615_379684.jsonl`
+  - manifest:
+    - `exports/group_922065597_20260324_194615_379684.manifest.json`
+  - trace/report:
+    - `state/export_perf/cli_export_group_922065597_20260324_194611_882045_41096.jsonl`
+    - `state/export_perf/cli_export_group_922065597_20260324_194611_882045_41096.report.json`
+- current probe result:
+  - `records=300`
+  - `elapsed=7.856s`
+  - `history_source=napcat_fast_history_bulk`
+  - `actionable_missing=0`
+  - `background_missing=14`
+  - `final_missing_reason=[qq_not_downloaded_local_placeholder:14]`
+- report contract outcome:
+  - `history_page_breakdown` is now non-empty and no longer double-counts `tail_scan` summary rows
+  - `tail_bulk_chunk_breakdown` is now non-empty
+  - `tail_forward_hydrate_windows` is now non-empty and now carries:
+    - window message count
+    - forward ref count
+    - hydrated count
+    - oldest/newest message ids
+    - oldest/newest seqs
+    - oldest/newest timestamps
+  - `materialize_stage_breakdown` and `materialize_asset_breakdown` are non-empty
+- current measured hotspot order from this probe:
+  - `public_token_get_image_remote_url:error`
+    - `16` calls
+    - `1.0048s` total
+  - `forward_remote_url:ok`
+    - `7` calls
+    - `0.8197s` total
+  - first sparse forward-hydrate window:
+    - `200` messages
+    - `1` forward ref
+    - `1` hydrated
+    - `0.4453s`
+- current interpretation:
+  - local copy/finalize I/O is no longer the top next optimization target on the maintainer runtime
+  - remaining ROI is concentrated in:
+    - top-level image public-token remote-failure path
+    - sparse forward-hydrate overfetch
+    - baseline-vs-current report completeness/diff automation
+
 ## Remaining Non-Evidence Decisions After This Pass
 
 The main remaining non-evidence control-flow is now concentrated in downloader route planning and pool shaping:
@@ -299,13 +347,19 @@ The main remaining non-evidence control-flow is now concentrated in downloader r
 ## Track 9. Fetch/Scan Hotspot Reduction
 
 - [x] confirm from the `20260324` full-export report that the main fetch hotspot is `forward_hydrate_s`, not raw `fast_tail_bulk`
-- [ ] add first-class perf rows for each bulk forward-hydrate window/chunk so the `35s+` tail forward cost is decomposed instead of living only in `scan_summary`
+- [x] add first-class perf rows for each bulk forward-hydrate window/chunk so the `35s+` tail forward cost is decomposed instead of living only in `scan_summary`
 - [ ] quantify zero-hit retry work inside finalize/forward enrichment:
   - `history_retry_calls`
   - `history_retry_hits`
   - `get_forward_msg_calls`
   - `get_forward_msg_hits`
 - [ ] gate forward-history retries on stronger evidence when the current run already predicts zero recovery value
+- [ ] reduce sparse forward-hydrate overfetch:
+  - current maintainer slice still pays `~445ms` to hydrate `200` messages for `1` forward ref
+  - next pass should compare:
+    - current `page_size` window
+    - smaller fixed windows
+    - density-aware minimal covering span
 
 ## Track 10. Full Export Perf Gate
 
@@ -333,10 +387,10 @@ The main remaining non-evidence control-flow is now concentrated in downloader r
   - observability gap
   - external NapCat-bound
 - [ ] keep the current top-ranked buckets visible:
-  - bulk forward hydrate cost inside fetch
+  - top-level `image` public-token remote-url failures (`public_token_get_image_remote_url:error`)
+  - sparse forward hydrate cost inside fetch
   - zero-hit finalize/forward retries
-  - local copy/finalize I/O inside `media_bundle.py`
-  - aggregate image public/remote checks that are individually cheap but numerous
+  - aggregate forward `image` remote downloads
 
 ## Track 1. Evidence-First Terminal Classification
 
