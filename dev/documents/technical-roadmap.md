@@ -66,6 +66,35 @@
 
 ## 4. 里程碑日志
 
+### [2026-03-24][055] post-restart forward-image timeout storm 已被定位为 route-ordering 回归，并已收回到 evidence-first 终局分类
+
+- 一次真实 NapCat 重启后，`--limit 300` live export 曾短暂回退到：
+  - `records=300`
+  - `elapsed=92.606s`
+  - `actionable_missing=0`
+  - `bundle.materialize_snapshot_media ~= 87.301s`
+  - `slowest_materialize_step_s ~= 12.103s`
+- 这次回退最终被定位为：
+  - 不是 page scanning 本身变慢
+  - 也不是新的 broad fetch regression
+  - 而是 forward `image` 在 metadata/local evidence 已经足够判终局后，public-token 路径仍继续存活，重复进入 `public_token_get_image` 超时链
+- 对应修复是：
+  - forward-image terminal classification 前移到 public-token 之前
+  - public-token remote-url 失败后立即重跑 evidence-first missing classification，而不是再漂回 `missing_after_napcat`
+  - simulator 也同步锁住：
+    - `top_level_image_public_token_dead_remote_recent`
+    - `top_level_image_public_token_dead_remote_old`
+- 修复后的同类 live probe 结果：
+  - `records=300`
+  - `elapsed=8.734s`
+  - `actionable_missing=0`
+  - `background_missing=21`
+  - `bundle.materialize_snapshot_media ~= 3.321s`
+  - `slowest_materialize_step_s ~= 0.315s`
+- 当前解释：
+  - fetch/page bulk 仍有继续压缩空间
+  - 但这轮最关键的 `12s` forward-image timeout storm 已经不再是主导瓶颈
+
 ### [2026-03-24][054] targeted perf probes now expose real fetch/materialize hotspots directly, and the next ROI buckets have shifted again
 
 - exporter perf report no longer double-counts `tail_scan` summary rows inside `history_page_breakdown`

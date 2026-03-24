@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urljoin
 
 from .fast_history_client import NapCatFastHistoryTimeoutError, NapCatFastHistoryUnavailable
 from .http_client import NapCatApiError, NapCatApiTimeoutError
@@ -2662,8 +2663,8 @@ class _ScenarioRuntimeState:
             self.remote_map[url] = self.remote_path
             return url
         if state == "relative_http":
-            relative = f"download/{self.scenario.name}/{self.file_name}"
-            resolved = f"{self.remote_base_url.rstrip('/')}/{relative}"
+            relative = f"/download/{self.scenario.name}/{self.file_name}"
+            resolved = urljoin(self.remote_base_url.rstrip("/") + "/", relative.lstrip("/"))
             self.remote_map[resolved] = self.remote_path
             return relative
         if state == "stale_http":
@@ -2699,6 +2700,10 @@ class _ScenarioRuntimeState:
             remote_url = f"https://cdn.example.invalid/{self.scenario.name}/{self.file_name}"
             self.remote_map[remote_url] = self.remote_path
             return {"remote_url": remote_url, "file_name": self.file_name, "asset_type": self.scenario.asset_type}
+        if mode == "expired_remote":
+            remote_url = f"https://cdn.example.invalid/expired/{self.scenario.name}/{self.file_name}"
+            self.remote_failure_map[remote_url] = "expired_remote"
+            return {"url": remote_url, "remote_url": remote_url, "file_name": self.file_name, "asset_type": self.scenario.asset_type}
         if mode == "blank_payload":
             return {
                 "file": "",
@@ -3468,6 +3473,22 @@ def _terminal_evidence_age_invariance_scenarios() -> list[AssetResolutionScenari
     for age_label, age_days in (("recent", 7), ("old", 260)):
         scenarios.extend(
             [
+                AssetResolutionScenario(
+                    name=f"top_level_image_public_token_dead_remote_{age_label}",
+                    suite="terminal_evidence_age_invariance",
+                    asset_type="image",
+                    topology="top_level",
+                    age_days=age_days,
+                    source_path_state="stale_missing",
+                    context_payload_state="public_token",
+                    public_result_state="expired_remote",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=1,
+                    max_fast_calls=1,
+                    max_remote_attempts=1,
+                    notes="Dead public-token remote for a top-level image should classify terminally regardless of age.",
+                ),
                 AssetResolutionScenario(
                     name=f"forward_image_dead_remote_public_timeout_{age_label}",
                     suite="terminal_evidence_age_invariance",
