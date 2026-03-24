@@ -1491,6 +1491,59 @@ def test_classify_forward_missing_keeps_forward_image_without_terminal_evidence_
     assert classification is None
 
 
+def test_resolve_remote_url_only_projects_relative_download_routes() -> None:
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        remote_base_url="http://127.0.0.1:3000",
+    )
+
+    assert (
+        downloader._resolve_remote_url("/download?appid=1407&fileid=abc&spec=0")
+        == "http://127.0.0.1:3000/download?appid=1407&fileid=abc&spec=0"
+    )
+    assert (
+        downloader._resolve_remote_url(
+            "/gchatpic_new/3348513412/922065597-2397162384-A8D7F0A6BDE1314277980B64829EE245/0?term=255&is_origin=0"
+        )
+        is None
+    )
+
+
+def test_resolve_for_export_does_not_attempt_remote_download_for_relative_non_download_image_url() -> None:
+    downloader = NapCatMediaDownloader(
+        _DummyClient(),
+        remote_base_url="http://127.0.0.1:3000",
+    )
+    request = {
+        "asset_type": "image",
+        "file_name": "old-image.png",
+        "timestamp_ms": 1757142395000,
+        "download_hint": {
+            "file_id": "2397162384",
+            "url": "/gchatpic_new/3348513412/922065597-2397162384-A8D7F0A6BDE1314277980B64829EE245/0?term=255&is_origin=0",
+            "message_id_raw": "7616405939521354983",
+            "element_id": "7616405939521354982",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+    downloader._call_public_action_with_token = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: {
+            "asset_type": "image",
+            "public_action": "get_image",
+            "public_file_token": "2397162384",
+            "file_name": "old-image.png",
+            "url": "/gchatpic_new/3348513412/922065597-2397162384-A8D7F0A6BDE1314277980B64829EE245/0?term=255&is_origin=0",
+        }
+    )
+    downloader._download_remote_media = (  # type: ignore[method-assign]
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("relative non-download image URL should not trigger remote download"))
+    )
+    downloader._resolve_via_context_only = lambda *_args, **_kwargs: (None, None)  # type: ignore[method-assign]
+
+    assert downloader.resolve_for_export(request) == (None, None)
+
+
 def test_classify_forward_missing_marks_forward_image_with_dead_remote_and_metadata_timeout_as_background_when_no_public_or_local_handle_exists() -> None:
     fast_client = _ForwardImageMetadataTimeoutClient()
     downloader = NapCatMediaDownloader(

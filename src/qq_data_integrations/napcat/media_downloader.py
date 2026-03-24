@@ -6101,4 +6101,9 @@ class NapCatMediaDownloader:
             return candidate
         if not self._remote_base_url:
             return None
+        if not (
+            candidate.startswith("/download")
+            or candidate.startswith("download?")
+        ):
+            return None
         return urljoin(self._remote_base_url.rstrip("/") + "/", candidate.lstrip("/"))
