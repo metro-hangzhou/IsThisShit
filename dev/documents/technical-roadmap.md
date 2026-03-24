@@ -66,6 +66,27 @@
 
 ## 4. 里程碑日志
 
+### [2026-03-24][056] full-history broad export 终于切到 fast bulk，`71` 页的 page-scan 成本已从前台分页退化改成 `7` 个 bulk chunk
+
+- 用户侧 broad export 继续暴露了一个真遗漏：
+  - tail export 已经在走 fast bulk
+  - 但 `@final_content @earliest_content` 这条 full-history 主路径还停留在旧的 per-page scan
+- 这轮把 `fetch_full_snapshot()` 改成：
+  - `fast_full_bulk` first
+  - `_fetch_history_page(...)` only as fallback
+- maintainer live benchmark on group `922065597` after the change：
+  - `messages=12593`
+  - `pages_scanned=71`
+  - `bulk_chunks=7`
+  - `provider.fast_full_bulk = 9.1365s`
+  - `provider.finalize_snapshot = 20.2898s`
+  - `provider.fetch_full_snapshot = 29.4657s`
+- 当前解释：
+  - page scanning 本身已经不再是 `~28s` 量级的前台分页瓶颈
+  - broad full-history 路径的下一个主热点已经转移到：
+    - `provider.finalize_snapshot`
+    - 尤其是 forward/detail enrichment
+
 ### [2026-03-24][055] post-restart forward-image timeout storm 已被定位为 route-ordering 回归，并已收回到 evidence-first 终局分类
 
 - 一次真实 NapCat 重启后，`--limit 300` live export 曾短暂回退到：

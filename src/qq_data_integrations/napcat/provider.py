@@ -642,8 +642,9 @@ class NapCatHistoryProvider:
                 exit_reason = "empty_page"
                 break
             pages_scanned += 1
-            history_source = str(
-                page_metrics.get("history_source") or history_source or ""
+            history_source = _merge_history_source(
+                history_source,
+                str(page_metrics.get("history_source") or ""),
             )
             if need_final and final_content_at is None:
                 final_content_at = _message_datetime(messages[-1])
@@ -759,8 +760,9 @@ class NapCatHistoryProvider:
                 exit_reason = "empty_page"
                 break
             pages_scanned += 1
-            history_source = str(
-                page_metrics.get("history_source") or history_source or ""
+            history_source = _merge_history_source(
+                history_source,
+                str(page_metrics.get("history_source") or ""),
             )
 
             oldest_dt = _message_datetime(page_messages[0])
@@ -902,8 +904,9 @@ class NapCatHistoryProvider:
                 exit_reason = "empty_page"
                 break
             pages_scanned += 1
-            history_source = str(
-                page_metrics.get("history_source") or history_source or ""
+            history_source = _merge_history_source(
+                history_source,
+                str(page_metrics.get("history_source") or ""),
             )
 
             oldest_dt = _message_datetime(page_messages[0])
@@ -1030,6 +1033,74 @@ class NapCatHistoryProvider:
             page_size=effective_base_page_size,
         )
 
+        bulk_state = self._collect_fast_history_full_bulk(
+            request,
+            page_size=effective_base_page_size,
+            progress_callback=progress_callback,
+        )
+        if bulk_state is not None:
+            collected_messages = list(bulk_state["messages"])
+            seen_keys = set(str(item) for item in bulk_state["seen_keys"])
+            pages_scanned = int(bulk_state["pages_scanned"])
+            history_source = str(bulk_state["history_source"] or history_source or "")
+            earliest_content_at = bulk_state.get("earliest_content_at")
+            final_content_at = bulk_state.get("final_content_at")
+            anchor = str(bulk_state.get("next_anchor") or "").strip() or None
+            if anchor:
+                seen_anchors.add(anchor)
+            if bulk_state["completed"]:
+                exit_reason = "bulk_completed"
+                collected_messages.sort(
+                    key=lambda item: (_message_datetime(item), _message_sort_key(item))
+                )
+                snapshot = SourceChatSnapshot(
+                    chat_type=request.chat_type,
+                    chat_id=request.chat_id,
+                    chat_name=request.chat_name,
+                    exported_at=datetime.now(EXPORT_TIMEZONE),
+                    metadata={
+                        "source": history_source or "napcat_http",
+                        "page_size": effective_base_page_size,
+                        "resolved_since": earliest_content_at.isoformat()
+                        if earliest_content_at
+                        else None,
+                        "resolved_until": final_content_at.isoformat()
+                        if final_content_at
+                        else None,
+                        "interval_mode": "closed",
+                        "full_history": True,
+                    },
+                    messages=collected_messages,
+                )
+                finalized = self._finalize_snapshot(
+                    snapshot, progress_callback=progress_callback
+                )
+                elapsed_s = perf_counter() - started
+                self._emit_scan_summary(
+                    progress_callback,
+                    scan_phase="full_scan",
+                    elapsed_s=elapsed_s,
+                    exit_reason=exit_reason,
+                    pages_scanned=pages_scanned,
+                    collected_messages=len(collected_messages),
+                    history_source=history_source or "napcat_http",
+                    earliest_content_at=earliest_content_at,
+                    final_content_at=final_content_at,
+                )
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fetch_full_snapshot",
+                    status="done",
+                    elapsed_s=elapsed_s,
+                    pages_scanned=pages_scanned,
+                    message_count=len(collected_messages),
+                    history_source=history_source or "napcat_http",
+                    exit_reason=exit_reason,
+                )
+                return finalized
+            if bulk_state.get("partial_fallback"):
+                exit_reason = "bulk_partial_fallback"
+
         while True:
             snapshot, page_metrics = self._fetch_history_page(
                 request,
@@ -1044,8 +1115,9 @@ class NapCatHistoryProvider:
                 exit_reason = "empty_page"
                 break
             pages_scanned += 1
-            history_source = str(
-                page_metrics.get("history_source") or history_source or ""
+            history_source = _merge_history_source(
+                history_source,
+                str(page_metrics.get("history_source") or ""),
             )
             if final_content_at is None:
                 final_content_at = _message_datetime(page_messages[-1])
@@ -1134,6 +1206,218 @@ class NapCatHistoryProvider:
             exit_reason=exit_reason,
         )
         return finalized
+
+    def _collect_fast_history_full_bulk(
+        self,
+        request: ExportRequest,
+        *,
+        page_size: int,
+        progress_callback: HistoryProgressCallback | None,
+    ) -> dict[str, Any] | None:
+        if self._fast_client is None or self._fast_mode == "off":
+            return None
+        chunk_limit = FAST_HISTORY_BULK_SAFE_DATA_COUNT
+        anchor: str | None = None
+        seen_keys: set[str] = set()
+        seen_anchors: set[str] = set()
+        collected_messages: list[dict[str, Any]] = []
+        pages_scanned = 0
+        chunk_count = 0
+        total_started = perf_counter()
+        final_content_at: datetime | None = None
+        earliest_content_at: datetime | None = None
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fast_full_bulk",
+            status="start",
+            page_size=page_size,
+            chunk_limit=chunk_limit,
+        )
+
+        while True:
+            chunk_started = perf_counter()
+            payload = self._fetch_fast_history_tail_bulk(
+                request,
+                data_count=chunk_limit,
+                page_size=page_size,
+                anchor_message_id=anchor,
+            )
+            if payload is None:
+                if chunk_count <= 0:
+                    self._emit_pipeline_stage(
+                        progress_callback,
+                        stage="provider.fast_full_bulk",
+                        status="done",
+                        elapsed_s=perf_counter() - total_started,
+                        pages_scanned=pages_scanned,
+                        bulk_chunks=chunk_count,
+                        exit_reason="unavailable_initial",
+                    )
+                    return None
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fast_full_bulk",
+                    status="done",
+                    elapsed_s=perf_counter() - total_started,
+                    pages_scanned=pages_scanned,
+                    bulk_chunks=chunk_count,
+                    exit_reason="partial_fallback",
+                )
+                return {
+                    "messages": collected_messages,
+                    "seen_keys": seen_keys,
+                    "next_anchor": anchor,
+                    "pages_scanned": pages_scanned,
+                    "completed": False,
+                    "history_source": "napcat_fast_history_bulk",
+                    "bulk_duration_s": round(perf_counter() - total_started, 4),
+                    "bulk_chunks": chunk_count,
+                    "bulk_chunk_limit": chunk_limit,
+                    "partial_fallback": True,
+                    "page_size": page_size,
+                    "earliest_content_at": earliest_content_at,
+                    "final_content_at": final_content_at,
+                }
+
+            chunk_count += 1
+            chunk_duration_s = round(perf_counter() - chunk_started, 4)
+            chunk_messages = _sorted_messages(self._extract_messages(payload.get("messages")))
+            pages_scanned += int(payload.get("pages_scanned") or 0)
+            if chunk_messages and final_content_at is None:
+                final_content_at = _message_datetime(chunk_messages[-1])
+            if chunk_messages:
+                earliest_content_at = _message_datetime(chunk_messages[0])
+            added = 0
+            for message in chunk_messages:
+                dedupe_key = _message_key(message)
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+                collected_messages.append(message)
+                added += 1
+
+            oldest_dt = _message_datetime(chunk_messages[0]) if chunk_messages else None
+            newest_dt = _message_datetime(chunk_messages[-1]) if chunk_messages else None
+            next_anchor = (
+                str(payload.get("next_anchor") or "").strip()
+                or (_history_anchor(chunk_messages[0]) if chunk_messages else None)
+            )
+            exhausted = bool(payload.get("exhausted"))
+            total_duration_s = round(perf_counter() - total_started, 4)
+            self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "history_page_done",
+                    "mode": "full_scan",
+                    "history_source": "napcat_fast_history_bulk",
+                    "status": "done",
+                    "page_duration_s": chunk_duration_s,
+                    "page_message_count": len(chunk_messages),
+                    "page_size": int(payload.get("page_size") or page_size),
+                    "requested_count": chunk_limit,
+                    "retry_count": 0,
+                    "chunk_index": chunk_count,
+                    "chunk_added": added,
+                    "pages_scanned": pages_scanned,
+                    "next_anchor": next_anchor,
+                    "oldest_content_at": oldest_dt,
+                    "newest_content_at": newest_dt,
+                },
+            )
+            self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "tail_bulk_chunk",
+                    "mode": "full_scan",
+                    "status": "done",
+                    "chunk_index": chunk_count,
+                    "chunk_target": chunk_limit,
+                    "chunk_added": added,
+                    "chunk_messages": len(chunk_messages),
+                    "chunk_duration_s": chunk_duration_s,
+                    "total_duration_s": total_duration_s,
+                    "pages_scanned": pages_scanned,
+                    "next_anchor": next_anchor,
+                    "exhausted": exhausted,
+                    "requested_data_count": len(collected_messages),
+                },
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "phase": "full_scan",
+                        "pages_scanned": pages_scanned,
+                        "collected_messages": len(collected_messages),
+                        "earliest_content_at": earliest_content_at,
+                        "final_content_at": final_content_at,
+                        "anchor": next_anchor,
+                        "history_source": "napcat_fast_history_bulk",
+                        "page_duration_s": chunk_duration_s,
+                        "bulk_duration_s": total_duration_s,
+                        "page_size": int(payload.get("page_size") or page_size),
+                        "page_message_count": len(chunk_messages),
+                        "retry_count": 0,
+                        "bulk_chunks": chunk_count,
+                        "bulk_chunk_limit": chunk_limit,
+                    }
+                )
+
+            if exhausted:
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fast_full_bulk",
+                    status="done",
+                    elapsed_s=perf_counter() - total_started,
+                    pages_scanned=pages_scanned,
+                    bulk_chunks=chunk_count,
+                    message_count=len(collected_messages),
+                    exit_reason="exhausted",
+                )
+                return {
+                    "messages": collected_messages,
+                    "seen_keys": seen_keys,
+                    "next_anchor": next_anchor,
+                    "pages_scanned": pages_scanned,
+                    "completed": True,
+                    "history_source": "napcat_fast_history_bulk",
+                    "bulk_duration_s": total_duration_s,
+                    "bulk_chunks": chunk_count,
+                    "bulk_chunk_limit": chunk_limit,
+                    "partial_fallback": False,
+                    "page_size": int(payload.get("page_size") or page_size),
+                    "earliest_content_at": earliest_content_at,
+                    "final_content_at": final_content_at,
+                }
+
+            if not next_anchor or next_anchor in seen_anchors or added <= 0:
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fast_full_bulk",
+                    status="done",
+                    elapsed_s=perf_counter() - total_started,
+                    pages_scanned=pages_scanned,
+                    bulk_chunks=chunk_count,
+                    message_count=len(collected_messages),
+                    exit_reason="boundary_stall",
+                )
+                return {
+                    "messages": collected_messages,
+                    "seen_keys": seen_keys,
+                    "next_anchor": anchor,
+                    "pages_scanned": pages_scanned,
+                    "completed": False,
+                    "history_source": "napcat_fast_history_bulk",
+                    "bulk_duration_s": total_duration_s,
+                    "bulk_chunks": chunk_count,
+                    "bulk_chunk_limit": chunk_limit,
+                    "partial_fallback": True,
+                    "page_size": int(payload.get("page_size") or page_size),
+                    "earliest_content_at": earliest_content_at,
+                    "final_content_at": final_content_at,
+                }
+
+            seen_anchors.add(next_anchor)
+            anchor = next_anchor
 
     def _extract_messages(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
@@ -2854,10 +3138,13 @@ def _sorted_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _merge_history_source(existing: str | None, new: str | None) -> str:
-    left = str(existing or "").strip()
-    right = str(new or "").strip()
-    if not left:
-        return right
-    if not right or right == left:
-        return left
-    return f"{left}+{right}"
+    parts: list[str] = []
+    for raw in (existing, new):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        for item in text.split("+"):
+            name = item.strip()
+            if name and name not in parts:
+                parts.append(name)
+    return "+".join(parts)
