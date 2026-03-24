@@ -60,6 +60,31 @@ Without that formal layer, we can still miss:
     - incomplete proof stays non-terminal
     - complete proof becomes terminal/background
 
+## [2026-03-24] New Regression Shape That Simulator Must Lock Down
+
+- latest broad regression was not a replay of the old forward-image windows
+- it introduced 6 new actionable misses, all with the same top-level evidence surface:
+  - top-level `image`
+  - stale local `source_path`
+  - direct `file_id` / public-token recovery handle present
+  - `context_hydration` already attempted with no recovered local path
+  - `public_token_get_image` returned payload, but only as remote URL
+  - `public_token_get_image_remote_url` then failed
+  - implementation still landed on `missing_after_napcat`
+- simulator must therefore add a first-class suite for:
+  - recent top-level image
+  - stale local path
+  - public-token payload with remote-only result
+  - authoritative remote failure on that public remote URL
+  - no remaining live handle
+- expected oracle result:
+  - `actual_resolver = qq_expired_after_napcat`
+  - `actual_path_kind = missing`
+  - zero cost-overrun tolerance
+- explicit anti-regression requirement:
+  - this suite must run for both `recent` and `old` ages
+  - the result must be invariant to age once the proof chain is complete
+
 ## Hard Rule
 
 From this point onward, simulator work should be driven by evidence dimensions, not by ad hoc "interesting scenarios".
@@ -411,6 +436,40 @@ Acceptance:
   - widened cost
   - or left a dimension uncovered
 
+## Track I. Baseline-Replay Regression Harness
+
+- [ ] encode the last actionable-zero full export as a replay baseline
+- [ ] replay current regressed actionable windows against the same evidence model
+- [ ] assert:
+  - no newly actionable terminal mismatches
+  - no new cost overruns
+  - no empty report fields for covered stages
+- [ ] add matrix families for:
+  - baseline vs regressed route-plan divergence
+  - report completeness invariants
+  - same asset, different stage timing surface cost drift
+
+## Track J. Performance Report Completeness As A Replay Contract
+
+- [ ] require replay/baseline runs to validate report schema, not just correctness/cost
+- [ ] assert presence and non-emptiness of:
+  - `total_elapsed_s`
+  - `history_page_breakdown`
+  - `materialize_stage_breakdown`
+  - `materialize_asset_breakdown`
+  - `top_materialize_steps`
+  - `top_materialize_substeps`
+- [ ] enforce per-row metadata contracts for covered sections so a report can be compared mechanically instead of by hand
+
+## Track K. Performance Review Board Inputs
+
+- [ ] make replay/simulator outputs emit a normalized optimization queue:
+  - empty-section regressions
+  - newly slow route families
+  - aggregate-cost hotspots
+  - correctness-vs-cost tension points
+- [ ] keep that queue aligned with the live full-export baseline so reviewer output becomes executable TODO input, not one-off commentary
+
 ## Immediate Execution Plan
 
 Phase 1. Formalize the evidence model
@@ -449,6 +508,8 @@ Call this plan complete only when all of the following are true:
 - oracle-vs-implementation mismatches are `0`
 - cost overruns are `0`
 - no uncovered high-impact evidence dimensions remain
+- exhaustive/replay suites must reproduce the last actionable-zero baseline for all known regressed windows
+- report completeness must show non-empty fetch/page/materialize sections whenever those stages were exercised
 - targeted live retests for residual actionable windows are clean
 - full live export on group `922065597` ends with:
   - `actionable_missing=0`

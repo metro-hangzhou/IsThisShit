@@ -88,6 +88,16 @@ def write_export_bundle(
                     "staged_path": str(written_data_path),
                 }
             )
+        materialize_started = monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.materialize_snapshot_media",
+                    "status": "start",
+                    "candidate_hint": len(snapshot.messages),
+                }
+            )
         assets = materialize_snapshot_media(
             snapshot,
             staged_assets_dir,
@@ -99,7 +109,28 @@ def write_export_bundle(
             progress_callback=progress_callback,
             forensics_collector=forensics_collector,
         )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.materialize_snapshot_media",
+                    "status": "done",
+                    "elapsed_s": round(monotonic() - materialize_started, 4),
+                    "materialized_asset_count": len(assets),
+                }
+            )
         summary = _summarize_assets(assets)
+        finalize_started = monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.finalize_output_files",
+                    "status": "start",
+                    "data_path": str(data_path),
+                    "assets_dir": str(final_assets_dir),
+                }
+            )
         if data_path.exists():
             data_path.unlink()
         written_data_path.replace(data_path)
@@ -107,6 +138,28 @@ def write_export_bundle(
             shutil.rmtree(final_assets_dir)
         if staged_assets_dir.exists():
             shutil.move(str(staged_assets_dir), str(final_assets_dir))
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.finalize_output_files",
+                    "status": "done",
+                    "elapsed_s": round(monotonic() - finalize_started, 4),
+                    "data_path": str(data_path),
+                    "assets_dir": str(final_assets_dir),
+                    "materialized_asset_count": len(assets),
+                }
+            )
+        manifest_started = monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.write_manifest",
+                    "status": "start",
+                    "manifest_path": str(manifest_path),
+                }
+            )
         _write_manifest_json(
             manifest_path,
             {
@@ -124,6 +177,17 @@ def write_export_bundle(
             },
             assets=assets,
         )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.write_manifest",
+                    "status": "done",
+                    "elapsed_s": round(monotonic() - manifest_started, 4),
+                    "manifest_path": str(manifest_path),
+                    "materialized_asset_count": len(assets),
+                }
+            )
         return ExportBundleResult(
             data_path=data_path,
             manifest_path=manifest_path,
@@ -269,6 +333,69 @@ def materialize_snapshot_media(
             total=total_candidates,
             candidate=candidate,
         )
+        identity_reuse = _lookup_recent_identity_reuse(
+            candidate,
+            recent_identity_reuse_map,
+        )
+        if identity_reuse is not None:
+            exported_rel_path, resolved_source_path, reused_resolver = identity_reuse
+            asset = MaterializedAsset(
+                message_id=message.message_id,
+                message_seq=message.message_seq,
+                sender_id=message.sender_id,
+                timestamp_iso=message.timestamp_iso,
+                asset_type=str(candidate.asset_type),
+                asset_role=candidate.asset_role,
+                file_name=candidate.file_name,
+                source_path=candidate.source_path,
+                resolved_source_path=resolved_source_path,
+                resolver=reused_resolver or "bundle_identity_reuse",
+                extra={
+                    "chat_id": message.chat_id,
+                    "chat_type": message.chat_type,
+                    "sender_name": message.sender_name,
+                },
+            )
+            asset.status = "reused"
+            asset.exported_rel_path = exported_rel_path
+            assets.append(asset)
+            reused_count += 1
+            step_elapsed_s = round(monotonic() - step_started, 4)
+            _emit_materialization_step_trace(
+                progress_callback,
+                stage="done",
+                current=len(assets),
+                total=total_candidates,
+                candidate=candidate,
+                status=asset.status,
+                resolver=asset.resolver,
+                resolved_source_path=asset.resolved_source_path,
+                step_elapsed_s=step_elapsed_s,
+            )
+            _emit_materialization_progress(
+                progress_callback,
+                current=len(assets),
+                total=total_candidates,
+                candidate=candidate,
+                copied=copied_count,
+                reused=reused_count,
+                missing=missing_count,
+                error=error_count,
+                status=asset.status,
+                resolver=asset.resolver,
+                step_elapsed_s=step_elapsed_s,
+            )
+            if media_download_manager is not None:
+                snapshot = media_download_manager.export_download_progress_snapshot()
+                signature = tuple(sorted(snapshot.items()))
+                if signature != last_download_signature:
+                    _emit_download_queue_progress(
+                        progress_callback,
+                        stage="progress",
+                        snapshot=snapshot,
+                    )
+                    last_download_signature = signature
+            continue
         cache_key = _asset_resolution_cache_key(candidate)
         cached_resolution = resolution_cache.get(cache_key)
         if cached_resolution is None:
@@ -450,17 +577,62 @@ def materialize_snapshot_media(
                     last_download_signature = signature
             continue
 
+        allocate_started = monotonic()
         rel_path = _allocate_export_rel_path(
             candidate,
             resolved_path,
             dedupe_key=dedupe_key,
             occupied_export_paths=occupied_export_paths,
         )
+        _emit_materialization_substep_trace(
+            progress_callback,
+            substep="allocate_export_path",
+            candidate=candidate,
+            elapsed_s=monotonic() - allocate_started,
+            source_path=str(resolved_path),
+            target_path=str(assets_dir / rel_path),
+            source_size_bytes=_safe_file_size(resolved_path),
+        )
         target_path = assets_dir / rel_path
+        mkdir_started = monotonic()
         target_path.parent.mkdir(parents=True, exist_ok=True)
+        _emit_materialization_substep_trace(
+            progress_callback,
+            substep="ensure_export_parent",
+            candidate=candidate,
+            elapsed_s=monotonic() - mkdir_started,
+            source_path=str(resolved_path),
+            target_path=str(target_path),
+        )
         try:
+            copy_started = monotonic()
             shutil.copy2(resolved_path, target_path)
+            copy_elapsed_s = monotonic() - copy_started
+            _emit_materialization_substep_trace(
+                progress_callback,
+                substep="copy_asset_file",
+                candidate=candidate,
+                elapsed_s=copy_elapsed_s,
+                source_path=str(resolved_path),
+                target_path=str(target_path),
+                source_size_bytes=_safe_file_size(resolved_path),
+                target_size_bytes=_safe_file_size(target_path),
+                resolver=asset.resolver,
+            )
         except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
+            _emit_materialization_substep_trace(
+                progress_callback,
+                substep="copy_asset_file",
+                candidate=candidate,
+                elapsed_s=monotonic() - copy_started,
+                status="error",
+                detail=str(exc),
+                source_path=str(resolved_path),
+                target_path=str(target_path),
+                source_size_bytes=_safe_file_size(resolved_path),
+                target_size_bytes=_safe_file_size(target_path),
+                resolver=asset.resolver,
+            )
             asset.status = "error"
             asset.note = str(exc)
             assets.append(asset)
@@ -562,6 +734,7 @@ def materialize_snapshot_media(
             )
         recovered_count = 0
         for asset, candidate in second_pass_candidates:
+            retry_started = monotonic()
             identity_reuse = _lookup_recent_identity_reuse(
                 candidate,
                 recent_identity_reuse_map,
@@ -577,6 +750,15 @@ def materialize_snapshot_media(
                 missing_count -= 1
                 reused_count += 1
                 recovered_count += 1
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_identity_reuse",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - retry_started,
+                    source_path=resolved_source_path,
+                    target_path=exported_rel_path,
+                    resolver=asset.resolver,
+                )
                 continue
             if asset.status != "missing":
                 continue
@@ -594,8 +776,18 @@ def materialize_snapshot_media(
                 "download_hint": candidate.download_hint,
             }
             with suppress(Exception):
+                public_retry_started = monotonic()
                 resolved_path, resolver = media_download_manager.resolve_via_public_token_route(
                     request_payload
+                )
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_public_retry",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - public_retry_started,
+                    status="ok" if resolved_path is not None else "miss",
+                    source_path=str(resolved_path) if resolved_path is not None else None,
+                    resolver=resolver,
                 )
                 if resolved_path is None:
                     continue
@@ -610,23 +802,78 @@ def materialize_snapshot_media(
                     missing_count -= 1
                     reused_count += 1
                     recovered_count += 1
+                    _emit_materialization_substep_trace(
+                        progress_callback,
+                        substep="second_pass_reuse_copied_asset",
+                        candidate=candidate,
+                        elapsed_s=monotonic() - retry_started,
+                        source_path=str(resolved_path),
+                        target_path=asset.exported_rel_path,
+                        resolver=asset.resolver,
+                    )
                     continue
+                allocate_started = monotonic()
                 rel_path = _allocate_export_rel_path(
                     candidate,
                     resolved_path,
                     dedupe_key=dedupe_key,
                     occupied_export_paths=occupied_export_paths,
                 )
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_allocate_export_path",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - allocate_started,
+                    source_path=str(resolved_path),
+                    target_path=str(assets_dir / rel_path),
+                    source_size_bytes=_safe_file_size(resolved_path),
+                    resolver=asset.resolver,
+                )
                 target_path = assets_dir / rel_path
+                mkdir_started = monotonic()
                 target_path.parent.mkdir(parents=True, exist_ok=True)
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_ensure_export_parent",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - mkdir_started,
+                    source_path=str(resolved_path),
+                    target_path=str(target_path),
+                    resolver=asset.resolver,
+                )
                 try:
+                    copy_started = monotonic()
                     shutil.copy2(resolved_path, target_path)
                 except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
+                    _emit_materialization_substep_trace(
+                        progress_callback,
+                        substep="second_pass_copy_asset_file",
+                        candidate=candidate,
+                        elapsed_s=monotonic() - copy_started,
+                        status="error",
+                        detail=str(exc),
+                        source_path=str(resolved_path),
+                        target_path=str(target_path),
+                        source_size_bytes=_safe_file_size(resolved_path),
+                        target_size_bytes=_safe_file_size(target_path),
+                        resolver=asset.resolver,
+                    )
                     asset.status = "error"
                     asset.note = str(exc)
                     missing_count -= 1
                     error_count += 1
                     continue
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_copy_asset_file",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - copy_started,
+                    source_path=str(resolved_path),
+                    target_path=str(target_path),
+                    source_size_bytes=_safe_file_size(resolved_path),
+                    target_size_bytes=_safe_file_size(target_path),
+                    resolver=asset.resolver,
+                )
                 asset.status = "copied"
                 asset.exported_rel_path = rel_path.as_posix()
                 copied_map[dedupe_key] = asset.exported_rel_path
@@ -993,6 +1240,69 @@ def _emit_materialization_step_trace(
     progress_callback(payload)
 
 
+def _emit_materialization_substep_trace(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    substep: str,
+    candidate: _AssetCandidate,
+    elapsed_s: float,
+    status: str = "done",
+    detail: str | None = None,
+    source_path: str | None = None,
+    target_path: str | None = None,
+    source_size_bytes: int | None = None,
+    target_size_bytes: int | None = None,
+    resolver: str | None = None,
+) -> None:
+    if progress_callback is None:
+        return
+    hint = candidate.download_hint or {}
+    forward_parent = hint.get("_forward_parent") if isinstance(hint.get("_forward_parent"), dict) else {}
+    source_text = str(source_path or candidate.source_path or "").strip() or None
+    target_text = str(target_path or "").strip() or None
+    source_drive = None
+    target_drive = None
+    if source_text:
+        with suppress(Exception):
+            source_drive = str(Path(source_text).anchor or "").strip() or None
+    if target_text:
+        with suppress(Exception):
+            target_drive = str(Path(target_text).anchor or "").strip() or None
+    payload: dict[str, Any] = {
+        "phase": "materialize_asset_substep",
+        "stage": "done",
+        "substep": substep,
+        "status": status,
+        "elapsed_s": round(elapsed_s, 4),
+        "elapsed_ms": int(round(elapsed_s * 1000)),
+        "asset_type": candidate.asset_type,
+        "asset_role": candidate.asset_role,
+        "file_name": candidate.file_name,
+        "message_id_raw": hint.get("message_id_raw"),
+        "element_id": hint.get("element_id"),
+        "forward_parent_message_id_raw": forward_parent.get("message_id_raw"),
+        "timestamp_ms": candidate.timestamp_ms,
+        "timestamp_iso": _timestamp_iso_from_ms(candidate.timestamp_ms),
+        "md5": candidate.md5,
+        "hint_file_id": hint.get("file_id"),
+        "hint_url": hint.get("remote_url") or hint.get("url"),
+        "source_path": source_text,
+        "source_path_kind": _bundle_asset_location_kind(source_text),
+        "target_path": target_text,
+        "target_path_kind": _bundle_asset_location_kind(target_text),
+        "source_size_bytes": source_size_bytes,
+        "target_size_bytes": target_size_bytes,
+        "source_drive": source_drive,
+        "target_drive": target_drive,
+        "same_volume": bool(source_drive and target_drive and source_drive.casefold() == target_drive.casefold()),
+    }
+    if detail:
+        payload["detail"] = detail
+    if resolver:
+        payload["resolver"] = resolver
+    progress_callback(payload)
+
+
 def _timestamp_iso_from_ms(timestamp_ms: int) -> str | None:
     if timestamp_ms <= 0:
         return None
@@ -1337,6 +1647,14 @@ def _resolve_via_roots(
                 continue
             if match.exists() and match.is_file():
                 return match.resolve()
+    return None
+
+
+def _safe_file_size(path: str | Path | None) -> int | None:
+    if not path:
+        return None
+    with suppress(OSError, ValueError):
+        return int(Path(path).stat().st_size)
     return None
 
 

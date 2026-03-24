@@ -50,13 +50,85 @@ class NapCatHistoryProvider:
         self._known_unavailable_forward_ids.clear()
         self._known_unavailable_history_keys.clear()
 
-    def fetch_snapshot(self, request: ExportRequest) -> SourceChatSnapshot:
-        return self.fetch_snapshot_before(
+    def _emit_progress(
+        self,
+        progress_callback: HistoryProgressCallback | None,
+        payload: dict[str, Any],
+    ) -> None:
+        if progress_callback is not None:
+            progress_callback(payload)
+
+    def _emit_pipeline_stage(
+        self,
+        progress_callback: HistoryProgressCallback | None,
+        *,
+        stage: str,
+        status: str,
+        elapsed_s: float | None = None,
+        **payload: Any,
+    ) -> None:
+        event: dict[str, Any] = {
+            "phase": "pipeline_stage",
+            "stage": stage,
+            "status": status,
+            **payload,
+        }
+        if elapsed_s is not None:
+            event["elapsed_s"] = round(elapsed_s, 4)
+            event["elapsed_ms"] = int(round(elapsed_s * 1000))
+        self._emit_progress(progress_callback, event)
+
+    def _emit_scan_summary(
+        self,
+        progress_callback: HistoryProgressCallback | None,
+        *,
+        scan_phase: str,
+        elapsed_s: float,
+        exit_reason: str,
+        **payload: Any,
+    ) -> None:
+        self._emit_progress(
+            progress_callback,
+            {
+                "phase": "scan_summary",
+                "scan_phase": scan_phase,
+                "elapsed_s": round(elapsed_s, 4),
+                "elapsed_ms": int(round(elapsed_s * 1000)),
+                "exit_reason": exit_reason,
+                **payload,
+            },
+        )
+
+    def fetch_snapshot(
+        self,
+        request: ExportRequest,
+        *,
+        progress_callback: HistoryProgressCallback | None = None,
+    ) -> SourceChatSnapshot:
+        started = perf_counter()
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot",
+            status="start",
+            requested_count=request.limit,
+        )
+        snapshot = self.fetch_snapshot_before(
             request,
             before_message_seq=None,
             count=request.limit,
             include_forward_details=True,
+            progress_callback=progress_callback,
         )
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot",
+            status="done",
+            elapsed_s=perf_counter() - started,
+            requested_count=request.limit,
+            message_count=len(snapshot.messages),
+            history_source=snapshot.metadata.get("source"),
+        )
+        return snapshot
 
     def fetch_snapshot_tail(
         self,
@@ -69,6 +141,7 @@ class NapCatHistoryProvider:
         if data_count <= 0:
             raise ValueError("data_count must be positive for tail export.")
 
+        started = perf_counter()
         effective_base_page_size = self._normalize_requested_page_size(page_size)
         anchor: str | None = None
         selected_messages: list[dict[str, Any]] = []
@@ -79,6 +152,14 @@ class NapCatHistoryProvider:
         fast_page_streak = 0
         history_source: str | None = None
         bulk_tail_metadata: dict[str, Any] | None = None
+        exit_reason = "completed"
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot_tail",
+            status="start",
+            requested_data_count=data_count,
+            page_size=effective_base_page_size,
+        )
 
         bulk_state = self._collect_fast_history_tail_bulk(
             request,
@@ -103,11 +184,13 @@ class NapCatHistoryProvider:
             if anchor:
                 seen_anchors.add(anchor)
             if bool(bulk_state["completed"]):
+                forward_hydrate_started = perf_counter()
                 self._hydrate_fast_history_tail_forwards_bulk(
                     request,
                     selected_messages,
                     page_size=bulk_page_size,
                 )
+                forward_hydrate_s = perf_counter() - forward_hydrate_started
                 selected_messages.sort(
                     key=lambda item: (_message_datetime(item), _message_sort_key(item))
                 )
@@ -127,7 +210,33 @@ class NapCatHistoryProvider:
                     metadata=metadata,
                     messages=selected_messages,
                 )
-                return self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+                finalized = self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+                elapsed_s = perf_counter() - started
+                self._emit_scan_summary(
+                    progress_callback,
+                    scan_phase="tail_scan",
+                    elapsed_s=elapsed_s,
+                    exit_reason="bulk_completed",
+                    pages_scanned=pages_scanned,
+                    matched_messages=len(selected_messages),
+                    requested_data_count=data_count,
+                    history_source=history_source or "napcat_fast_history_bulk",
+                    bulk_chunks=int(bulk_tail_metadata.get("bulk_chunks") or 0) if bulk_tail_metadata else 0,
+                    bulk_duration_s=float(bulk_tail_metadata.get("bulk_duration_s") or 0.0) if bulk_tail_metadata else 0.0,
+                    forward_hydrate_s=round(forward_hydrate_s, 4),
+                )
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fetch_snapshot_tail",
+                    status="done",
+                    elapsed_s=elapsed_s,
+                    requested_data_count=data_count,
+                    pages_scanned=pages_scanned,
+                    message_count=len(selected_messages),
+                    history_source=history_source or "napcat_fast_history_bulk",
+                    exit_reason="bulk_completed",
+                )
+                return finalized
 
         while len(selected_messages) < data_count:
             snapshot, page_metrics = self._fetch_history_page(
@@ -140,6 +249,7 @@ class NapCatHistoryProvider:
             )
             page_messages = self._extract_messages(snapshot.messages)
             if not page_messages:
+                exit_reason = "empty_page"
                 break
             pages_scanned += 1
             history_source = _merge_history_source(
@@ -177,9 +287,15 @@ class NapCatHistoryProvider:
                 page_duration_s=page_metrics["page_duration_s"],
                 fast_page_streak=fast_page_streak,
                 history_source=str(page_metrics.get("history_source") or ""),
+                progress_callback=progress_callback,
+                mode="tail_scan",
             )
             next_anchor = _history_anchor(page_messages[0])
-            if not next_anchor or next_anchor in seen_anchors:
+            if not next_anchor:
+                exit_reason = "missing_anchor"
+                break
+            if next_anchor in seen_anchors:
+                exit_reason = "anchor_loop"
                 break
             seen_anchors.add(next_anchor)
             anchor = next_anchor
@@ -211,7 +327,35 @@ class NapCatHistoryProvider:
             },
             messages=selected_messages,
         )
-        return self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+        finalized = self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+        elapsed_s = perf_counter() - started
+        if len(selected_messages) >= data_count:
+            exit_reason = "target_reached"
+        self._emit_scan_summary(
+            progress_callback,
+            scan_phase="tail_scan",
+            elapsed_s=elapsed_s,
+            exit_reason=exit_reason,
+            pages_scanned=pages_scanned,
+            matched_messages=len(selected_messages),
+            requested_data_count=data_count,
+            history_source=history_source or "napcat_http",
+            bulk_chunks=int(bulk_tail_metadata.get("bulk_chunks") or 0) if bulk_tail_metadata else 0,
+            bulk_duration_s=float(bulk_tail_metadata.get("bulk_duration_s") or 0.0) if bulk_tail_metadata else 0.0,
+            bulk_partial_fallback=bool((bulk_tail_metadata or {}).get("bulk_partial_fallback")),
+        )
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot_tail",
+            status="done",
+            elapsed_s=elapsed_s,
+            requested_data_count=data_count,
+            pages_scanned=pages_scanned,
+            message_count=len(selected_messages),
+            history_source=history_source or "napcat_http",
+            exit_reason=exit_reason,
+        )
+        return finalized
 
     def fetch_snapshot_before(
         self,
@@ -220,37 +364,62 @@ class NapCatHistoryProvider:
         before_message_seq: str | None,
         count: int | None = None,
         include_forward_details: bool = True,
+        progress_callback: HistoryProgressCallback | None = None,
     ) -> SourceChatSnapshot:
         requested_count = count or request.limit or 20
         reverse_order = before_message_seq not in {None, "", "0"}
         payload: Any
         source = "napcat_http"
+        started = perf_counter()
+        fast_fetch_s = 0.0
+        http_fetch_s = 0.0
+        extract_sort_s = 0.0
+        fast_forward_hydrate_s = 0.0
+        finalize_s = 0.0
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot_before",
+            status="start",
+            before_message_seq=before_message_seq,
+            requested_count=requested_count,
+            reverse_order=reverse_order,
+            include_forward_details=include_forward_details,
+        )
+        fast_started = perf_counter()
         fast_payload = self._fetch_fast_history(
             request,
             before_message_id=before_message_seq,
             count=requested_count,
             reverse_order=reverse_order,
         )
+        fast_fetch_s = perf_counter() - fast_started
         if fast_payload is not None:
             payload = fast_payload
             source = "napcat_fast_history"
         elif request.chat_type == "group":
+            http_started = perf_counter()
             payload = self._client.get_group_msg_history(
                 request.chat_id,
                 message_seq=before_message_seq,
                 count=requested_count,
                 reverse_order=reverse_order,
             )
+            http_fetch_s = perf_counter() - http_started
         else:
+            http_started = perf_counter()
             payload = self._client.get_friend_msg_history(
                 request.chat_id,
                 message_seq=before_message_seq,
                 count=requested_count,
                 reverse_order=reverse_order,
             )
+            http_fetch_s = perf_counter() - http_started
 
+        extract_started = perf_counter()
         messages = _sorted_messages(self._extract_messages(payload))
+        extract_sort_s = perf_counter() - extract_started
         if source == "napcat_fast_history":
+            hydrate_started = perf_counter()
             self._hydrate_fast_history_page_forwards(
                 request,
                 messages,
@@ -258,6 +427,7 @@ class NapCatHistoryProvider:
                 count=requested_count,
                 reverse_order=reverse_order,
             )
+            fast_forward_hydrate_s = perf_counter() - hydrate_started
         snapshot = SourceChatSnapshot(
             chat_type=request.chat_type,
             chat_id=request.chat_id,
@@ -272,7 +442,27 @@ class NapCatHistoryProvider:
             messages=messages,
         )
         if include_forward_details:
-            return self._finalize_snapshot(snapshot)
+            finalize_started = perf_counter()
+            snapshot = self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+            finalize_s = perf_counter() - finalize_started
+        total_elapsed_s = perf_counter() - started
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot_before",
+            status="done",
+            elapsed_s=total_elapsed_s,
+            before_message_seq=before_message_seq,
+            requested_count=requested_count,
+            reverse_order=reverse_order,
+            include_forward_details=include_forward_details,
+            history_source=source,
+            message_count=len(messages),
+            fast_fetch_s=round(fast_fetch_s, 4),
+            http_fetch_s=round(http_fetch_s, 4),
+            extract_sort_s=round(extract_sort_s, 4),
+            fast_forward_hydrate_s=round(fast_forward_hydrate_s, 4),
+            finalize_s=round(finalize_s, 4),
+        )
         return snapshot
 
     def get_history_bounds(
@@ -287,16 +477,47 @@ class NapCatHistoryProvider:
         if not need_earliest and not need_final:
             return ChatHistoryBounds()
 
+        started = perf_counter()
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.get_history_bounds",
+            status="start",
+            need_earliest=need_earliest,
+            need_final=need_final,
+            page_size=page_size,
+        )
         if need_final and not need_earliest:
             latest_snapshot = self.fetch_snapshot_before(
-                request, before_message_seq=None, count=1
+                request, before_message_seq=None, count=1, progress_callback=progress_callback
             )
             latest_messages = self._extract_messages(latest_snapshot.messages)
-            return ChatHistoryBounds(
+            bounds = ChatHistoryBounds(
                 final_content_at=_message_datetime(latest_messages[-1])
                 if latest_messages
                 else None,
             )
+            elapsed_s = perf_counter() - started
+            self._emit_scan_summary(
+                progress_callback,
+                scan_phase="bounds_scan",
+                elapsed_s=elapsed_s,
+                exit_reason="final_only",
+                pages_scanned=1 if latest_messages else 0,
+                history_source=str(latest_snapshot.metadata.get("source") or ""),
+                earliest_content_at=None,
+                final_content_at=bounds.final_content_at,
+            )
+            self._emit_pipeline_stage(
+                progress_callback,
+                stage="provider.get_history_bounds",
+                status="done",
+                elapsed_s=elapsed_s,
+                need_earliest=need_earliest,
+                need_final=need_final,
+                pages_scanned=1 if latest_messages else 0,
+                exit_reason="final_only",
+            )
+            return bounds
 
         anchor: str | None = None
         earliest_content_at: datetime | None = None
@@ -307,6 +528,7 @@ class NapCatHistoryProvider:
         effective_base_page_size = current_page_size
         fast_page_streak = 0
         history_source: str | None = None
+        exit_reason = "completed"
         while True:
             snapshot, page_metrics = self._fetch_history_page(
                 request,
@@ -318,6 +540,7 @@ class NapCatHistoryProvider:
             )
             messages = self._extract_messages(snapshot.messages)
             if not messages:
+                exit_reason = "empty_page"
                 break
             pages_scanned += 1
             history_source = str(
@@ -345,17 +568,49 @@ class NapCatHistoryProvider:
                 page_duration_s=page_metrics["page_duration_s"],
                 fast_page_streak=fast_page_streak,
                 history_source=str(page_metrics.get("history_source") or ""),
+                progress_callback=progress_callback,
+                mode="bounds_scan",
             )
             next_anchor = _history_anchor(messages[0])
-            if not need_earliest or not next_anchor or next_anchor in seen_anchors:
+            if not need_earliest:
+                exit_reason = "final_found"
+                break
+            if not next_anchor:
+                exit_reason = "missing_anchor"
+                break
+            if next_anchor in seen_anchors:
+                exit_reason = "anchor_loop"
                 break
             seen_anchors.add(next_anchor)
             anchor = next_anchor
 
-        return ChatHistoryBounds(
+        bounds = ChatHistoryBounds(
             earliest_content_at=earliest_content_at,
             final_content_at=final_content_at,
         )
+        elapsed_s = perf_counter() - started
+        self._emit_scan_summary(
+            progress_callback,
+            scan_phase="bounds_scan",
+            elapsed_s=elapsed_s,
+            exit_reason=exit_reason,
+            pages_scanned=pages_scanned,
+            history_source=history_source or "napcat_http",
+            earliest_content_at=earliest_content_at,
+            final_content_at=final_content_at,
+        )
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.get_history_bounds",
+            status="done",
+            elapsed_s=elapsed_s,
+            need_earliest=need_earliest,
+            need_final=need_final,
+            pages_scanned=pages_scanned,
+            history_source=history_source or "napcat_http",
+            exit_reason=exit_reason,
+        )
+        return bounds
 
     def fetch_snapshot_between(
         self,
@@ -369,6 +624,7 @@ class NapCatHistoryProvider:
                 "ExportRequest.since and ExportRequest.until are required for interval export."
             )
 
+        started = perf_counter()
         lower_bound = min(request.since, request.until).astimezone(EXPORT_TIMEZONE)
         upper_bound = max(request.since, request.until).astimezone(EXPORT_TIMEZONE)
         anchor: str | None = None
@@ -380,6 +636,15 @@ class NapCatHistoryProvider:
         effective_base_page_size = current_page_size
         fast_page_streak = 0
         history_source: str | None = None
+        exit_reason = "completed"
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot_between",
+            status="start",
+            since=lower_bound.isoformat(),
+            until=upper_bound.isoformat(),
+            page_size=effective_base_page_size,
+        )
 
         while True:
             snapshot, page_metrics = self._fetch_history_page(
@@ -392,6 +657,7 @@ class NapCatHistoryProvider:
             )
             page_messages = self._extract_messages(snapshot.messages)
             if not page_messages:
+                exit_reason = "empty_page"
                 break
             pages_scanned += 1
             history_source = str(
@@ -427,15 +693,19 @@ class NapCatHistoryProvider:
                 page_duration_s=page_metrics["page_duration_s"],
                 fast_page_streak=fast_page_streak,
                 history_source=str(page_metrics.get("history_source") or ""),
+                progress_callback=progress_callback,
+                mode="interval_scan",
             )
 
             next_anchor = _history_anchor(page_messages[0])
-            if (
-                oldest_dt <= lower_bound
-                or newest_dt < lower_bound
-                or not next_anchor
-                or next_anchor in seen_anchors
-            ):
+            if oldest_dt <= lower_bound or newest_dt < lower_bound:
+                exit_reason = "crossed_lower_bound"
+                break
+            if not next_anchor:
+                exit_reason = "missing_anchor"
+                break
+            if next_anchor in seen_anchors:
+                exit_reason = "anchor_loop"
                 break
             seen_anchors.add(next_anchor)
             anchor = next_anchor
@@ -456,7 +726,30 @@ class NapCatHistoryProvider:
             },
             messages=selected_messages,
         )
-        return self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+        finalized = self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+        elapsed_s = perf_counter() - started
+        self._emit_scan_summary(
+            progress_callback,
+            scan_phase="interval_scan",
+            elapsed_s=elapsed_s,
+            exit_reason=exit_reason,
+            pages_scanned=pages_scanned,
+            matched_messages=len(selected_messages),
+            history_source=history_source or "napcat_http",
+            since=lower_bound.isoformat(),
+            until=upper_bound.isoformat(),
+        )
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot_between",
+            status="done",
+            elapsed_s=elapsed_s,
+            pages_scanned=pages_scanned,
+            message_count=len(selected_messages),
+            history_source=history_source or "napcat_http",
+            exit_reason=exit_reason,
+        )
+        return finalized
 
     def fetch_snapshot_tail_between(
         self,
@@ -473,6 +766,7 @@ class NapCatHistoryProvider:
         if data_count <= 0:
             raise ValueError("data_count must be positive for tail interval export.")
 
+        started = perf_counter()
         lower_bound = min(request.since, request.until).astimezone(EXPORT_TIMEZONE)
         upper_bound = max(request.since, request.until).astimezone(EXPORT_TIMEZONE)
         anchor: str | None = None
@@ -484,6 +778,16 @@ class NapCatHistoryProvider:
         effective_base_page_size = current_page_size
         fast_page_streak = 0
         history_source: str | None = None
+        exit_reason = "completed"
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot_tail_between",
+            status="start",
+            since=lower_bound.isoformat(),
+            until=upper_bound.isoformat(),
+            requested_data_count=data_count,
+            page_size=effective_base_page_size,
+        )
 
         while len(selected_messages) < data_count:
             snapshot, page_metrics = self._fetch_history_page(
@@ -496,6 +800,7 @@ class NapCatHistoryProvider:
             )
             page_messages = self._extract_messages(snapshot.messages)
             if not page_messages:
+                exit_reason = "empty_page"
                 break
             pages_scanned += 1
             history_source = str(
@@ -537,13 +842,18 @@ class NapCatHistoryProvider:
                 page_duration_s=page_metrics["page_duration_s"],
                 fast_page_streak=fast_page_streak,
                 history_source=str(page_metrics.get("history_source") or ""),
+                progress_callback=progress_callback,
+                mode="interval_tail_scan",
             )
             next_anchor = _history_anchor(page_messages[0])
-            if (
-                newest_dt < lower_bound
-                or not next_anchor
-                or next_anchor in seen_anchors
-            ):
+            if newest_dt < lower_bound:
+                exit_reason = "crossed_lower_bound"
+                break
+            if not next_anchor:
+                exit_reason = "missing_anchor"
+                break
+            if next_anchor in seen_anchors:
+                exit_reason = "anchor_loop"
                 break
             seen_anchors.add(next_anchor)
             anchor = next_anchor
@@ -566,7 +876,33 @@ class NapCatHistoryProvider:
             },
             messages=selected_messages,
         )
-        return self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+        finalized = self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+        elapsed_s = perf_counter() - started
+        if len(selected_messages) >= data_count:
+            exit_reason = "target_reached"
+        self._emit_scan_summary(
+            progress_callback,
+            scan_phase="interval_tail_scan",
+            elapsed_s=elapsed_s,
+            exit_reason=exit_reason,
+            pages_scanned=pages_scanned,
+            matched_messages=len(selected_messages),
+            requested_data_count=data_count,
+            history_source=history_source or "napcat_http",
+            since=lower_bound.isoformat(),
+            until=upper_bound.isoformat(),
+        )
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_snapshot_tail_between",
+            status="done",
+            elapsed_s=elapsed_s,
+            pages_scanned=pages_scanned,
+            message_count=len(selected_messages),
+            history_source=history_source or "napcat_http",
+            exit_reason=exit_reason,
+        )
+        return finalized
 
     def fetch_full_snapshot(
         self,
@@ -575,6 +911,7 @@ class NapCatHistoryProvider:
         page_size: int = 100,
         progress_callback: HistoryProgressCallback | None = None,
     ) -> SourceChatSnapshot:
+        started = perf_counter()
         anchor: str | None = None
         collected_messages: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
@@ -586,6 +923,13 @@ class NapCatHistoryProvider:
         effective_base_page_size = current_page_size
         fast_page_streak = 0
         history_source: str | None = None
+        exit_reason = "completed"
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_full_snapshot",
+            status="start",
+            page_size=effective_base_page_size,
+        )
 
         while True:
             snapshot, page_metrics = self._fetch_history_page(
@@ -598,6 +942,7 @@ class NapCatHistoryProvider:
             )
             page_messages = self._extract_messages(snapshot.messages)
             if not page_messages:
+                exit_reason = "empty_page"
                 break
             pages_scanned += 1
             history_source = str(
@@ -631,9 +976,15 @@ class NapCatHistoryProvider:
                 page_duration_s=page_metrics["page_duration_s"],
                 fast_page_streak=fast_page_streak,
                 history_source=str(page_metrics.get("history_source") or ""),
+                progress_callback=progress_callback,
+                mode="full_scan",
             )
             next_anchor = _history_anchor(page_messages[0])
-            if not next_anchor or next_anchor in seen_anchors:
+            if not next_anchor:
+                exit_reason = "missing_anchor"
+                break
+            if next_anchor in seen_anchors:
+                exit_reason = "anchor_loop"
                 break
             seen_anchors.add(next_anchor)
             anchor = next_anchor
@@ -660,7 +1011,30 @@ class NapCatHistoryProvider:
             },
             messages=collected_messages,
         )
-        return self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+        finalized = self._finalize_snapshot(snapshot, progress_callback=progress_callback)
+        elapsed_s = perf_counter() - started
+        self._emit_scan_summary(
+            progress_callback,
+            scan_phase="full_scan",
+            elapsed_s=elapsed_s,
+            exit_reason=exit_reason,
+            pages_scanned=pages_scanned,
+            collected_messages=len(collected_messages),
+            history_source=history_source or "napcat_http",
+            earliest_content_at=earliest_content_at,
+            final_content_at=final_content_at,
+        )
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fetch_full_snapshot",
+            status="done",
+            elapsed_s=elapsed_s,
+            pages_scanned=pages_scanned,
+            message_count=len(collected_messages),
+            history_source=history_source or "napcat_http",
+            exit_reason=exit_reason,
+        )
+        return finalized
 
     def _extract_messages(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
@@ -693,6 +1067,7 @@ class NapCatHistoryProvider:
                     before_message_seq=before_message_seq,
                     count=requested_count,
                     include_forward_details=False,
+                    progress_callback=progress_callback,
                 )
             except (httpx.ReadTimeout, NapCatApiTimeoutError):
                 next_count = max(MIN_HISTORY_PAGE_SIZE, requested_count // 2)
@@ -713,11 +1088,41 @@ class NapCatHistoryProvider:
                             "retry_count": attempts,
                         }
                     )
+                    progress_callback(
+                        {
+                            "phase": "history_page_done",
+                            "mode": mode,
+                            "before_message_seq": before_message_seq,
+                            "requested_count": requested_count,
+                            "history_source": "timeout",
+                            "page_duration_s": round(perf_counter() - started, 4),
+                            "page_message_count": 0,
+                            "retry_count": attempts,
+                            "status": "retry",
+                        }
+                    )
                 requested_count = next_count
                 continue
 
             page_duration_s = perf_counter() - started
             page_messages = self._extract_messages(snapshot.messages)
+            self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "history_page_done",
+                    "mode": mode,
+                    "before_message_seq": before_message_seq,
+                    "requested_count": requested_count,
+                    "history_source": snapshot.metadata.get("source"),
+                    "page_duration_s": round(page_duration_s, 4),
+                    "page_message_count": len(page_messages),
+                    "retry_count": attempts - 1,
+                    "status": "done",
+                    "page_oldest_content_at": _message_datetime(page_messages[0]) if page_messages else None,
+                    "page_newest_content_at": _message_datetime(page_messages[-1]) if page_messages else None,
+                    "page_anchor": _history_anchor(page_messages[0]) if page_messages else None,
+                },
+            )
             return (
                 snapshot,
                 {
@@ -735,7 +1140,15 @@ class NapCatHistoryProvider:
         *,
         progress_callback: HistoryProgressCallback | None = None,
     ) -> SourceChatSnapshot:
+        started = perf_counter()
         source = str(snapshot.metadata.get("source") or "").strip()
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.finalize_snapshot",
+            status="start",
+            history_source=source or "napcat_http",
+            message_count=len(snapshot.messages),
+        )
         enriched_count, structure_unavailable_count = self._enrich_forward_details(
             snapshot.messages,
             chat_type=snapshot.chat_type,
@@ -744,13 +1157,34 @@ class NapCatHistoryProvider:
             progress_callback=progress_callback,
         )
         if enriched_count <= 0 and structure_unavailable_count <= 0:
+            self._emit_pipeline_stage(
+                progress_callback,
+                stage="provider.finalize_snapshot",
+                status="done",
+                elapsed_s=perf_counter() - started,
+                history_source=source or "napcat_http",
+                message_count=len(snapshot.messages),
+                forward_detail_count=0,
+                forward_structure_unavailable_count=0,
+            )
             return snapshot
         metadata = dict(snapshot.metadata)
         if enriched_count > 0:
             metadata["forward_detail_count"] = enriched_count
         if structure_unavailable_count > 0:
             metadata["forward_structure_unavailable_count"] = structure_unavailable_count
-        return snapshot.model_copy(update={"metadata": metadata})
+        finalized = snapshot.model_copy(update={"metadata": metadata})
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.finalize_snapshot",
+            status="done",
+            elapsed_s=perf_counter() - started,
+            history_source=source or "napcat_http",
+            message_count=len(snapshot.messages),
+            forward_detail_count=enriched_count,
+            forward_structure_unavailable_count=structure_unavailable_count,
+        )
+        return finalized
 
     def _enrich_forward_details(
         self,
@@ -761,9 +1195,17 @@ class NapCatHistoryProvider:
         skip_history_retry: bool = False,
         progress_callback: HistoryProgressCallback | None = None,
     ) -> tuple[int, int]:
+        started = perf_counter()
         cache: dict[str, list[dict[str, Any]] | None] = {}
         parse_mult_cache: dict[str, bool] = {}
         structure_unavailable = 0
+        history_retry_calls = 0
+        history_retry_hits = 0
+        get_forward_msg_calls = 0
+        get_forward_msg_hits = 0
+        known_history_unavailable_hits = 0
+        known_forward_unavailable_hits = 0
+        cache_hits = 0
         already_resolved = sum(
             1
             for message in messages
@@ -788,6 +1230,7 @@ class NapCatHistoryProvider:
             ):
                 if message_key in self._known_unavailable_history_keys:
                     parse_mult_cache[message_key] = False
+                    known_history_unavailable_hits += 1
                     if self._mark_forward_target_unavailable(
                         target,
                         reason=self._known_unavailable_history_keys[message_key]
@@ -795,12 +1238,15 @@ class NapCatHistoryProvider:
                     ):
                         structure_unavailable += 1
                 else:
+                    history_retry_calls += 1
                     hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
                         target["message"],
                         chat_type=chat_type,
                         chat_id=chat_id,
                     )
                     parse_mult_cache[message_key] = hydrated_via_history
+                    if hydrated_via_history:
+                        history_retry_hits += 1
                     if known_history_unavailable:
                         self._known_unavailable_history_keys[message_key] = known_history_unavailable
                         if self._mark_forward_target_unavailable(
@@ -826,9 +1272,11 @@ class NapCatHistoryProvider:
 
             forward_id = target["forward_id"]
             if forward_id in self._known_unavailable_forward_ids:
+                known_forward_unavailable_hits += 1
                 cache[forward_id] = None
                 recovered_via_history = False
                 if message_key:
+                    history_retry_calls += 1
                     hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
                         target["message"],
                         chat_type=chat_type,
@@ -836,6 +1284,7 @@ class NapCatHistoryProvider:
                     )
                     parse_mult_cache[message_key] = hydrated_via_history
                     if hydrated_via_history:
+                        history_retry_hits += 1
                         enriched += 1
                         cache[forward_id] = []
                         recovered_via_history = True
@@ -851,6 +1300,7 @@ class NapCatHistoryProvider:
                 ):
                     structure_unavailable += 1
             if forward_id not in cache:
+                get_forward_msg_calls += 1
                 try:
                     response = self._client.get_forward_msg(forward_id)
                 except (NapCatApiError, httpx.HTTPError) as exc:
@@ -860,6 +1310,7 @@ class NapCatHistoryProvider:
                         self._known_unavailable_forward_ids[forward_id] = known_forward_unavailable
                         recovered_via_history = False
                         if message_key:
+                            history_retry_calls += 1
                             hydrated_via_history, known_history_unavailable = self._hydrate_forward_message_via_history(
                                 target["message"],
                                 chat_type=chat_type,
@@ -867,6 +1318,7 @@ class NapCatHistoryProvider:
                             )
                             parse_mult_cache[message_key] = hydrated_via_history
                             if hydrated_via_history:
+                                history_retry_hits += 1
                                 enriched += 1
                                 cache[forward_id] = []
                                 recovered_via_history = True
@@ -892,6 +1344,10 @@ class NapCatHistoryProvider:
                         if isinstance(value, list)
                         else None
                     )
+                    if cache[forward_id]:
+                        get_forward_msg_hits += 1
+            else:
+                cache_hits += 1
             resolved_messages = cache.get(forward_id)
             if resolved_messages:
                 target["attach"][target["key"]] = resolved_messages
@@ -907,6 +1363,25 @@ class NapCatHistoryProvider:
                         "resolved_forwards": enriched,
                     }
                 )
+        self._emit_progress(
+            progress_callback,
+            {
+                "phase": "forward_expand_summary",
+                "elapsed_s": round(perf_counter() - started, 4),
+                "total_forwards": total_targets,
+                "processed_forwards": processed,
+                "resolved_forwards": enriched,
+                "already_resolved": already_resolved,
+                "structure_unavailable_count": structure_unavailable,
+                "history_retry_calls": history_retry_calls,
+                "history_retry_hits": history_retry_hits,
+                "get_forward_msg_calls": get_forward_msg_calls,
+                "get_forward_msg_hits": get_forward_msg_hits,
+                "known_history_unavailable_hits": known_history_unavailable_hits,
+                "known_forward_unavailable_hits": known_forward_unavailable_hits,
+                "cache_hits": cache_hits,
+            },
+        )
         return enriched, structure_unavailable
 
     @staticmethod
@@ -1328,6 +1803,14 @@ class NapCatHistoryProvider:
         pages_scanned = 0
         chunk_count = 0
         total_started = perf_counter()
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fast_tail_bulk",
+            status="start",
+            requested_data_count=data_count,
+            page_size=page_size,
+            chunk_limit=chunk_limit,
+        )
 
         while len(collected_messages) < data_count:
             remaining = data_count - len(collected_messages)
@@ -1341,7 +1824,40 @@ class NapCatHistoryProvider:
             )
             if payload is None:
                 if chunk_count <= 0:
+                    self._emit_pipeline_stage(
+                        progress_callback,
+                        stage="provider.fast_tail_bulk",
+                        status="done",
+                        elapsed_s=perf_counter() - total_started,
+                        requested_data_count=data_count,
+                        pages_scanned=pages_scanned,
+                        bulk_chunks=chunk_count,
+                        exit_reason="unavailable_initial",
+                    )
                     return None
+                self._emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "tail_bulk_summary",
+                        "status": "fallback",
+                        "requested_data_count": data_count,
+                        "pages_scanned": pages_scanned,
+                        "bulk_chunks": chunk_count,
+                        "bulk_chunk_limit": chunk_limit,
+                        "elapsed_s": round(perf_counter() - total_started, 4),
+                        "exit_reason": "bulk_route_unavailable_after_partial",
+                    },
+                )
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fast_tail_bulk",
+                    status="done",
+                    elapsed_s=perf_counter() - total_started,
+                    requested_data_count=data_count,
+                    pages_scanned=pages_scanned,
+                    bulk_chunks=chunk_count,
+                    exit_reason="partial_fallback",
+                )
                 return {
                     "messages": collected_messages,
                     "seen_keys": seen_keys,
@@ -1379,6 +1895,43 @@ class NapCatHistoryProvider:
             )
             exhausted = bool(payload.get("exhausted"))
             total_duration_s = round(perf_counter() - total_started, 4)
+            self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "history_page_done",
+                    "mode": "tail_scan",
+                    "history_source": "napcat_fast_history_bulk",
+                    "status": "done",
+                    "page_duration_s": chunk_duration_s,
+                    "page_message_count": len(chunk_messages),
+                    "page_size": int(payload.get("page_size") or page_size),
+                    "requested_count": chunk_target,
+                    "retry_count": 0,
+                    "chunk_index": chunk_count,
+                    "chunk_added": added,
+                    "pages_scanned": pages_scanned,
+                    "next_anchor": next_anchor,
+                    "oldest_content_at": oldest_dt,
+                    "newest_content_at": newest_dt,
+                },
+            )
+            self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "tail_bulk_chunk",
+                    "status": "done",
+                    "chunk_index": chunk_count,
+                    "chunk_target": chunk_target,
+                    "chunk_added": added,
+                    "chunk_messages": len(chunk_messages),
+                    "chunk_duration_s": chunk_duration_s,
+                    "total_duration_s": total_duration_s,
+                    "pages_scanned": pages_scanned,
+                    "next_anchor": next_anchor,
+                    "exhausted": exhausted,
+                    "requested_data_count": data_count,
+                },
+            )
             if progress_callback is not None:
                 progress_callback(
                     {
@@ -1402,6 +1955,29 @@ class NapCatHistoryProvider:
                 )
 
             if len(collected_messages) >= data_count or exhausted:
+                self._emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "tail_bulk_summary",
+                        "status": "done",
+                        "requested_data_count": data_count,
+                        "pages_scanned": pages_scanned,
+                        "bulk_chunks": chunk_count,
+                        "bulk_chunk_limit": chunk_limit,
+                        "elapsed_s": total_duration_s,
+                        "exit_reason": "target_reached" if len(collected_messages) >= data_count else "exhausted",
+                    },
+                )
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fast_tail_bulk",
+                    status="done",
+                    elapsed_s=perf_counter() - total_started,
+                    requested_data_count=data_count,
+                    pages_scanned=pages_scanned,
+                    bulk_chunks=chunk_count,
+                    exit_reason="target_reached" if len(collected_messages) >= data_count else "exhausted",
+                )
                 return {
                     "messages": collected_messages,
                     "seen_keys": seen_keys,
@@ -1431,6 +2007,29 @@ class NapCatHistoryProvider:
                 if bridged is not None:
                     pages_scanned = int(bridged["pages_scanned"])
                     if bridged["completed"]:
+                        self._emit_progress(
+                            progress_callback,
+                            {
+                                "phase": "tail_bulk_summary",
+                                "status": "done",
+                                "requested_data_count": data_count,
+                                "pages_scanned": pages_scanned,
+                                "bulk_chunks": chunk_count,
+                                "bulk_chunk_limit": chunk_limit,
+                                "elapsed_s": round(perf_counter() - total_started, 4),
+                                "exit_reason": "boundary_bridge_completed",
+                            },
+                        )
+                        self._emit_pipeline_stage(
+                            progress_callback,
+                            stage="provider.fast_tail_bulk",
+                            status="done",
+                            elapsed_s=perf_counter() - total_started,
+                            requested_data_count=data_count,
+                            pages_scanned=pages_scanned,
+                            bulk_chunks=chunk_count,
+                            exit_reason="boundary_bridge_completed",
+                        )
                         return {
                             "messages": collected_messages,
                             "seen_keys": seen_keys,
@@ -1452,6 +2051,29 @@ class NapCatHistoryProvider:
                         seen_anchors.add(bridge_next_anchor)
                         anchor = bridge_next_anchor
                         continue
+                self._emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "tail_bulk_summary",
+                        "status": "fallback",
+                        "requested_data_count": data_count,
+                        "pages_scanned": pages_scanned,
+                        "bulk_chunks": chunk_count,
+                        "bulk_chunk_limit": chunk_limit,
+                        "elapsed_s": total_duration_s,
+                        "exit_reason": "boundary_stall",
+                    },
+                )
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.fast_tail_bulk",
+                    status="done",
+                    elapsed_s=perf_counter() - total_started,
+                    requested_data_count=data_count,
+                    pages_scanned=pages_scanned,
+                    bulk_chunks=chunk_count,
+                    exit_reason="boundary_stall",
+                )
                 return {
                     "messages": collected_messages,
                     "seen_keys": seen_keys,
@@ -1468,6 +2090,29 @@ class NapCatHistoryProvider:
             seen_anchors.add(next_anchor)
             anchor = next_anchor
 
+        self._emit_progress(
+            progress_callback,
+            {
+                "phase": "tail_bulk_summary",
+                "status": "done",
+                "requested_data_count": data_count,
+                "pages_scanned": pages_scanned,
+                "bulk_chunks": chunk_count,
+                "bulk_chunk_limit": chunk_limit,
+                "elapsed_s": round(perf_counter() - total_started, 4),
+                "exit_reason": "loop_completed",
+            },
+        )
+        self._emit_pipeline_stage(
+            progress_callback,
+            stage="provider.fast_tail_bulk",
+            status="done",
+            elapsed_s=perf_counter() - total_started,
+            requested_data_count=data_count,
+            pages_scanned=pages_scanned,
+            bulk_chunks=chunk_count,
+            exit_reason="loop_completed",
+        )
         return {
             "messages": collected_messages,
             "seen_keys": seen_keys,
@@ -1498,6 +2143,18 @@ class NapCatHistoryProvider:
         if not anchor or remaining <= 0:
             return None
         bridge_count = max(1, min(page_size, remaining))
+        started = perf_counter()
+        self._emit_progress(
+            progress_callback,
+            {
+                "phase": "tail_boundary_bridge",
+                "status": "start",
+                "anchor": anchor,
+                "remaining": remaining,
+                "bridge_count": bridge_count,
+                "pages_scanned": pages_scanned,
+            },
+        )
         snapshot, page_metrics = self._fetch_history_page(
             request,
             before_message_seq=anchor,
@@ -1508,6 +2165,18 @@ class NapCatHistoryProvider:
         )
         page_messages = self._extract_messages(snapshot.messages)
         if not page_messages:
+            self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "tail_boundary_bridge",
+                    "status": "empty",
+                    "anchor": anchor,
+                    "remaining": remaining,
+                    "bridge_count": bridge_count,
+                    "pages_scanned": pages_scanned,
+                    "elapsed_s": round(perf_counter() - started, 4),
+                },
+            )
             return None
         pages_scanned += 1
         oldest_dt = _message_datetime(page_messages[0])
@@ -1537,6 +2206,22 @@ class NapCatHistoryProvider:
                     **page_metrics,
                 }
             )
+        self._emit_progress(
+            progress_callback,
+            {
+                "phase": "tail_boundary_bridge",
+                "status": "done",
+                "anchor": anchor,
+                "remaining": remaining,
+                "bridge_count": bridge_count,
+                "pages_scanned": pages_scanned,
+                "added": added,
+                "next_anchor": next_anchor,
+                "elapsed_s": round(perf_counter() - started, 4),
+                "history_source": snapshot.metadata.get("source"),
+                "page_duration_s": page_metrics.get("page_duration_s"),
+            },
+        )
         if added <= 0:
             return None
         return {
@@ -1557,6 +2242,8 @@ class NapCatHistoryProvider:
         page_duration_s: float,
         fast_page_streak: int,
         history_source: str,
+        progress_callback: HistoryProgressCallback | None = None,
+        mode: str | None = None,
     ) -> tuple[int, int]:
         slow_page_threshold_s = (
             FAST_PLUGIN_SLOW_HISTORY_PAGE_SECONDS
@@ -1567,7 +2254,22 @@ class NapCatHistoryProvider:
             current_page_size > MIN_HISTORY_PAGE_SIZE
             and page_duration_s >= slow_page_threshold_s
         ):
-            return max(MIN_HISTORY_PAGE_SIZE, current_page_size // 2), 0
+            new_page_size = max(MIN_HISTORY_PAGE_SIZE, current_page_size // 2)
+            self._emit_progress(
+                progress_callback,
+                {
+                    "phase": "page_size_adapt",
+                    "mode": mode,
+                    "history_source": history_source,
+                    "old_page_size": current_page_size,
+                    "new_page_size": new_page_size,
+                    "page_duration_s": round(page_duration_s, 4),
+                    "page_message_count": page_message_count,
+                    "fast_page_streak": fast_page_streak,
+                    "decision": "shrink",
+                },
+            )
+            return new_page_size, 0
 
         if (
             current_page_size < base_page_size
@@ -1576,11 +2278,40 @@ class NapCatHistoryProvider:
         ):
             fast_page_streak += 1
             if fast_page_streak >= 2:
-                return min(
+                new_page_size = min(
                     base_page_size, current_page_size + FAST_HISTORY_RECOVERY_STEP
-                ), 0
+                )
+                self._emit_progress(
+                    progress_callback,
+                    {
+                        "phase": "page_size_adapt",
+                        "mode": mode,
+                        "history_source": history_source,
+                        "old_page_size": current_page_size,
+                        "new_page_size": new_page_size,
+                        "page_duration_s": round(page_duration_s, 4),
+                        "page_message_count": page_message_count,
+                        "fast_page_streak": fast_page_streak,
+                        "decision": "recover",
+                    },
+                )
+                return new_page_size, 0
             return current_page_size, fast_page_streak
 
+        self._emit_progress(
+            progress_callback,
+            {
+                "phase": "page_size_adapt",
+                "mode": mode,
+                "history_source": history_source,
+                "old_page_size": current_page_size,
+                "new_page_size": current_page_size,
+                "page_duration_s": round(page_duration_s, 4),
+                "page_message_count": page_message_count,
+                "fast_page_streak": fast_page_streak,
+                "decision": "hold",
+            },
+        )
         return current_page_size, 0
 
     def _normalize_requested_page_size(self, page_size: int) -> int:

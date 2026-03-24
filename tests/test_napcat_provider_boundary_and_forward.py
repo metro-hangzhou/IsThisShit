@@ -476,3 +476,34 @@ def test_match_message_by_seq_does_not_accept_single_mismatched_message_with_seq
     payload = [{"message_seq": "9999", "message": [{"type": "forward", "data": {"content": "x"}}]}]
 
     assert provider._match_message_by_seq(payload, "1000") is None
+
+
+def test_collect_fast_history_tail_bulk_emits_history_page_done_for_bulk_chunks() -> None:
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=object())
+    progress: list[dict[str, object]] = []
+
+    def fake_fetch_fast_history_tail_bulk(*args, **kwargs):
+        return {
+            "messages": [_message("m1", "1"), _message("m2", "2")],
+            "pages_scanned": 2,
+            "next_anchor": "anchor-2",
+            "page_size": 200,
+            "exhausted": True,
+        }
+
+    provider._fetch_fast_history_tail_bulk = fake_fetch_fast_history_tail_bulk  # type: ignore[method-assign]
+
+    state = provider._collect_fast_history_tail_bulk(
+        _request(),
+        data_count=3,
+        page_size=200,
+        progress_callback=progress.append,
+    )
+
+    assert state is not None
+    history_page_events = [row for row in progress if row.get("phase") == "history_page_done"]
+    assert len(history_page_events) == 1
+    assert history_page_events[0]["mode"] == "tail_scan"
+    assert history_page_events[0]["history_source"] == "napcat_fast_history_bulk"
+    assert history_page_events[0]["page_message_count"] == 2
+    assert history_page_events[0]["requested_count"] == 3

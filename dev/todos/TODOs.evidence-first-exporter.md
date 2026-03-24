@@ -128,6 +128,110 @@ The latest strict audit found the remaining non-evidence decisions concentrated 
   - slowest `materialize_asset_substep`: `context_hydration(video)=0.614s`
   - no `media_resolution_substep` timeout events remain in the full trace
 
+## [2026-03-24] Regression Comparison: current actionable=6 vs last actionable=0 baseline
+
+- last actionable-zero full-export baseline:
+  - data:
+    - `exports/group_922065597_20260324_011430_476759.jsonl`
+  - manifest:
+    - `exports/group_922065597_20260324_011430_476759.manifest.json`
+  - trace:
+    - `state/export_perf/cli_export_group_922065597_20260324_011320_022564_119740.jsonl`
+  - baseline result:
+    - `actionable_missing=0`
+    - `background_missing=1240`
+    - `final_missing_reason=[qq_expired_after_napcat:1154, qq_not_downloaded_local_placeholder:86]`
+
+- current regressed full export:
+  - data:
+    - `exports/group_922065597_20260324_175228_915207.jsonl`
+  - manifest:
+    - `exports/group_922065597_20260324_175228_915207.manifest.json`
+  - trace/report:
+    - `state/export_perf/cli_export_group_922065597_20260324_175137_771039_36128.jsonl`
+    - `state/export_perf/cli_export_group_922065597_20260324_175137_771039_36128.report.json`
+  - regressed result:
+    - `actionable_missing=6`
+    - `background_missing=1234`
+    - `final_missing_reason=[missing_after_napcat:6, qq_expired_after_napcat:1157, qq_not_downloaded_local_placeholder:77]`
+
+- currently known diff:
+  - all `6` newly actionable assets are top-level `image`
+  - all `6` previously resolved to:
+    - `qq_not_downloaded_local_placeholder`
+  - all `6` now resolve to:
+    - `missing_after_napcat`
+  - all `6` share the same evidence shape:
+    - stale/placeholder local path
+    - direct `file_id`
+    - relative `/gchatpic_new/...` hint URL
+    - successful `public_token_get_image`
+    - failed `public_token_get_image_remote_url`
+
+- regression triage checklist:
+  - [ ] diff `final_missing_reason` against the last actionable-zero baseline
+  - [ ] diff `actionable_missing_reason` / newly reintroduced actionable assets only
+  - [ ] diff retry-window count and exact windows when present
+  - [ ] diff `history_source`
+  - [ ] diff `forward_detail_count`
+  - [ ] diff `prefetch_chunks / prefetch_timeout_count`
+  - [ ] diff top slow stages
+  - [ ] diff top slow asset substeps
+  - [ ] explain whether the regression is:
+    - route-plan drift
+    - terminal-classification drift
+    - instrumentation-only side effect
+
+- required output for future full-export regressions:
+  - [ ] `newly regressed assets only`
+  - [ ] `same assets but slower route plan`
+  - [ ] `same result but observability-only change` verdict
+
+## [2026-03-24] New Regression To Eliminate Before Next Broad Validation
+
+- latest full export regression artifact:
+  - trace: `D:\Coding_Project\IsThisShit\state\export_perf\cli_export_group_922065597_20260324_175137_771039_36128.jsonl`
+  - report: `D:\Coding_Project\IsThisShit\state\export_perf\cli_export_group_922065597_20260324_175137_771039_36128.report.json`
+  - manifest: `D:\Coding_Project\IsThisShit\exports\group_922065597_20260324_175228_915207.manifest.json`
+- baseline zero-actionable references that this regression must be compared against:
+  - `D:\Coding_Project\IsThisShit\state\export_perf\cli_export_group_922065597_20260323_034139_599938_98080.jsonl`
+  - `D:\Coding_Project\IsThisShit\state\export_perf\cli_export_group_922065597_20260323_044222_445135_101008.jsonl`
+  - `D:\Coding_Project\gittest20260316_t1\IsThisShit\exports\group_922065597_20260323_153041_110212.manifest.json`
+- regression signature:
+  - baseline: `records=12593`, `actionable_missing=0`
+  - latest: `records=12593`, `actionable_missing=6`, `background_missing=1234`
+  - latest new retry windows:
+    - `2025-12-08_14-06-41 .. 14-07-11`
+    - `2025-12-14_22-16-54 .. 22-17-24`
+    - `2025-12-17_20-04-24 .. 20-04-54`
+    - `2026-01-05_21-00-34 .. 21-01-04`
+    - `2026-01-06_09-33-09 .. 09-33-39`
+    - `2026-01-15_14-50-01 .. 14-50-31`
+- shared evidence shape across all 6 latest actionable misses:
+  - top-level `image`
+  - stale local `source_path`
+  - direct `file_id`/public-token handle exists
+  - `context_hydration` ran and still produced no resolved local path
+  - `public_token_get_image` succeeded but only yielded remote URL
+  - `public_token_get_image_remote_url` then failed on the public remote URL
+  - final classifier still returned `missing_after_napcat`
+- working hypothesis:
+  - `public-token image` classification still contains a residual proxy/age gate
+  - evidence is already sufficient to classify terminally, but `_classify_missing_from_public_payload(...)` is still guarded by `old_bucket/expired_candidate` in a way that recent top-level images do not cross
+- required fix:
+  - remove the residual age gate from top-level image terminal classification in the public-token path
+  - classifier must use the complete evidence chain directly:
+    - no resolved local path
+    - no unexhausted live remote URL
+    - stale/zero local hint or other broken local evidence
+    - public-token route exhausted
+    - authoritative remote failure evidence from the public remote URL when available
+- validation rule for this regression:
+  - do not rerun full export first
+  - first add unit/simulator coverage for this exact top-level image public-token failure shape
+  - then run targeted retests for the 6 new retry windows
+  - only when those windows return `actionable_missing=0` should broad full-export validation be paid again
+
 ## Remaining Non-Evidence Decisions After This Pass
 
 The main remaining non-evidence control-flow is now concentrated in downloader route planning and pool shaping:
@@ -146,6 +250,93 @@ The main remaining non-evidence control-flow is now concentrated in downloader r
   - `actionable_missing=0`
   - stable `history_source`
   - no material benchmark regression vs current baseline
+
+### Release Gate: correctness baseline
+
+- do not sync release lines if the latest full export on `922065597` regresses from the last actionable-zero baseline
+- `actionable_missing=0` is a hard gate
+- if the gate is violated:
+  - targeted retests must converge first
+  - only then is another full export considered authoritative
+
+## Track 7. Export Perf Report Contract
+
+- [x] persist `total_elapsed_s` alongside `elapsed_s` for stable report consumers
+- [x] emit non-empty `history_page_breakdown` for fast-bulk tail fetches via synthetic chunk-backed page rows
+- [x] emit explicit:
+  - `materialize_stage_breakdown`
+  - `materialize_asset_breakdown`
+- [ ] define required sections for every full-export performance report:
+  - fetch stage breakdown
+  - page/chunk breakdown
+  - forward expand breakdown
+  - materialize stage breakdown
+  - top slow assets
+  - top slow substeps
+- [ ] fail validation if a covered stage produces an unexpectedly empty report section
+
+## Track 8. Phase Metadata Normalization
+
+- [x] extend materialize report schema so grouped rows keep:
+  - `asset_type`
+  - `asset_role`
+  - `status`
+  - `resolver`
+  - `missing_kind`
+  - `substep`
+- [x] instrument local materialization internals with per-substep timing for:
+  - `allocate_export_path`
+  - `ensure_export_parent`
+  - `copy_asset_file`
+  - second-pass identity reuse / public retry / second-pass copy
+- [ ] normalize shared perf-event metadata across:
+  - fetch/page scan
+  - forward expansion
+  - materialize first pass
+  - materialize second pass
+- [ ] make byte-size metadata mandatory where a file copy or remote download actually completed
+
+## Track 9. Fetch/Scan Hotspot Reduction
+
+- [x] confirm from the `20260324` full-export report that the main fetch hotspot is `forward_hydrate_s`, not raw `fast_tail_bulk`
+- [ ] add first-class perf rows for each bulk forward-hydrate window/chunk so the `35s+` tail forward cost is decomposed instead of living only in `scan_summary`
+- [ ] quantify zero-hit retry work inside finalize/forward enrichment:
+  - `history_retry_calls`
+  - `history_retry_hits`
+  - `get_forward_msg_calls`
+  - `get_forward_msg_hits`
+- [ ] gate forward-history retries on stronger evidence when the current run already predicts zero recovery value
+
+## Track 10. Full Export Perf Gate
+
+- [ ] compare every new full export against the last actionable-zero baseline on:
+  - total elapsed
+  - fetch elapsed
+  - materialize elapsed
+  - forward hydrate elapsed
+  - top slow asset p95/p99
+- [ ] define an explicit acceptable regression budget instead of only saying `no material benchmark regression`
+
+## Track 11. Replay Diff Reporter
+
+- [ ] emit a fixed diff summary for baseline-vs-current full exports:
+  - newly regressed assets only
+  - same assets but slower route plan
+  - new empty report sections
+  - stage delta table vs baseline
+
+## Track 12. Perf Review Board
+
+- [ ] maintain a ranked optimization queue grouped by:
+  - high ROI
+  - correctness-sensitive
+  - observability gap
+  - external NapCat-bound
+- [ ] keep the current top-ranked buckets visible:
+  - bulk forward hydrate cost inside fetch
+  - zero-hit finalize/forward retries
+  - local copy/finalize I/O inside `media_bundle.py`
+  - aggregate image public/remote checks that are individually cheap but numerous
 
 ## Track 1. Evidence-First Terminal Classification
 
@@ -297,9 +488,22 @@ Remaining work:
   - target:
     - split:
       - hard terminal structure-unavailable
-      - transient route failure
-      - parse-mult/history mismatch
+    - transient route failure
+    - parse-mult/history mismatch
     - do not let one coarse failure family suppress all later forward retries
+
+## Track 6. Instrumentation-Driven Regression Triage
+
+- [ ] keep the last actionable-zero full export as an explicit comparison baseline
+- [ ] compare every new full export against that baseline before treating a run as healthy
+- [ ] explain every newly reintroduced actionable asset
+- [ ] explain every empty or partial report field
+- [ ] maintain a benchmark comparison table for:
+  - fetch
+  - finalize
+  - materialize
+  - total elapsed
+- [ ] ensure observability changes are correctness-neutral before release sync
 
 ## Simulator Expansion Required
 
