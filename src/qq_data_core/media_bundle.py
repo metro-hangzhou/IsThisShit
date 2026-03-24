@@ -297,6 +297,7 @@ def materialize_snapshot_media(
                 )
     copied_map: dict[str, str] = {}
     recent_identity_reuse_map: dict[tuple[Any, ...], tuple[str, str | None, str | None]] = {}
+    future_local_identity_map = _build_future_local_identity_resolution_map(candidate_entries)
     occupied_export_paths: dict[str, str] = {}
     resolution_cache: dict[tuple[Any, ...], tuple[Path | None, str]] = {}
     assets: list[MaterializedAsset] = []
@@ -411,7 +412,14 @@ def materialize_snapshot_media(
                     file_name=candidate.file_name,
                     source_path=candidate.source_path,
                 )
-            if media_resolution_mode == "napcat_only":
+            future_local_identity = _lookup_future_local_identity_resolution(
+                candidate,
+                current_index=current_index,
+                future_identity_map=future_local_identity_map,
+            )
+            if future_local_identity is not None:
+                resolved_path, resolver = future_local_identity
+            elif media_resolution_mode == "napcat_only":
                 resolved_path, resolver = _resolve_candidate_path_napcat_only(
                     candidate,
                     media_download_manager=media_download_manager,
@@ -969,6 +977,45 @@ def _lookup_recent_identity_reuse(
         reused = reuse_map.get(identity_key)
         if reused is not None:
             return reused
+    return None
+
+
+def _build_future_local_identity_resolution_map(
+    candidate_entries: list[tuple[NormalizedMessage, _AssetCandidate]],
+) -> dict[tuple[Any, ...], list[tuple[int, Path, str]]]:
+    future_identity_map: dict[tuple[Any, ...], list[tuple[int, Path, str]]] = {}
+    for index, (_message, candidate) in enumerate(candidate_entries, start=1):
+        if candidate.asset_type != "image":
+            continue
+        if _candidate_has_forward_parent_hint(candidate):
+            continue
+        resolved_path = _existing_path(candidate.source_path)
+        if resolved_path is None:
+            continue
+        for identity_key in _asset_recent_identity_keys(candidate):
+            future_identity_map.setdefault(identity_key, []).append(
+                (index, resolved_path, "bundle_future_local_identity_evidence")
+            )
+    return future_identity_map
+
+
+def _lookup_future_local_identity_resolution(
+    candidate: _AssetCandidate,
+    *,
+    current_index: int,
+    future_identity_map: dict[tuple[Any, ...], list[tuple[int, Path, str]]],
+) -> tuple[Path, str] | None:
+    if candidate.asset_type != "image":
+        return None
+    if _candidate_has_forward_parent_hint(candidate):
+        return None
+    for identity_key in _asset_recent_identity_keys(candidate):
+        candidates = future_identity_map.get(identity_key)
+        if not candidates:
+            continue
+        for evidence_index, resolved_path, resolver in candidates:
+            if evidence_index > current_index:
+                return resolved_path, resolver
     return None
 
 

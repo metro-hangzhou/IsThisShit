@@ -26,6 +26,8 @@ FAST_HISTORY_PAGE_SECONDS = 0.75
 FAST_HISTORY_RECOVERY_STEP = 50
 MAX_HISTORY_TIMEOUT_RETRIES = 3
 FORWARD_ELEMENT_TYPE = 16
+SPARSE_TAIL_FORWARD_HYDRATE_MIN_WINDOW_MESSAGES = 100
+SPARSE_TAIL_FORWARD_HYDRATE_MAX_FORWARD_REFS = 2
 
 
 class NapCatHistoryProvider:
@@ -241,13 +243,31 @@ class NapCatHistoryProvider:
                 seen_anchors.add(anchor)
             if bool(bulk_state["completed"]):
                 forward_hydrate_started = perf_counter()
-                self._hydrate_fast_history_tail_forwards_bulk(
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.tail_forward_hydrate",
+                    status="start",
+                    message_count=len(selected_messages),
+                    page_size=bulk_page_size,
+                    history_source=history_source or "napcat_fast_history_bulk",
+                )
+                hydrated_forward_count = self._hydrate_fast_history_tail_forwards_bulk(
                     request,
                     selected_messages,
                     page_size=bulk_page_size,
                     progress_callback=progress_callback,
                 )
                 forward_hydrate_s = perf_counter() - forward_hydrate_started
+                self._emit_pipeline_stage(
+                    progress_callback,
+                    stage="provider.tail_forward_hydrate",
+                    status="done",
+                    elapsed_s=forward_hydrate_s,
+                    message_count=len(selected_messages),
+                    hydrated_forward_count=hydrated_forward_count,
+                    page_size=bulk_page_size,
+                    history_source=history_source or "napcat_fast_history_bulk",
+                )
                 selected_messages.sort(
                     key=lambda item: (_message_datetime(item), _message_sort_key(item))
                 )
@@ -478,7 +498,15 @@ class NapCatHistoryProvider:
         extract_sort_s = perf_counter() - extract_started
         if source == "napcat_fast_history":
             hydrate_started = perf_counter()
-            self._hydrate_fast_history_page_forwards(
+            self._emit_pipeline_stage(
+                progress_callback,
+                stage="provider.fast_forward_hydrate",
+                status="start",
+                message_count=len(messages),
+                requested_count=requested_count,
+                before_message_seq=before_message_seq,
+            )
+            hydrated_forward_count = self._hydrate_fast_history_page_forwards(
                 request,
                 messages,
                 before_message_seq=before_message_seq,
@@ -486,6 +514,16 @@ class NapCatHistoryProvider:
                 reverse_order=reverse_order,
             )
             fast_forward_hydrate_s = perf_counter() - hydrate_started
+            self._emit_pipeline_stage(
+                progress_callback,
+                stage="provider.fast_forward_hydrate",
+                status="done",
+                elapsed_s=fast_forward_hydrate_s,
+                message_count=len(messages),
+                requested_count=requested_count,
+                before_message_seq=before_message_seq,
+                hydrated_forward_count=hydrated_forward_count,
+            )
         snapshot = SourceChatSnapshot(
             chat_type=request.chat_type,
             chat_id=request.chat_id,
@@ -1696,7 +1734,10 @@ class NapCatHistoryProvider:
         reverse_order: bool,
     ) -> int:
         forward_messages = [
-            message for message in messages if self._message_has_forward_reference(message)
+            message
+            for message in messages
+            if self._message_has_forward_reference(message)
+            and not self._message_has_resolved_forward_content(message)
         ]
         forward_message_ids = {
             str(
@@ -1785,6 +1826,24 @@ class NapCatHistoryProvider:
             hydrated += 1
         return hydrated
 
+    def _hydrate_sparse_tail_forward_messages(
+        self,
+        request: ExportRequest,
+        forward_messages: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        hydrated = 0
+        history_calls = 0
+        for message in forward_messages:
+            history_calls += 1
+            hydrated_now, _known_unavailable = self._hydrate_forward_message_via_history(
+                message,
+                chat_type=request.chat_type,
+                chat_id=request.chat_id,
+            )
+            if hydrated_now:
+                hydrated += 1
+        return hydrated, history_calls
+
     def _hydrate_fast_history_tail_forwards_bulk(
         self,
         request: ExportRequest,
@@ -1807,21 +1866,46 @@ class NapCatHistoryProvider:
             if not window:
                 break
             window_index += 1
-            forward_ref_count = sum(
-                1 for message in window if self._message_has_forward_reference(message)
-            )
+            forward_messages = [
+                message for message in window if self._message_has_forward_reference(message)
+            ]
+            resolved_forward_messages = [
+                message
+                for message in forward_messages
+                if self._message_has_resolved_forward_content(message)
+            ]
+            unresolved_forward_messages = [
+                message
+                for message in forward_messages
+                if not self._message_has_resolved_forward_content(message)
+            ]
+            forward_ref_count = len(forward_messages)
+            resolved_forward_ref_count = len(resolved_forward_messages)
+            unresolved_forward_ref_count = len(unresolved_forward_messages)
             oldest_message = window[0]
             newest_message = window[-1]
             oldest_dt = _message_datetime(oldest_message)
             newest_dt = _message_datetime(newest_message)
             window_started = perf_counter()
-            hydrated_in_window = self._hydrate_fast_history_page_forwards(
-                request,
-                window,
-                before_message_seq=anchor,
-                count=len(window),
-                reverse_order=reverse_order,
-            )
+            strategy = "bulk_parse_mult_window"
+            history_calls = 1 if unresolved_forward_ref_count > 0 else 0
+            if self._should_use_sparse_tail_forward_hydrate(
+                window_message_count=len(window),
+                forward_ref_count=unresolved_forward_ref_count,
+            ):
+                strategy = "history_retry_sparse_forward"
+                hydrated_in_window, history_calls = self._hydrate_sparse_tail_forward_messages(
+                    request,
+                    unresolved_forward_messages,
+                )
+            else:
+                hydrated_in_window = self._hydrate_fast_history_page_forwards(
+                    request,
+                    window,
+                    before_message_seq=anchor,
+                    count=len(window),
+                    reverse_order=reverse_order,
+                )
             hydrated += hydrated_in_window
             window_elapsed_s = perf_counter() - window_started
             self._emit_progress(
@@ -1832,7 +1916,11 @@ class NapCatHistoryProvider:
                     "window_index": window_index,
                     "window_message_count": len(window),
                     "forward_ref_count": forward_ref_count,
+                    "resolved_forward_ref_count": resolved_forward_ref_count,
+                    "unresolved_forward_ref_count": unresolved_forward_ref_count,
                     "hydrated_count": hydrated_in_window,
+                    "strategy": strategy,
+                    "history_calls": history_calls,
                     "before_message_seq": anchor,
                     "reverse_order": reverse_order,
                     "oldest_message_id": oldest_message.get("message_id")
@@ -1862,6 +1950,33 @@ class NapCatHistoryProvider:
             reverse_order = True
             end = start
         return hydrated
+
+    @staticmethod
+    def _should_use_sparse_tail_forward_hydrate(
+        *,
+        window_message_count: int,
+        forward_ref_count: int,
+    ) -> bool:
+        if forward_ref_count <= 0:
+            return False
+        if window_message_count < SPARSE_TAIL_FORWARD_HYDRATE_MIN_WINDOW_MESSAGES:
+            return False
+        return forward_ref_count <= SPARSE_TAIL_FORWARD_HYDRATE_MAX_FORWARD_REFS
+
+    @staticmethod
+    def _trim_sparse_tail_forward_window(
+        window: list[dict[str, Any]],
+        forward_messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not window or not forward_messages:
+            return window
+        first_forward = forward_messages[0]
+        try:
+            first_index = window.index(first_forward)
+        except ValueError:
+            return window
+        trimmed_window = window[first_index:]
+        return trimmed_window or window
 
     def _message_has_forward_reference(self, message: dict[str, Any]) -> bool:
         raw_message = _message_raw(message)
