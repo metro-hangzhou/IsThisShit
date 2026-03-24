@@ -476,6 +476,12 @@ class NapCatMediaDownloader:
                     _emit_prepare_progress("progress", index)
                     last_prepare_emit = monotonic()
                 continue
+            if not self._should_skip_eager_remote_prefetch(
+                request,
+                old_bucket=old_bucket,
+            ):
+                self._schedule_request_remote_prefetch(request)
+            self._schedule_request_direct_public_token_prefetch(request)
             if large_prefetch_run and old_bucket is not None:
                 skipped_old_bucket_prefetch += 1
                 if progress_callback is not None and (
@@ -493,12 +499,6 @@ class NapCatMediaDownloader:
                     _emit_prepare_progress("progress", index)
                     last_prepare_emit = monotonic()
                 continue
-            if not self._should_skip_eager_remote_prefetch(
-                request,
-                old_bucket=old_bucket,
-            ):
-                self._schedule_request_remote_prefetch(request)
-            self._schedule_request_direct_public_token_prefetch(request)
             key = self._request_key(request)
             if key in self._prefetched_media or key in seen:
                 continue
@@ -3528,7 +3528,9 @@ class NapCatMediaDownloader:
         if self._has_forward_parent_hint(hint):
             return None
         asset_type = str(request.get("asset_type") or "").strip().lower()
-        if asset_type == "speech":
+        if asset_type == "image":
+            action = "get_image"
+        elif asset_type == "speech":
             action = "get_record"
         elif asset_type in {"file", "video"}:
             action = "get_file"
