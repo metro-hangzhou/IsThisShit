@@ -282,6 +282,96 @@ def test_collect_fast_history_tail_bulk_boundary_bridge_does_not_overshoot_reque
     assert {item["message_id"] for item in state["messages"][2:]} == {"m4", "m5"}
 
 
+def test_fetch_full_snapshot_prefers_fast_full_bulk_until_exhausted() -> None:
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=object())
+    payloads = iter(
+        [
+            {
+                "messages": [_message("m1", "1"), _message("m2", "2")],
+                "pages_scanned": 1,
+                "next_anchor": "anchor-2",
+                "page_size": 200,
+                "exhausted": False,
+            },
+            {
+                "messages": [_message("m3", "3"), _message("m4", "4")],
+                "pages_scanned": 1,
+                "next_anchor": "anchor-4",
+                "page_size": 200,
+                "exhausted": True,
+            },
+        ]
+    )
+    history_page_calls = 0
+
+    def fake_fetch_fast_history_tail_bulk(*args, **kwargs):
+        try:
+            return next(payloads)
+        except StopIteration:
+            return None
+
+    def fake_fetch_history_page(*args, **kwargs):
+        nonlocal history_page_calls
+        history_page_calls += 1
+        return _snapshot([]), {
+            "history_source": "napcat_fast_history",
+            "page_duration_s": 0.01,
+            "page_size": 1,
+            "page_message_count": 0,
+            "retry_count": 0,
+        }
+
+    provider._fetch_fast_history_tail_bulk = fake_fetch_fast_history_tail_bulk  # type: ignore[method-assign]
+    provider._fetch_history_page = fake_fetch_history_page  # type: ignore[method-assign]
+    provider._finalize_snapshot = lambda snapshot, progress_callback=None: snapshot  # type: ignore[method-assign]
+
+    snapshot = provider.fetch_full_snapshot(_request(), page_size=500, progress_callback=None)
+
+    assert history_page_calls == 0
+    assert snapshot.metadata["source"] == "napcat_fast_history_bulk"
+    assert [item["message_id"] for item in snapshot.messages] == ["m1", "m2", "m3", "m4"]
+
+
+def test_fetch_full_snapshot_falls_back_to_history_page_after_partial_fast_full_bulk() -> None:
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=object())
+    payloads = iter(
+        [
+            {
+                "messages": [_message("m1", "1"), _message("m2", "2")],
+                "pages_scanned": 1,
+                "next_anchor": "anchor-2",
+                "page_size": 200,
+                "exhausted": False,
+            },
+            None,
+        ]
+    )
+    history_page_anchors: list[str | None] = []
+
+    def fake_fetch_fast_history_tail_bulk(*args, **kwargs):
+        return next(payloads)
+
+    def fake_fetch_history_page(request, *, before_message_seq: str | None, **kwargs):
+        history_page_anchors.append(before_message_seq)
+        return _snapshot([_message("m3", "3")]), {
+            "history_source": "napcat_fast_history",
+            "page_duration_s": 0.01,
+            "page_size": 1,
+            "page_message_count": 1,
+            "retry_count": 0,
+        }
+
+    provider._fetch_fast_history_tail_bulk = fake_fetch_fast_history_tail_bulk  # type: ignore[method-assign]
+    provider._fetch_history_page = fake_fetch_history_page  # type: ignore[method-assign]
+    provider._finalize_snapshot = lambda snapshot, progress_callback=None: snapshot  # type: ignore[method-assign]
+
+    snapshot = provider.fetch_full_snapshot(_request(), page_size=500, progress_callback=None)
+
+    assert history_page_anchors == ["anchor-2", "3"]
+    assert snapshot.metadata["source"] == "napcat_fast_history_bulk+napcat_fast_history"
+    assert [item["message_id"] for item in snapshot.messages] == ["m1", "m2", "m3"]
+
+
 def test_enrich_forward_details_uses_history_as_last_chance_after_get_forward_msg_failure() -> None:
     class _ForwardFailClient:
         def get_forward_msg(self, message_id: str):

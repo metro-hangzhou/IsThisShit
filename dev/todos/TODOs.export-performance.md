@@ -43,6 +43,30 @@ Primary rule:
 
 ## What The Current Perf Audit Already Shows
 
+## [2026-03-24] Full-History Scan Route Was Still On The Old Per-Page Path Until This Pass
+
+- user-side `@final_content @earliest_content` broad exports were still reporting:
+  - `scanning full history pages=71 ... elapsed~=28s`
+- root cause:
+  - `fetch_full_snapshot()` had never been switched to fast bulk
+  - only tail-oriented paths were using `/history-tail-bulk`
+  - full-history broad exports were still doing `71` front-end page fetches through `_fetch_history_page(...)`
+- this pass changes full-history to `fast_full_bulk` first, with per-page retry only as fallback
+- direct maintainer live benchmark on group `922065597` after the change:
+  - `messages=12593`
+  - `pages_scanned=71`
+  - `bulk_chunks=7`
+  - `provider.fast_full_bulk = 9.1365s`
+  - `provider.finalize_snapshot = 20.2898s`
+  - `provider.fetch_full_snapshot = 29.4657s`
+- interpretation:
+  - full-history page scanning itself did drop materially:
+    - from `~28s` broad front-end scan time
+    - to `~9.1s` bulk fetch time
+  - the new dominant cost inside `fetch_full_snapshot()` is now `provider.finalize_snapshot`
+    - mainly forward/detail enrichment
+    - not raw page acquisition
+
 ### Stage breakdown from the latest full-export report
 
 - `app.write_bundle`: `61.281s`
