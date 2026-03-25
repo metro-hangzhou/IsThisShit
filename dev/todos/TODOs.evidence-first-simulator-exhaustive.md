@@ -85,6 +85,183 @@ Without that formal layer, we can still miss:
   - this suite must run for both `recent` and `old` ages
   - the result must be invariant to age once the proof chain is complete
 
+## [2026-03-25] New Top Priority: Asset Distribution Exhaustiveness
+
+The current simulator has become strong at bounded evidence families, but we still need a stronger guarantee against performance/route-order patches quietly reintroducing `missing_after_napcat`, especially in forwarded trees.
+
+New hard requirement:
+
+- every meaningful asset-distribution family that the exporter can observe must be represented in simulator space
+- this includes not only single-asset states, but also how assets are distributed across:
+  - top-level messages
+  - forward trees
+  - nested-forward trees
+  - repeated-identity clusters across multiple messages
+  - mixed-family bundles inside one forward parent
+- simulator must explicitly assert that new performance optimizations do not convert:
+  - previous `background_missing`
+  - or previous `reused/copied`
+  into new `actionable_missing`
+
+Concrete execution tracks to add now:
+
+- `Track A. Forward / Nested-Forward Asset Distribution Matrix`
+  - enumerate:
+    - single forward child
+    - sparse forward siblings
+    - dense forward siblings
+    - nested-forward with top-level mixed assets
+    - nested-forward with repeated identity across depths
+    - forward parent missing / malformed / partially hydrated
+  - cover asset families:
+    - `image`
+    - `video`
+    - `file`
+    - `speech`
+    - `sticker`
+  - required oracle:
+    - no new `actionable_missing`
+    - route order must not regress into unnecessary `context_hydration` / public retry / remote retry
+
+- `Track B. Repeated Identity Distribution Matrix`
+  - same underlying asset reappears as:
+    - top-level -> top-level
+    - top-level -> forward
+    - forward -> nested-forward
+    - weak key first, strong key later
+    - strong key first, weak key later
+  - required oracle:
+    - same-run caches and second-pass promotion must preserve or improve outcome
+    - performance patches must not break reuse and accidentally create fresh actionable misses
+
+- `Track C. Route-Order / Prefetch / Second-Pass Interaction Matrix`
+  - cross product of:
+    - prefetch hit / miss / payload-only / payload+remote
+    - direct public-token outcome
+    - context payload outcome
+    - second-pass retry eligibility
+    - bundle future-local evidence
+  - required oracle:
+    - evidence-complete terminal assets short-circuit early
+    - recent recoverable assets remain recoverable
+    - no `prefetch`/`second-pass` ordering change may turn a former background or reuse case into `missing_after_napcat`
+
+- `Track D. Performance Patch Anti-Regression Matrix`
+  - every newly added acceleration branch must have a paired simulator suite that proves:
+    - lower or equal cost class
+    - unchanged or improved final resolver
+    - zero actionable drift
+  - current must-cover branches:
+    - top-level image terminal classifier
+    - direct public-token prefetch reuse
+    - future-local identity evidence
+    - forward metadata dedupe
+    - sparse forward hydrate narrowing
+
+- `Track E. Distribution Coverage Summary`
+  - simulator CLI must emit a coverage summary showing:
+    - which asset families
+    - which topologies
+    - which distribution patterns
+    - which route-order branches
+    are currently exercised
+  - this summary should become the fast answer to:
+    - “did we actually simulate this family before shipping the optimization?”
+
+Immediate acceptance gate before broad performance work continues:
+
+- [ ] add forward/nested-forward distribution suites for all five asset families
+- [ ] add repeated-identity cross-topology suites
+- [ ] add prefetch/second-pass interaction suites
+- [ ] add anti-regression expectations specifically for `actionable_missing`
+- [ ] ensure simulator summary reports coverage by family/topology/distribution branch
+
+Concrete high-risk matrices confirmed by the latest code audit:
+
+- [ ] `prefetch_payload_only_then_context_payload_terminal`
+  - top-level / forward / nested-forward `image`
+  - direct public-token prefetch returns payload-only or remote-attempted-failed
+  - context later returns `no-path` or `stale-local-path`
+  - oracle:
+    - never regress to `missing_after_napcat` once the combined proof chain is terminal
+- [x] `request_state_vs_payload_state_terminal_equivalence`
+  - same evidence, two route plans:
+    - request-state early skip
+    - payload-state post-context classification
+  - oracle:
+    - same terminal/background result
+    - no actionable drift
+- [ ] `second_pass_gate_stability_under_prefetch_variants`
+  - vary:
+    - prefetch empty
+    - payload-only
+    - remote-attempted-failed
+    - runtime unavailable
+    - cached terminal classification
+  - oracle:
+    - recoverable assets remain recoverable
+    - already-terminal assets remain skipped
+- [x] `future_local_identity_cross_topology`
+  - `top_level -> top_level`
+  - `top_level -> forward`
+  - `forward -> top_level`
+  - `forward -> nested_forward`
+  - `nested_forward -> top_level`
+  - with weak-key-first and strong-key-first permutations
+- [ ] `prefetch_strategy_branch_matrix`
+  - branches:
+    - eager remote prefetch preferred
+    - direct public-token prefetch preferred
+    - both skipped due terminal request-state proof
+  - across top-level / forward / nested-forward image families
+- [ ] `provider_forward_detail_antiregression`
+  - plugin says sorted ascending / partial detail / missing detail
+  - sparse vs dense forward density
+  - oracle:
+    - skipping `tail_forward_hydrate` or re-sort must not drop forward/nested-forward asset evidence
+
+## [2026-03-25] Progress Snapshot
+
+- landed `request_state_payload_state_terminal_equivalence` simulator suite:
+  - `top_level_image_weak_gchatpic_context_no_path_{recent,old}`
+  - `top_level_image_weak_gchatpic_context_stale_local_{recent,old}`
+  - `top_level_image_local_download_dead_{recent,old}`
+- landed additional cross-topology pair guard:
+  - `nested_forward_terminal_then_top_level_public_remote`
+- provider anti-regression tests added for:
+  - fast-bulk re-sort when `messages_sorted_ascending` is false
+  - history fallback when forward-detail batch returns `ok=true` but empty messages
+- still missing the broader prefetch/second-pass interaction matrix and the full provider partial-detail contract matrix
+- [ ] `optimization_coverage_manifest`
+  - maintain a table mapping each acceleration branch to:
+    - code branch
+    - paired simulator suite
+    - invariant protected
+  - no unpaired performance branch should be considered release-complete
+
+## [2026-03-25] Progress Update: Provider Guard + Cross-Topology Pair Coverage
+
+This pass landed two concrete pieces of the above panel:
+
+- provider trust-boundary guards are now enforced in code and tests:
+  - fast-bulk `messages_sorted_ascending=true` is no longer trusted blindly
+  - tail forward hydrate is no longer skipped merely because the batch-detail method exists; bulk messages must also already carry resolved forward content
+- simulator now covers additional repeated-identity cross-topology distributions through pair/cross-run cases:
+  - `top_level -> forward` image unresolved -> remote recovery
+  - `forward -> nested_forward` image unresolved -> remote recovery
+  - `top_level -> forward` video timeout -> direct-file-id remote recovery
+  - `top_level -> nested_forward` file timeout -> direct-file-id remote recovery
+  - `nested_forward -> top_level` terminal image -> public-token remote recovery
+
+Remaining gap after this pass:
+
+- `provider_forward_detail_antiregression` is only partially complete
+  - sorted-flag wrong and tail-hydrate skip boundaries are now locked
+  - partial/empty batch-detail success semantics for full export still need explicit coverage
+- `future_local_identity_cross_topology` is partially complete
+  - unresolved/recoverable cross-topology cases are now covered
+  - weak-key-first vs strong-key-first promotion still needs dedicated matrix coverage
+
 ## [2026-03-24] Post-Restart Regression Lockdown Added In This Pass
 
 - the latest post-restart forward-image regression was reproduced against the bounded evidence matrix and reduced to two concrete simulator gaps:
