@@ -166,6 +166,8 @@ class WatchConversationView:
         ui_profile: CliUiProfile | None = None,
         application_input: Input | None = None,
         application_output: Output | None = None,
+        live_events_enabled: bool = True,
+        initial_notice_text: str = "",
     ) -> None:
         self._settings = settings
         self._gateway = gateway
@@ -177,8 +179,9 @@ class WatchConversationView:
         self._entries: list[WatchTimelineEntry] = []
         self._seen_keys: set[str] = set()
         self._status_text = "Loading history..."
-        self._notice_text = ""
+        self._notice_text = str(initial_notice_text or "")
         self._help_text = _default_watch_help_text()
+        self._live_events_enabled = bool(live_events_enabled)
         self._follow_tail = True
         self._scroll_top = 0
         self._history_page_size = max(20, self._history_limit)
@@ -309,6 +312,9 @@ class WatchConversationView:
         self._history_exhausted = not snapshot.messages or not self._oldest_history_anchor
 
     def _start_background_tasks(self) -> None:
+        if not self._live_events_enabled:
+            self._pump_task = None
+            return
         self._pump_task = self._app.create_background_task(self._pump_live_events())
 
     async def _stop_background_tasks(self) -> None:

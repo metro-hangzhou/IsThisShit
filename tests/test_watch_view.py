@@ -62,3 +62,14 @@ def test_before_render_refreshes_message_area_for_resize() -> None:
     WatchConversationView._before_render(view, Mock())
 
     view._refresh_message_area_for_resize.assert_called_once_with()
+
+
+def test_start_background_tasks_skips_live_pump_when_disabled() -> None:
+    view = object.__new__(WatchConversationView)
+    view._live_events_enabled = False
+    view._app = Mock()
+
+    WatchConversationView._start_background_tasks(view)
+
+    assert view._pump_task is None
+    view._app.create_background_task.assert_not_called()
