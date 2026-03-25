@@ -1678,6 +1678,172 @@ def default_asset_resolution_pair_cases() -> list[AssetResolutionPairCase]:
         )
     )
 
+    shared_top_level_to_forward_image_name = "pair_top_level_to_forward_image_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="top_level_image_placeholder_then_forward_remote",
+            first=replace(
+                scenarios["top_level_image_placeholder_zero_byte"],
+                name=shared_top_level_to_forward_image_name,
+                age_days=240,
+            ),
+            second=replace(
+                scenarios["forward_image_remote_url_hit"],
+                name=shared_top_level_to_forward_image_name,
+                age_days=20,
+            ),
+            expected_second_resolver="napcat_forward_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=0,
+            max_fast_calls=2,
+            max_remote_attempts=1,
+            notes="A top-level unresolved placeholder image must not poison later forward remote recovery for the same logical identity.",
+        )
+    )
+
+    shared_forward_to_nested_image_name = "pair_forward_to_nested_image_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="forward_image_unresolved_then_nested_forward_remote",
+            first=AssetResolutionScenario(
+                name=shared_forward_to_nested_image_name,
+                suite="pair_sequence",
+                asset_type="image",
+                topology="forward",
+                age_days=20,
+                hint_remote_state="stale_http",
+                forward_metadata_state="timeout",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1,
+                max_remote_attempts=1,
+                notes="Forward image with weak dead remote evidence alone remains unresolved.",
+            ),
+            second=replace(
+                scenarios["exhaustive_nested_forward_image_relative_http_unavailable_remote_wins"],
+                name=shared_forward_to_nested_image_name,
+                age_days=20,
+            ),
+            expected_second_resolver="napcat_forward_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=0,
+            max_fast_calls=2,
+            max_remote_attempts=2,
+            notes="An unresolved forward image must not poison later nested-forward remote recovery for the same logical identity.",
+        )
+    )
+
+    shared_top_level_to_forward_video_name = "pair_top_level_to_forward_video_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="top_level_video_old_timeout_then_forward_direct_remote",
+            first=AssetResolutionScenario(
+                name=shared_top_level_to_forward_video_name,
+                suite="pair_sequence",
+                asset_type="video",
+                topology="top_level",
+                age_days=240,
+                context_payload_state="timeout",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1,
+                max_remote_attempts=0,
+                notes="Synthetic old top-level video timeout miss for top-level to forward cross-topology checks.",
+            ),
+            second=AssetResolutionScenario(
+                name=shared_top_level_to_forward_video_name,
+                suite="pair_sequence",
+                asset_type="video",
+                topology="forward",
+                age_days=20,
+                context_payload_state="unavailable",
+                direct_file_result_state="valid_remote",
+                expected_resolver="napcat_segment_file_id_get_file_remote_url",
+                expected_path_kind="remote",
+                max_client_calls=1,
+                max_fast_calls=1,
+                max_remote_attempts=1,
+                notes="Forward video becomes recoverable via direct-file-id remote path under the same logical identity.",
+            ),
+            expected_second_resolver="napcat_segment_file_id_get_file_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=2,
+            max_remote_attempts=1,
+            notes="A top-level video timeout miss must not poison later forward direct-file-id remote recovery.",
+        )
+    )
+
+    shared_top_level_to_nested_file_name = "pair_top_level_to_nested_file_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="top_level_file_old_timeout_then_nested_forward_direct_remote",
+            first=AssetResolutionScenario(
+                name=shared_top_level_to_nested_file_name,
+                suite="pair_sequence",
+                asset_type="file",
+                topology="top_level",
+                age_days=240,
+                context_payload_state="timeout",
+                expected_resolver=None,
+                expected_path_kind="missing",
+                max_client_calls=0,
+                max_fast_calls=1,
+                max_remote_attempts=0,
+                notes="Synthetic old top-level file timeout miss for top-level to nested-forward checks.",
+            ),
+            second=AssetResolutionScenario(
+                name=shared_top_level_to_nested_file_name,
+                suite="pair_sequence",
+                asset_type="file",
+                topology="nested_forward",
+                age_days=20,
+                context_payload_state="unavailable",
+                direct_file_result_state="valid_remote",
+                expected_resolver="napcat_segment_file_id_get_file_remote_url",
+                expected_path_kind="remote",
+                max_client_calls=1,
+                max_fast_calls=1,
+                max_remote_attempts=1,
+                notes="Nested-forward file becomes recoverable via direct-file-id remote path under the same logical identity.",
+            ),
+            expected_second_resolver="napcat_segment_file_id_get_file_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=2,
+            max_remote_attempts=1,
+            notes="A top-level file timeout miss must not poison later nested-forward direct-file-id remote recovery.",
+        )
+    )
+
+    shared_nested_to_top_level_image_name = "pair_nested_to_top_level_image_identity"
+    cases.append(
+        AssetResolutionPairCase(
+            name="nested_forward_terminal_then_top_level_public_remote",
+            first=replace(
+                scenarios["exhaustive_nested_forward_image_old_stale_missing_dead_remote_metadata_timeout_materialize_empty"],
+                name=shared_nested_to_top_level_image_name,
+                age_days=260,
+            ),
+            second=replace(
+                scenarios["top_level_image_public_token_remote"],
+                name=shared_nested_to_top_level_image_name,
+                age_days=20,
+            ),
+            expected_second_resolver="napcat_public_token_get_image_remote_url",
+            expected_second_path_kind="remote",
+            max_client_calls=1,
+            max_fast_calls=2,
+            max_remote_attempts=3,
+            notes=(
+                "A nested-forward terminal image miss must not poison later top-level "
+                "public-token recovery for the same logical identity."
+            ),
+        )
+    )
+
     return cases
 
 
@@ -2667,6 +2833,16 @@ class _ScenarioRuntimeState:
             resolved = urljoin(self.remote_base_url.rstrip("/") + "/", relative.lstrip("/"))
             self.remote_map[resolved] = self.remote_path
             return relative
+        if state == "relative_gchatpic":
+            return (
+                f"/gchatpic_new/3348513412/"
+                f"{self.scenario.name}-{self.file_name}/0?term=255&is_origin=0"
+            )
+        if state == "relative_download_dead":
+            relative = f"/download?appid=1407&fileid=dead-{self.scenario.name}&spec=0"
+            resolved = urljoin(self.remote_base_url.rstrip("/") + "/", relative.lstrip("/"))
+            self.remote_failure_map[resolved] = "unsupported_local_download"
+            return relative
         if state == "stale_http":
             return f"https://assets.example.invalid/stale/{self.scenario.name}/{self.file_name}"
         if state == "expired_pair":
@@ -2789,6 +2965,21 @@ class _ScenarioRuntimeState:
             return {"file": self.local_path, "file_name": self.file_name, "asset_type": self.scenario.asset_type}
         if state == "zero_local":
             return {"file": self.zero_local_path, "file_name": self.file_name, "asset_type": self.scenario.asset_type}
+        if state == "empty_local":
+            return {
+                "file": "",
+                "url": "",
+                "file_name": self.file_name,
+                "asset_type": self.scenario.asset_type,
+            }
+        if state == "stale_local":
+            stale_path = str((self.root / "stale" / self.file_name).resolve())
+            return {
+                "file": stale_path,
+                "url": stale_path,
+                "file_name": self.file_name,
+                "asset_type": self.scenario.asset_type,
+            }
         if state == "public_token":
             return {
                 "public_action": action,
@@ -3607,6 +3798,78 @@ def _terminal_evidence_age_invariance_scenarios() -> list[AssetResolutionScenari
     return scenarios
 
 
+def _request_state_payload_state_terminal_equivalence_scenarios() -> list[AssetResolutionScenario]:
+    scenarios: list[AssetResolutionScenario] = []
+    for age_label, age_days in (("recent", 7), ("old", 260)):
+        scenarios.extend(
+            [
+                AssetResolutionScenario(
+                    name=f"top_level_image_weak_gchatpic_context_no_path_{age_label}",
+                    suite="request_state_payload_state_terminal_equivalence",
+                    asset_type="image",
+                    topology="top_level",
+                    age_days=age_days,
+                    source_path_state="placeholder_zero",
+                    hint_remote_state="relative_gchatpic",
+                    context_payload_state="empty_local",
+                    direct_file_result_state="valid_local",
+                    expected_resolver="qq_not_downloaded_local_placeholder",
+                    expected_path_kind="missing",
+                    max_client_calls=0,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                    notes=(
+                        "Weak relative gchatpic plus placeholder local evidence and context "
+                        "hydration yielding no local path should settle as placeholder "
+                        "background missing regardless of age."
+                    ),
+                ),
+                AssetResolutionScenario(
+                    name=f"top_level_image_weak_gchatpic_context_stale_local_{age_label}",
+                    suite="request_state_payload_state_terminal_equivalence",
+                    asset_type="image",
+                    topology="top_level",
+                    age_days=age_days,
+                    source_path_state="placeholder_zero",
+                    hint_remote_state="relative_gchatpic",
+                    context_payload_state="stale_local",
+                    direct_file_result_state="valid_local",
+                    expected_resolver="qq_not_downloaded_local_placeholder",
+                    expected_path_kind="missing",
+                    max_client_calls=0,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                    notes=(
+                        "A stale local path returned by context hydration must be treated the "
+                        "same as an empty local result under the weak gchatpic proof chain."
+                    ),
+                ),
+                AssetResolutionScenario(
+                    name=f"top_level_image_local_download_dead_{age_label}",
+                    suite="request_state_payload_state_terminal_equivalence",
+                    asset_type="image",
+                    topology="top_level",
+                    age_days=age_days,
+                    source_path_state="placeholder_zero",
+                    hint_remote_state="relative_download_dead",
+                    context_payload_state="public_token",
+                    public_result_state="none",
+                    expected_resolver="qq_expired_after_napcat",
+                    expected_path_kind="missing",
+                    max_client_calls=1,
+                    max_fast_calls=1,
+                    max_remote_attempts=0,
+                    notes=(
+                        "Projected localhost /download unsupported plus placeholder local "
+                        "evidence and failed direct public-token fetch must classify "
+                        "terminally regardless of age."
+                    ),
+                ),
+            ]
+        )
+    return scenarios
+
+
 def _exhaustive_sticker_forward_parent_scenarios() -> list[AssetResolutionScenario]:
     scenarios: list[AssetResolutionScenario] = []
     for topology in ("forward", "nested_forward"):
@@ -4402,6 +4665,7 @@ def generated_asset_resolution_scenarios() -> list[AssetResolutionScenario]:
 
     scenarios.extend(_exhaustive_old_forward_terminal_scenarios())
     scenarios.extend(_terminal_evidence_age_invariance_scenarios())
+    scenarios.extend(_request_state_payload_state_terminal_equivalence_scenarios())
     scenarios.extend(_exhaustive_sticker_forward_parent_scenarios())
     scenarios.extend(_exhaustive_local_path_state_scenarios())
     scenarios.extend(_exhaustive_old_forward_direct_file_id_scenarios())

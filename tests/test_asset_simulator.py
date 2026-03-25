@@ -227,6 +227,7 @@ def test_asset_resolution_scenario_catalog_is_systematic() -> None:
     assert any(item.suite == "exhaustive_old_public_zero_byte" for item in scenarios)
     assert any(item.suite == "exhaustive_forward_image_terminal" for item in scenarios)
     assert any(item.suite == "terminal_evidence_age_invariance" for item in scenarios)
+    assert any(item.suite == "request_state_payload_state_terminal_equivalence" for item in scenarios)
     assert any("public_not_found" in item.name for item in scenarios)
     assert any("direct_not_found" in item.name for item in scenarios)
     assert any(item.asset_type == "sticker" and item.topology == "nested_forward" for item in scenarios)
@@ -259,7 +260,10 @@ def test_asset_resolution_catalog_reports_state_coverage() -> None:
     assert summary["total"] >= 450
     assert summary["suite_counts"]["public_token_shape_drift"] == 36
     assert summary["suite_counts"]["exhaustive_forward_image_terminal"] == 60
+    assert summary["suite_counts"]["request_state_payload_state_terminal_equivalence"] == 6
     assert summary["state_field_counts"]["hint_remote_state"]["live_http"] > 0
+    assert summary["state_field_counts"]["hint_remote_state"]["relative_gchatpic"] > 0
+    assert summary["state_field_counts"]["hint_remote_state"]["relative_download_dead"] > 0
     assert summary["state_field_counts"]["public_fallback_result_state"]["valid_remote_only"] > 0
     assert summary["state_field_counts"]["forward_parent_state"]["missing_peer_uid"] > 0
     assert summary["state_field_counts"]["direct_file_result_state"]["not_found"] > 0
@@ -274,10 +278,11 @@ def test_terminal_evidence_age_invariance_suite_matches_recent_and_old_results()
     results = run_asset_resolution_matrix(suite="terminal_evidence_age_invariance")
     by_name = {item.name: item for item in results}
 
-    assert len(results) == 22
+    assert len(results) == 24
     assert all(item.matched for item in results)
 
     for stem in (
+        "top_level_image_public_token_dead_remote",
         "forward_image_dead_remote_public_timeout",
         "forward_image_no_payload_terminal",
         "forward_video_blank_public_payload",
@@ -288,6 +293,30 @@ def test_terminal_evidence_age_invariance_suite_matches_recent_and_old_results()
         old = by_name[f"{stem}_old"]
         assert recent.actual_resolver == old.actual_resolver
         assert recent.actual_path_kind == old.actual_path_kind
+
+
+def test_request_state_payload_state_terminal_equivalence_suite_matches_recent_and_old_results() -> None:
+    results = run_asset_resolution_matrix(suite="request_state_payload_state_terminal_equivalence")
+    by_name = {item.name: item for item in results}
+
+    assert len(results) == 6
+    assert all(item.matched for item in results)
+
+    for stem in (
+        "top_level_image_weak_gchatpic_context_no_path",
+        "top_level_image_weak_gchatpic_context_stale_local",
+        "top_level_image_local_download_dead",
+    ):
+        recent = by_name[f"{stem}_recent"]
+        old = by_name[f"{stem}_old"]
+        assert recent.actual_resolver == old.actual_resolver
+        assert recent.actual_path_kind == old.actual_path_kind
+
+    assert by_name["top_level_image_weak_gchatpic_context_no_path_recent"].actual_resolver == "qq_not_downloaded_local_placeholder"
+    assert by_name["top_level_image_weak_gchatpic_context_stale_local_recent"].actual_resolver == "qq_not_downloaded_local_placeholder"
+    assert by_name["top_level_image_local_download_dead_recent"].actual_resolver == "qq_expired_after_napcat"
+    assert by_name["top_level_image_weak_gchatpic_context_no_path_recent"].actual_path_kind == "missing"
+    assert by_name["top_level_image_local_download_dead_recent"].actual_path_kind == "missing"
 
 
 def test_prefetch_planning_matrix_reports_large_window_pressure_shapes() -> None:
@@ -360,12 +389,36 @@ def test_public_timeout_scope_matrix_matches_expectations() -> None:
 def test_asset_resolution_pair_matrix_matches_expectations() -> None:
     results = run_asset_resolution_pair_matrix()
     summary = summarize_asset_resolution_pair_results(results)
+    by_name = {item.name: item for item in results}
 
     assert len(results) == len(default_asset_resolution_pair_cases())
     assert summary["mismatched"] == 0
     assert summary["resolver_counts"]["napcat_public_token_get_image_remote_url"] > 0
     assert summary["resolver_counts"]["napcat_segment_file_id_get_file_remote_url"] > 0
     assert summary["path_kind_counts"]["remote"] == len(results)
+    assert by_name["top_level_image_placeholder_then_forward_remote"].actual_second_resolver == "napcat_forward_remote_url"
+    assert by_name["forward_image_unresolved_then_nested_forward_remote"].actual_second_resolver == "napcat_forward_remote_url"
+    assert by_name["nested_forward_terminal_then_top_level_public_remote"].actual_second_resolver == "napcat_public_token_get_image_remote_url"
+
+
+def test_asset_resolution_pair_matrix_covers_cross_topology_distribution_cases() -> None:
+    results = {item.name: item for item in run_asset_resolution_pair_matrix()}
+
+    assert results["top_level_image_placeholder_then_forward_remote"].matched is True
+    assert results["top_level_image_placeholder_then_forward_remote"].actual_second_resolver == "napcat_forward_remote_url"
+    assert results["top_level_image_placeholder_then_forward_remote"].actual_second_path_kind == "remote"
+
+    assert results["forward_image_unresolved_then_nested_forward_remote"].matched is True
+    assert results["forward_image_unresolved_then_nested_forward_remote"].actual_second_resolver == "napcat_forward_remote_url"
+    assert results["forward_image_unresolved_then_nested_forward_remote"].actual_second_path_kind == "remote"
+
+    assert results["top_level_video_old_timeout_then_forward_direct_remote"].matched is True
+    assert results["top_level_video_old_timeout_then_forward_direct_remote"].actual_second_resolver == "napcat_segment_file_id_get_file_remote_url"
+    assert results["top_level_video_old_timeout_then_forward_direct_remote"].actual_second_path_kind == "remote"
+
+    assert results["top_level_file_old_timeout_then_nested_forward_direct_remote"].matched is True
+    assert results["top_level_file_old_timeout_then_nested_forward_direct_remote"].actual_second_resolver == "napcat_segment_file_id_get_file_remote_url"
+    assert results["top_level_file_old_timeout_then_nested_forward_direct_remote"].actual_second_path_kind == "remote"
 
 
 def test_cross_run_reset_matrix_matches_expectations() -> None:

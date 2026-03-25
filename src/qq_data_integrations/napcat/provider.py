@@ -3,7 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from time import perf_counter
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import httpx
 
@@ -251,6 +251,7 @@ class NapCatHistoryProvider:
             if bool(bulk_state["completed"]):
                 if self._should_skip_tail_forward_hydrate_for_fast_bulk(
                     history_source=history_source,
+                    messages=selected_messages,
                 ):
                     forward_hydrate_s = 0.0
                     hydrated_forward_count = 0
@@ -1588,10 +1589,30 @@ class NapCatHistoryProvider:
         return []
 
     @staticmethod
-    def _bulk_messages_sorted_ascending(payload: Any) -> bool:
+    def _messages_sorted_ascending(messages: Sequence[dict[str, Any]]) -> bool:
+        previous: tuple[datetime, tuple[Any, ...]] | None = None
+        for message in messages:
+            current = (_message_datetime(message), _message_sort_key(message))
+            if previous is not None and current < previous:
+                return False
+            previous = current
+        return True
+
+    @classmethod
+    def _bulk_messages_sorted_ascending(cls, payload: Any) -> bool:
         if not isinstance(payload, dict):
             return False
-        return bool(payload.get("messages_sorted_ascending"))
+        if not bool(payload.get("messages_sorted_ascending")):
+            return False
+        messages: list[dict[str, Any]] = []
+        for key in ("messages", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                messages = [item for item in value if isinstance(item, dict)]
+                break
+        if len(messages) <= 1:
+            return True
+        return cls._messages_sorted_ascending(messages)
 
     @staticmethod
     def _bulk_debug_summary(payload: Any) -> dict[str, Any]:
@@ -1622,12 +1643,23 @@ class NapCatHistoryProvider:
         self,
         *,
         history_source: str | None,
+        messages: Sequence[dict[str, Any]] | None = None,
     ) -> bool:
         if str(history_source or "").strip() != "napcat_fast_history_bulk":
             return False
         if self._fast_client is None:
             return False
-        return callable(getattr(self._fast_client, "hydrate_forward_detail_batch", None))
+        if not callable(getattr(self._fast_client, "hydrate_forward_detail_batch", None)):
+            return False
+        if not isinstance(messages, Sequence):
+            return False
+        unresolved_forward_refs = any(
+            self._message_has_forward_reference(message)
+            and not self._message_has_resolved_forward_content(message)
+            for message in messages
+            if isinstance(message, dict)
+        )
+        return not unresolved_forward_refs
 
     def _fetch_history_page(
         self,
