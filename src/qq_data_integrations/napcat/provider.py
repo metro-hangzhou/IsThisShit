@@ -243,40 +243,59 @@ class NapCatHistoryProvider:
                 "bulk_partial_fallback": bulk_state["partial_fallback"],
                 "pages_scanned": pages_scanned,
             }
+            bulk_tail_metadata.update(self._bulk_debug_summary(bulk_state))
             bulk_page_size = int(bulk_state["page_size"] or effective_base_page_size)
             anchor = bulk_state["next_anchor"]
             if anchor:
                 seen_anchors.add(anchor)
             if bool(bulk_state["completed"]):
-                forward_hydrate_started = perf_counter()
-                self._emit_pipeline_stage(
-                    progress_callback,
-                    stage="provider.tail_forward_hydrate",
-                    status="start",
-                    message_count=len(selected_messages),
-                    page_size=bulk_page_size,
-                    history_source=history_source or "napcat_fast_history_bulk",
-                )
-                hydrated_forward_count = self._hydrate_fast_history_tail_forwards_bulk(
-                    request,
-                    selected_messages,
-                    page_size=bulk_page_size,
-                    progress_callback=progress_callback,
-                )
-                forward_hydrate_s = perf_counter() - forward_hydrate_started
-                self._emit_pipeline_stage(
-                    progress_callback,
-                    stage="provider.tail_forward_hydrate",
-                    status="done",
-                    elapsed_s=forward_hydrate_s,
-                    message_count=len(selected_messages),
-                    hydrated_forward_count=hydrated_forward_count,
-                    page_size=bulk_page_size,
-                    history_source=history_source or "napcat_fast_history_bulk",
-                )
-                selected_messages.sort(
-                    key=lambda item: (_message_datetime(item), _message_sort_key(item))
-                )
+                if self._should_skip_tail_forward_hydrate_for_fast_bulk(
+                    history_source=history_source,
+                ):
+                    forward_hydrate_s = 0.0
+                    hydrated_forward_count = 0
+                    self._emit_pipeline_stage(
+                        progress_callback,
+                        stage="provider.tail_forward_hydrate",
+                        status="done",
+                        elapsed_s=0.0,
+                        message_count=len(selected_messages),
+                        hydrated_forward_count=0,
+                        page_size=bulk_page_size,
+                        history_source=history_source or "napcat_fast_history_bulk",
+                        skip_reason="fast_plugin_forward_detail_batch",
+                    )
+                else:
+                    forward_hydrate_started = perf_counter()
+                    self._emit_pipeline_stage(
+                        progress_callback,
+                        stage="provider.tail_forward_hydrate",
+                        status="start",
+                        message_count=len(selected_messages),
+                        page_size=bulk_page_size,
+                        history_source=history_source or "napcat_fast_history_bulk",
+                    )
+                    hydrated_forward_count = self._hydrate_fast_history_tail_forwards_bulk(
+                        request,
+                        selected_messages,
+                        page_size=bulk_page_size,
+                        progress_callback=progress_callback,
+                    )
+                    forward_hydrate_s = perf_counter() - forward_hydrate_started
+                    self._emit_pipeline_stage(
+                        progress_callback,
+                        stage="provider.tail_forward_hydrate",
+                        status="done",
+                        elapsed_s=forward_hydrate_s,
+                        message_count=len(selected_messages),
+                        hydrated_forward_count=hydrated_forward_count,
+                        page_size=bulk_page_size,
+                        history_source=history_source or "napcat_fast_history_bulk",
+                    )
+                if not bool(bulk_state.get("messages_sorted_ascending")):
+                    selected_messages.sort(
+                        key=lambda item: (_message_datetime(item), _message_sort_key(item))
+                    )
                 metadata = {
                     "source": history_source or "napcat_fast_history_bulk",
                     "page_size": bulk_page_size,
@@ -1224,9 +1243,12 @@ class NapCatHistoryProvider:
             request,
             data_count=target_count,
             page_size=page_size,
+            include_debug_stats=progress_callback is not None,
         )
         if direct_full_payload is not None:
-            chunk_messages = _sorted_messages(self._extract_messages(direct_full_payload.get("messages")))
+            chunk_messages = self._extract_messages(direct_full_payload.get("messages"))
+            if not self._bulk_messages_sorted_ascending(direct_full_payload):
+                chunk_messages = _sorted_messages(chunk_messages)
             final_content_at = _message_datetime(chunk_messages[-1]) if chunk_messages else None
             earliest_content_at = _message_datetime(chunk_messages[0]) if chunk_messages else None
             pages_scanned = int(direct_full_payload.get("pages_scanned") or 0)
@@ -1271,6 +1293,7 @@ class NapCatHistoryProvider:
                 message_count=len(chunk_messages),
                 exit_reason="exhausted" if bool(direct_full_payload.get("exhausted")) else "completed",
                 route="history_full_bulk",
+                **self._bulk_debug_summary(direct_full_payload),
             )
             return {
                 "messages": chunk_messages,
@@ -1288,6 +1311,8 @@ class NapCatHistoryProvider:
                 "earliest_content_at": earliest_content_at,
                 "final_content_at": final_content_at,
                 "route": "history_full_bulk",
+                "messages_sorted_ascending": self._bulk_messages_sorted_ascending(direct_full_payload),
+                "page_call_breakdown": direct_full_payload.get("page_call_breakdown"),
             }
         chunk_limit = FAST_HISTORY_BULK_SAFE_DATA_COUNT
         anchor: str | None = None
@@ -1316,6 +1341,7 @@ class NapCatHistoryProvider:
                 page_size=page_size,
                 anchor_message_id=anchor,
                 anchor_message_seq=anchor_seq,
+                include_debug_stats=progress_callback is not None,
             )
             if payload is None:
                 if chunk_count <= 0:
@@ -1357,7 +1383,9 @@ class NapCatHistoryProvider:
 
             chunk_count += 1
             chunk_duration_s = round(perf_counter() - chunk_started, 4)
-            chunk_messages = _sorted_messages(self._extract_messages(payload.get("messages")))
+            chunk_messages = self._extract_messages(payload.get("messages"))
+            if not self._bulk_messages_sorted_ascending(payload):
+                chunk_messages = _sorted_messages(chunk_messages)
             pages_scanned += int(payload.get("pages_scanned") or 0)
             if chunk_messages and final_content_at is None:
                 final_content_at = _message_datetime(chunk_messages[-1])
@@ -1455,6 +1483,7 @@ class NapCatHistoryProvider:
                     bulk_chunks=chunk_count,
                     message_count=len(collected_messages),
                     exit_reason="exhausted",
+                    **self._bulk_debug_summary(payload),
                 )
                 return {
                     "messages": collected_messages,
@@ -1471,6 +1500,7 @@ class NapCatHistoryProvider:
                     "page_size": int(payload.get("page_size") or page_size),
                     "earliest_content_at": earliest_content_at,
                     "final_content_at": final_content_at,
+                    "messages_sorted_ascending": self._bulk_messages_sorted_ascending(payload),
                 }
 
             if not next_anchor or next_anchor in seen_anchors or added <= 0:
@@ -1511,6 +1541,7 @@ class NapCatHistoryProvider:
         *,
         data_count: int,
         page_size: int,
+        include_debug_stats: bool = False,
     ) -> Any | None:
         if self._fast_client is None or self._fast_mode == "off":
             return None
@@ -1520,6 +1551,17 @@ class NapCatHistoryProvider:
         if self._fast_tail_bulk_available is False and self._fast_mode != "force":
             return None
         try:
+            payload = get_history_full_bulk(
+                request.chat_type,
+                request.chat_id,
+                data_count=data_count,
+                page_size=page_size,
+                history_fetch_strategy=FAST_HISTORY_BULK_FETCH_STRATEGY,
+                include_debug_stats=include_debug_stats,
+            )
+        except TypeError as exc:
+            if "include_debug_stats" not in str(exc):
+                raise
             payload = get_history_full_bulk(
                 request.chat_type,
                 request.chat_id,
@@ -1544,6 +1586,48 @@ class NapCatHistoryProvider:
                 if isinstance(value, list):
                     return [item for item in value if isinstance(item, dict)]
         return []
+
+    @staticmethod
+    def _bulk_messages_sorted_ascending(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return bool(payload.get("messages_sorted_ascending"))
+
+    @staticmethod
+    def _bulk_debug_summary(payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        breakdown = payload.get("page_call_breakdown")
+        if not isinstance(breakdown, list) or not breakdown:
+            return {}
+        route_counts: dict[str, int] = {}
+        elapsed_ms_total = 0
+        slowest_ms = 0
+        for item in breakdown:
+            if not isinstance(item, dict):
+                continue
+            route = str(item.get("route") or "").strip() or "unknown"
+            route_counts[route] = route_counts.get(route, 0) + 1
+            elapsed_ms = int(item.get("elapsed_ms") or 0)
+            elapsed_ms_total += elapsed_ms
+            slowest_ms = max(slowest_ms, elapsed_ms)
+        return {
+            "plugin_page_calls": len(breakdown),
+            "plugin_route_breakdown": route_counts,
+            "plugin_elapsed_ms_total": elapsed_ms_total,
+            "plugin_slowest_round_ms": slowest_ms,
+        }
+
+    def _should_skip_tail_forward_hydrate_for_fast_bulk(
+        self,
+        *,
+        history_source: str | None,
+    ) -> bool:
+        if str(history_source or "").strip() != "napcat_fast_history_bulk":
+            return False
+        if self._fast_client is None:
+            return False
+        return callable(getattr(self._fast_client, "hydrate_forward_detail_batch", None))
 
     def _fetch_history_page(
         self,
@@ -2738,6 +2822,7 @@ class NapCatHistoryProvider:
         page_size: int,
         anchor_message_id: str | None = None,
         anchor_message_seq: str | None = None,
+        include_debug_stats: bool = False,
     ) -> Any | None:
         if self._fast_client is None or self._fast_mode == "off":
             return None
@@ -2755,9 +2840,11 @@ class NapCatHistoryProvider:
                 anchor_message_id=anchor_message_id,
                 anchor_message_seq=anchor_message_seq,
                 history_fetch_strategy=FAST_HISTORY_BULK_FETCH_STRATEGY,
+                include_debug_stats=include_debug_stats,
             )
         except TypeError as exc:
-            if "anchor_message_seq" not in str(exc):
+            error_text = str(exc)
+            if "anchor_message_seq" not in error_text and "include_debug_stats" not in error_text:
                 raise
             payload = get_history_tail_bulk(
                 request.chat_type,
@@ -2790,9 +2877,12 @@ class NapCatHistoryProvider:
                 request,
                 data_count=data_count,
                 page_size=page_size,
+                include_debug_stats=progress_callback is not None,
             )
             if direct_full_payload is not None:
-                chunk_messages = _sorted_messages(self._extract_messages(direct_full_payload.get("messages")))
+                chunk_messages = self._extract_messages(direct_full_payload.get("messages"))
+                if not self._bulk_messages_sorted_ascending(direct_full_payload):
+                    chunk_messages = _sorted_messages(chunk_messages)
                 selected_messages = chunk_messages[-data_count:] if data_count > 0 else chunk_messages
                 oldest_dt = _message_datetime(selected_messages[0]) if selected_messages else None
                 newest_dt = _message_datetime(selected_messages[-1]) if selected_messages else None
@@ -2872,6 +2962,7 @@ class NapCatHistoryProvider:
                     bulk_chunks=1,
                     exit_reason="direct_full_bulk_completed",
                     route="history_full_bulk",
+                    **self._bulk_debug_summary(direct_full_payload),
                 )
                 return {
                     "messages": selected_messages,
@@ -2887,6 +2978,8 @@ class NapCatHistoryProvider:
                     "partial_fallback": False,
                     "page_size": int(direct_full_payload.get("page_size") or page_size),
                     "route": "history_full_bulk",
+                    "messages_sorted_ascending": self._bulk_messages_sorted_ascending(direct_full_payload),
+                    "page_call_breakdown": direct_full_payload.get("page_call_breakdown"),
                 }
         anchor: str | None = None
         anchor_seq: str | None = None
@@ -2915,6 +3008,7 @@ class NapCatHistoryProvider:
                 page_size=page_size,
                 anchor_message_id=anchor,
                 anchor_message_seq=anchor_seq,
+                include_debug_stats=progress_callback is not None,
             )
             if payload is None:
                 if chunk_count <= 0:
@@ -2968,7 +3062,9 @@ class NapCatHistoryProvider:
 
             chunk_count += 1
             chunk_duration_s = round(perf_counter() - chunk_started, 4)
-            chunk_messages = _sorted_messages(self._extract_messages(payload.get("messages")))
+            chunk_messages = self._extract_messages(payload.get("messages"))
+            if not self._bulk_messages_sorted_ascending(payload):
+                chunk_messages = _sorted_messages(chunk_messages)
             pages_scanned += int(payload.get("pages_scanned") or 0)
             added = 0
             for message in chunk_messages:
@@ -3078,6 +3174,7 @@ class NapCatHistoryProvider:
                     pages_scanned=pages_scanned,
                     bulk_chunks=chunk_count,
                     exit_reason="target_reached" if len(collected_messages) >= data_count else "exhausted",
+                    **self._bulk_debug_summary(payload),
                 )
                 return {
                     "messages": collected_messages,
@@ -3091,6 +3188,7 @@ class NapCatHistoryProvider:
                     "bulk_chunk_limit": chunk_limit,
                     "partial_fallback": False,
                     "page_size": int(payload.get("page_size") or page_size),
+                    "messages_sorted_ascending": self._bulk_messages_sorted_ascending(payload),
                 }
             if not next_anchor or next_anchor in seen_anchors or added <= 0:
                 remaining = data_count - len(collected_messages)

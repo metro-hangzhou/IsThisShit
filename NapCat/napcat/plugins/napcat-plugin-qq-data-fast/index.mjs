@@ -329,6 +329,78 @@ function sortHistoryMessages(messages) {
   });
 }
 
+const HISTORY_FETCH_STRATEGY_MSG_HISTORY = "msg_history";
+const HISTORY_FETCH_STRATEGY_SEQ_WINDOW = "seq_window";
+const HISTORY_FETCH_STRATEGY_QUERY_SEQ_WINDOW = "query_seq_window";
+
+function normalizeHistoryFetchStrategy(value) {
+  const text = asText(value).toLowerCase();
+  if (text === HISTORY_FETCH_STRATEGY_SEQ_WINDOW) {
+    return HISTORY_FETCH_STRATEGY_SEQ_WINDOW;
+  }
+  if (text === HISTORY_FETCH_STRATEGY_QUERY_SEQ_WINDOW) {
+    return HISTORY_FETCH_STRATEGY_QUERY_SEQ_WINDOW;
+  }
+  return HISTORY_FETCH_STRATEGY_MSG_HISTORY;
+}
+
+function rawHistorySeq(message) {
+  return asText(message?.msgSeq);
+}
+
+async function queryLatestHistoryWindow(ctx, peer, pageSize) {
+  return await ctx.core.context.session.getMsgService().queryMsgsWithFilterEx("0", "0", "0", {
+    chatInfo: peer,
+    filterMsgType: [],
+    filterSendersUid: [],
+    filterMsgToTime: "0",
+    filterMsgFromTime: "0",
+    isReverseOrder: true,
+    isIncludeCurrent: true,
+    pageLimit: pageSize,
+  });
+}
+
+async function fetchHistoryWindow(ctx, peer, pageSize, strategy, anchorMessageId, anchorMessageSeq) {
+  const startedAt = Date.now();
+  let response;
+  let route = HISTORY_FETCH_STRATEGY_MSG_HISTORY;
+  if (strategy === HISTORY_FETCH_STRATEGY_QUERY_SEQ_WINDOW) {
+    if (anchorMessageSeq) {
+      route = "getMsgsBySeqAndCount";
+      response = await ctx.core.apis.MsgApi.getMsgsBySeqAndCount(peer, anchorMessageSeq, pageSize, true, true);
+    } else if (anchorMessageId) {
+      route = "getMsgHistory";
+      response = await ctx.core.apis.MsgApi.getMsgHistory(peer, anchorMessageId, pageSize, true);
+    } else {
+      route = "queryMsgsWithFilterEx";
+      response = await queryLatestHistoryWindow(ctx, peer, pageSize);
+    }
+  } else if (strategy === HISTORY_FETCH_STRATEGY_SEQ_WINDOW) {
+    if (anchorMessageSeq) {
+      route = "getMsgsBySeqAndCount";
+      response = await ctx.core.apis.MsgApi.getMsgsBySeqAndCount(peer, anchorMessageSeq, pageSize, true, true);
+    } else if (anchorMessageId) {
+      route = "getMsgHistory";
+      response = await ctx.core.apis.MsgApi.getMsgHistory(peer, anchorMessageId, pageSize, true);
+    } else {
+      route = "getAioFirstViewLatestMsgs";
+      response = await ctx.core.apis.MsgApi.getAioFirstViewLatestMsgs(peer, pageSize);
+    }
+  } else if (anchorMessageId) {
+    route = "getMsgHistory";
+    response = await ctx.core.apis.MsgApi.getMsgHistory(peer, anchorMessageId, pageSize, true);
+  } else {
+    route = "getAioFirstViewLatestMsgs";
+    response = await ctx.core.apis.MsgApi.getAioFirstViewLatestMsgs(peer, pageSize);
+  }
+  return {
+    response,
+    route,
+    elapsedMs: Math.max(0, Date.now() - startedAt),
+  };
+}
+
 async function fetchHistoryTailBulk(ctx, payload) {
   const chatType = payload?.chat_type === "group" ? "group" : "private";
   const chatId = asText(payload?.chat_id || payload?.group_id || payload?.user_id);
@@ -343,20 +415,46 @@ async function fetchHistoryTailBulk(ctx, payload) {
   const startAnchorMessageId = asText(
     payload?.anchor_message_id || payload?.anchorMessageId || payload?.message_id,
   );
+  const startAnchorMessageSeq = asText(
+    payload?.anchor_message_seq || payload?.anchorMessageSeq || payload?.message_seq,
+  );
+  const historyFetchStrategy = normalizeHistoryFetchStrategy(
+    payload?.history_fetch_strategy || payload?.strategy,
+  );
+  const includeDebugStats = asBool(payload?.include_debug_stats, false);
   const peer = await buildPeer(ctx, chatType, chatId);
   const seenKeys = new Set();
   const seenAnchors = new Set();
-  const collected = [];
+  const pageSegments = [];
   let anchor = startAnchorMessageId;
+  let anchorSeq = startAnchorMessageSeq;
   let pagesScanned = 0;
   let noProgressStreak = 0;
   let exhausted = false;
+  const chunkStats = [];
+  let collectedCount = 0;
 
   while (collected.length < requestedDataCount) {
-    const response = anchor
-      ? await ctx.core.apis.MsgApi.getMsgHistory(peer, anchor, pageSize, true)
-      : await ctx.core.apis.MsgApi.getAioFirstViewLatestMsgs(peer, pageSize);
+    const pageCall = await fetchHistoryWindow(
+      ctx,
+      peer,
+      pageSize,
+      historyFetchStrategy,
+      anchor,
+      anchorSeq,
+    );
+    const response = pageCall.response;
     const rawPage = Array.isArray(response?.msgList) ? response.msgList : [];
+    if (includeDebugStats) {
+      chunkStats.push({
+        chunk_index: chunkStats.length + 1,
+        route: pageCall.route,
+        elapsed_ms: pageCall.elapsedMs,
+        anchor_message_id: anchor || null,
+        anchor_message_seq: anchorSeq || null,
+        message_count: rawPage.length,
+      });
+    }
     if (rawPage.length === 0) {
       exhausted = true;
       break;
@@ -364,14 +462,19 @@ async function fetchHistoryTailBulk(ctx, payload) {
     pagesScanned += 1;
     const sortedPage = sortHistoryMessages(rawPage);
     let added = 0;
+    const dedupedPage = [];
     for (const message of sortedPage) {
       const key = rawHistoryKey(message);
       if (!key || seenKeys.has(key)) {
         continue;
       }
       seenKeys.add(key);
-      collected.push(message);
+      dedupedPage.push(message);
       added += 1;
+    }
+    if (dedupedPage.length > 0) {
+      pageSegments.push(dedupedPage);
+      collectedCount += dedupedPage.length;
     }
     if (added === 0) {
       noProgressStreak += 1;
@@ -384,28 +487,155 @@ async function fetchHistoryTailBulk(ctx, payload) {
     }
     const oldest = sortedPage[0];
     const nextAnchor = rawHistoryAnchor(oldest);
+    const nextAnchorSeq = rawHistorySeq(oldest);
     if (!nextAnchor || seenAnchors.has(nextAnchor)) {
       exhausted = true;
       break;
     }
     seenAnchors.add(nextAnchor);
     anchor = nextAnchor;
+    anchorSeq = nextAnchorSeq || anchorSeq;
   }
 
-  const sortedCollected = sortHistoryMessages(collected);
-  const selected = sortedCollected.slice(-requestedDataCount);
+  const orderedCollected = [];
+  for (let index = pageSegments.length - 1; index >= 0; index -= 1) {
+    orderedCollected.push(...pageSegments[index]);
+  }
+  const selected = orderedCollected.slice(-requestedDataCount);
   const nextAnchor = selected.length > 0 ? rawHistoryAnchor(selected[0]) : "";
+  const nextAnchorSeq = selected.length > 0 ? rawHistorySeq(selected[0]) : "";
   return {
     chat_type: chatType,
     chat_id: chatId,
     requested_data_count: requestedDataCount,
     start_anchor_message_id: startAnchorMessageId || null,
+    start_anchor_message_seq: startAnchorMessageSeq || null,
     page_size: pageSize,
     pages_scanned: pagesScanned,
     count: selected.length,
+    history_fetch_strategy: historyFetchStrategy,
     next_anchor: nextAnchor || null,
+    next_anchor_message_seq: nextAnchorSeq || null,
+    messages_sorted_ascending: true,
     exhausted: exhausted || selected.length < requestedDataCount,
+    page_call_breakdown: includeDebugStats ? chunkStats : undefined,
     messages: selected.map(slimRawMessage),
+  };
+}
+
+async function fetchHistoryFullBulk(ctx, payload) {
+  const chatType = payload?.chat_type === "group" ? "group" : "private";
+  const chatId = asText(payload?.chat_id || payload?.group_id || payload?.user_id);
+  if (!chatId) {
+    throw new Error("chat_id is required");
+  }
+  const requestedDataCount = clampPositiveCount(
+    payload?.data_count || payload?.requested_data_count || payload?.count,
+    64000,
+  );
+  const pageSize = clampCount(payload?.page_size || payload?.count || DEFAULT_PAGE_SIZE);
+  const historyFetchStrategy = normalizeHistoryFetchStrategy(
+    payload?.history_fetch_strategy || payload?.strategy,
+  );
+  const includeDebugStats = asBool(payload?.include_debug_stats, false);
+  const peer = await buildPeer(ctx, chatType, chatId);
+  const seenKeys = new Set();
+  const seenAnchors = new Set();
+  const pageSegments = [];
+  let anchor = "";
+  let anchorSeq = "";
+  let pagesScanned = 0;
+  let noProgressStreak = 0;
+  let exhausted = false;
+  const chunkStats = [];
+  const startedAt = Date.now();
+  let collectedCount = 0;
+
+  while (collected.length < requestedDataCount) {
+    const pageCall = await fetchHistoryWindow(
+      ctx,
+      peer,
+      pageSize,
+      historyFetchStrategy,
+      anchor,
+      anchorSeq,
+    );
+    const response = pageCall.response;
+    const rawPage = Array.isArray(response?.msgList) ? response.msgList : [];
+    if (includeDebugStats) {
+      chunkStats.push({
+        chunk_index: chunkStats.length + 1,
+        route: pageCall.route,
+        elapsed_ms: pageCall.elapsedMs,
+        anchor_message_id: anchor || null,
+        anchor_message_seq: anchorSeq || null,
+        message_count: rawPage.length,
+      });
+    }
+    if (rawPage.length === 0) {
+      exhausted = true;
+      break;
+    }
+    pagesScanned += 1;
+    const sortedPage = sortHistoryMessages(rawPage);
+    let added = 0;
+    const dedupedPage = [];
+    for (const message of sortedPage) {
+      const key = rawHistoryKey(message);
+      if (!key || seenKeys.has(key)) {
+        continue;
+      }
+      seenKeys.add(key);
+      dedupedPage.push(message);
+      added += 1;
+      if ((collectedCount + dedupedPage.length) >= requestedDataCount) {
+        break;
+      }
+    }
+    if (dedupedPage.length > 0) {
+      pageSegments.push(dedupedPage);
+      collectedCount += dedupedPage.length;
+    }
+    if (added === 0) {
+      noProgressStreak += 1;
+      if (noProgressStreak >= 2) {
+        exhausted = true;
+        break;
+      }
+    } else {
+      noProgressStreak = 0;
+    }
+    const oldest = sortedPage[0];
+    const nextAnchor = rawHistoryAnchor(oldest);
+    const nextAnchorSeq = rawHistorySeq(oldest);
+    if (!nextAnchor || seenAnchors.has(nextAnchor)) {
+      exhausted = true;
+      break;
+    }
+    seenAnchors.add(nextAnchor);
+    anchor = nextAnchor;
+    anchorSeq = nextAnchorSeq || anchorSeq;
+  }
+
+  const orderedCollected = [];
+  for (let index = pageSegments.length - 1; index >= 0; index -= 1) {
+    orderedCollected.push(...pageSegments[index]);
+  }
+  return {
+    chat_type: chatType,
+    chat_id: chatId,
+    requested_data_count: requestedDataCount,
+    page_size: pageSize,
+    pages_scanned: pagesScanned,
+    count: orderedCollected.length,
+    history_fetch_strategy: historyFetchStrategy,
+    next_anchor: orderedCollected.length > 0 ? rawHistoryAnchor(orderedCollected[0]) || null : null,
+    next_anchor_message_seq: orderedCollected.length > 0 ? rawHistorySeq(orderedCollected[0]) || null : null,
+    messages_sorted_ascending: true,
+    exhausted: exhausted || orderedCollected.length < requestedDataCount,
+    page_call_breakdown: includeDebugStats ? chunkStats : undefined,
+    elapsed_ms: Math.max(0, Date.now() - startedAt),
+    messages: orderedCollected.map(slimRawMessage),
   };
 }
 
@@ -726,21 +956,48 @@ async function findForwardMediaTarget(ctx, messages, target, depth = 1, forwardL
   return bestMatch;
 }
 
-async function getRawMessageByContext(ctx, payload) {
+function buildRawMessageContextCacheKey(payload) {
+  const msgId = asText(payload?.message_id || payload?.message_id_raw);
+  const peerUid = asText(payload?.peer_uid);
+  const rawChatType = Number(payload?.chat_type_raw || 0);
+  if (!msgId || !peerUid || !Number.isFinite(rawChatType) || rawChatType <= 0) {
+    return "";
+  }
+  return `${rawChatType}:${peerUid}:${msgId}`;
+}
+
+async function getRawMessageByContext(ctx, payload, rawMessageCache = null) {
   const msgId = asText(payload?.message_id || payload?.message_id_raw);
   const peerUid = asText(payload?.peer_uid);
   const rawChatType = Number(payload?.chat_type_raw || 0);
   if (!msgId || !peerUid || !Number.isFinite(rawChatType) || rawChatType <= 0) {
     throw new Error("message_id_raw, peer_uid, and chat_type_raw are required");
   }
-  const peer = buildRawPeer(peerUid, rawChatType);
-  const rawMessage = (await ctx.core.apis.MsgApi.getMsgsByMsgId(peer, [msgId]))?.msgList?.find(
-    (msg) => asText(msg?.msgId) === msgId,
-  );
-  if (!rawMessage) {
-    throw new Error(`message ${msgId} not found`);
+  const cacheKey = buildRawMessageContextCacheKey(payload);
+  if (rawMessageCache instanceof Map && cacheKey) {
+    const cached = rawMessageCache.get(cacheKey);
+    if (cached) {
+      return await cached;
+    }
   }
-  return { msgId, rawChatType, peer, rawMessage };
+  const peer = buildRawPeer(peerUid, rawChatType);
+  const loadTask = (async () => {
+    const rawMessage = (await ctx.core.apis.MsgApi.getMsgsByMsgId(peer, [msgId]))?.msgList?.find(
+      (msg) => asText(msg?.msgId) === msgId,
+    );
+    if (!rawMessage) {
+      throw new Error(`message ${msgId} not found`);
+    }
+    return { msgId, rawChatType, peer, rawMessage };
+  })();
+  if (rawMessageCache instanceof Map && cacheKey) {
+    rawMessageCache.set(cacheKey, loadTask);
+  }
+  const resolved = await loadTask;
+  if (rawMessageCache instanceof Map && cacheKey) {
+    rawMessageCache.set(cacheKey, resolved);
+  }
+  return resolved;
 }
 
 function normalizeHydratedElementRecord(rawMessage, element, downloadPath, assetRole, depth = 0) {
@@ -962,7 +1219,8 @@ async function loadForwardMessages(ctx, rawMessage, forwardElement, forwardLoadC
   return loaded;
 }
 
-async function collectForwardMediaRecords(ctx, messages, depth = 1, forwardLoadCache = null) {
+async function collectForwardMediaRecords(ctx, messages, depth = 1, forwardLoadCache = null, options = {}) {
+  const metadataOnly = Boolean(options?.metadataOnly);
   const assets = [];
   for (const msg of messages || []) {
     const safeMsgId = asText(msg?.msgId);
@@ -971,7 +1229,9 @@ async function collectForwardMediaRecords(ctx, messages, depth = 1, forwardLoadC
     }
     for (const element of msg.elements) {
       if (element?.picElement || element?.fileElement || element?.videoElement || element?.pttElement) {
-        const normalized = await hydrateElementRecord(ctx, msg, element, "", depth);
+        const normalized = metadataOnly
+          ? normalizeHydratedElementRecord(msg, element, "", "", depth)
+          : await hydrateElementRecord(ctx, msg, element, "", depth);
         assets.push({
           ...normalized,
           source_message_id_raw: safeMsgId,
@@ -980,8 +1240,12 @@ async function collectForwardMediaRecords(ctx, messages, depth = 1, forwardLoadC
         continue;
       }
       if (element?.marketFaceElement) {
-        const staticRecord = await hydrateElementRecord(ctx, msg, element, "static", depth);
-        const dynamicRecord = await hydrateElementRecord(ctx, msg, element, "dynamic", depth);
+        const staticRecord = metadataOnly
+          ? normalizeHydratedElementRecord(msg, element, "", "static", depth)
+          : await hydrateElementRecord(ctx, msg, element, "static", depth);
+        const dynamicRecord = metadataOnly
+          ? normalizeHydratedElementRecord(msg, element, "", "dynamic", depth)
+          : await hydrateElementRecord(ctx, msg, element, "dynamic", depth);
         if (asText(staticRecord.file)) {
           assets.push({
             ...staticRecord,
@@ -1000,7 +1264,13 @@ async function collectForwardMediaRecords(ctx, messages, depth = 1, forwardLoadC
       }
       if (element?.multiForwardMsgElement?.resId) {
         const nested = await loadForwardMessages(ctx, msg, element.multiForwardMsgElement, forwardLoadCache);
-        const nestedAssets = await collectForwardMediaRecords(ctx, nested, depth + 1, forwardLoadCache);
+        const nestedAssets = await collectForwardMediaRecords(
+          ctx,
+          nested,
+          depth + 1,
+          forwardLoadCache,
+          { metadataOnly },
+        );
         assets.push(...nestedAssets);
       }
     }
@@ -1023,7 +1293,10 @@ async function hydrateForwardMedia(ctx, payload) {
   const forwardLoadCache = new Map();
   const nestedMessages = await loadForwardMessages(ctx, rawMessage, forwardElement.multiForwardMsgElement, forwardLoadCache);
     const target = buildForwardAssetTarget(payload);
-    if (target) {
+    const hasLocatorEvidence = Boolean(
+      target && (target.file_name || target.md5 || target.file_id || target.url || target.stem)
+    );
+    if (target && hasLocatorEvidence) {
       const matched = await findForwardMediaTarget(ctx, nestedMessages, target, 1, forwardLoadCache);
       if (matched?.rawMessage && matched?.element) {
         const matchedAssetType = asText(target?.asset_type).toLowerCase();
@@ -1071,23 +1344,48 @@ async function hydrateForwardMedia(ctx, payload) {
         targeted_mode: "targeted_miss",
       };
     }
-  const assets = await collectForwardMediaRecords(ctx, nestedMessages, 1, forwardLoadCache);
-  return { assets };
+  const metadataOnly = !Boolean(payload?.materialize);
+  let assets = await collectForwardMediaRecords(
+    ctx,
+    nestedMessages,
+    1,
+    forwardLoadCache,
+    { metadataOnly },
+  );
+  if (target) {
+    assets = assets.filter((asset) => {
+      const assetType = asText(asset?.asset_type).toLowerCase();
+      const assetRole = asText(asset?.asset_role).toLowerCase();
+      if (target.asset_type && assetType !== target.asset_type) {
+        return false;
+      }
+      if (target.asset_role && assetRole !== target.asset_role) {
+        return false;
+      }
+      return true;
+    });
+  }
+  return {
+    assets,
+    targeted: false,
+    targeted_mode: metadataOnly ? "metadata_parent_scope" : "",
+  };
 }
 
-async function hydrateForwardDetail(ctx, payload) {
+async function hydrateForwardDetail(ctx, payload, options = {}) {
   const elementId = asText(payload?.element_id);
   if (!elementId) {
     throw new Error("element_id is required");
   }
-  const { rawMessage } = await getRawMessageByContext(ctx, payload);
+  const rawMessageCache = options?.rawMessageCache instanceof Map ? options.rawMessageCache : null;
+  const forwardLoadCache = options?.forwardLoadCache instanceof Map ? options.forwardLoadCache : new Map();
+  const { rawMessage } = await getRawMessageByContext(ctx, payload, rawMessageCache);
   const forwardElement = rawMessage?.elements?.find(
     (element) => asText(element?.elementId) === elementId && element?.multiForwardMsgElement?.resId,
   );
   if (!forwardElement?.multiForwardMsgElement?.resId) {
     throw new Error(`forward element ${elementId} not found`);
   }
-  const forwardLoadCache = new Map();
   const nestedMessages = await loadForwardMessages(
     ctx,
     rawMessage,
@@ -1102,6 +1400,27 @@ async function hydrateForwardDetail(ctx, payload) {
   };
 }
 
+async function hydrateForwardDetailBatch(ctx, payload) {
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  const rawMessageCache = new Map();
+  const forwardLoadCache = new Map();
+  const results = await Promise.all(items.map(async (item) => {
+    try {
+      const data = await hydrateForwardDetail(ctx, item || {}, {
+        rawMessageCache,
+        forwardLoadCache,
+      });
+      return { ok: true, data };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }));
+  return { items: results };
+}
+
 export async function plugin_init(ctx) {
   ctx.logger.info("QQ Data Fast History plugin initialized");
 
@@ -1110,9 +1429,11 @@ export async function plugin_init(ctx) {
     { name: "capabilities", method: "GET", path: "/capabilities" },
     { name: "history", method: "POST", path: "/history" },
     { name: "history_tail_bulk", method: "POST", path: "/history-tail-bulk" },
+    { name: "history_full_bulk", method: "POST", path: "/history-full-bulk" },
     { name: "hydrate_media", method: "POST", path: "/hydrate-media" },
     { name: "hydrate_media_batch", method: "POST", path: "/hydrate-media-batch" },
     { name: "hydrate_forward_detail", method: "POST", path: "/hydrate-forward-detail" },
+    { name: "hydrate_forward_detail_batch", method: "POST", path: "/hydrate-forward-detail-batch" },
     { name: "hydrate_forward_media", method: "POST", path: "/hydrate-forward-media" },
   ];
 
@@ -1134,6 +1455,15 @@ export async function plugin_init(ctx) {
         ok: true,
         plugin: ctx.pluginName,
         version: "0.1.0",
+        features: {
+          forward_detail_batch: true,
+          forward_parent_metadata_scope: true,
+          history_fetch_strategy: [
+            HISTORY_FETCH_STRATEGY_MSG_HISTORY,
+            HISTORY_FETCH_STRATEGY_SEQ_WINDOW,
+            HISTORY_FETCH_STRATEGY_QUERY_SEQ_WINDOW,
+          ],
+        },
         routes: capabilityRoutes,
       },
     });
@@ -1158,6 +1488,19 @@ export async function plugin_init(ctx) {
       res.json({ code: 0, data });
     } catch (error) {
       ctx.logger.error("history-tail-bulk route failed", error);
+      res.status(500).json({
+        code: -1,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  ctx.router.postNoAuth("/history-full-bulk", async (req, res) => {
+    try {
+      const data = await fetchHistoryFullBulk(ctx, req.body || {});
+      res.json({ code: 0, data });
+    } catch (error) {
+      ctx.logger.error("history-full-bulk route failed", error);
       res.status(500).json({
         code: -1,
         message: error instanceof Error ? error.message : String(error),
@@ -1197,6 +1540,19 @@ export async function plugin_init(ctx) {
       res.json({ code: 0, data });
     } catch (error) {
       ctx.logger.error("hydrate-forward-detail route failed", error);
+      res.status(500).json({
+        code: -1,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  });
+
+  ctx.router.postNoAuth("/hydrate-forward-detail-batch", async (req, res) => {
+    try {
+      const data = await hydrateForwardDetailBatch(ctx, req.body || {});
+      res.json({ code: 0, data });
+    } catch (error) {
+      ctx.logger.error("hydrate-forward-detail-batch route failed", error);
       res.status(500).json({
         code: -1,
         message: error instanceof Error ? error.message : String(error),

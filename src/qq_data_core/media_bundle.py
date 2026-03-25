@@ -78,15 +78,19 @@ def write_export_bundle(
     manifest_path = data_path.with_suffix(".manifest.json")
     final_assets_dir = data_path.parent / f"{data_path.stem}_assets"
     try:
+        write_started = monotonic()
         written_data_path = write_data(snapshot, staged_data_path)
+        write_elapsed_s = monotonic() - write_started
         if progress_callback is not None:
             progress_callback(
                 {
                     "phase": "write_data_file",
                     "stage": "done",
+                    "elapsed_s": round(write_elapsed_s, 4),
                     "record_count": len(snapshot.messages),
                     "target_path": str(data_path),
                     "staged_path": str(written_data_path),
+                    "bytes_written": _safe_file_size(written_data_path),
                 }
             )
         materialize_started = monotonic()
@@ -164,17 +168,17 @@ def write_export_bundle(
         _write_manifest_json(
             manifest_path,
             {
-            "schema_version": 1,
-            "chat_type": snapshot.chat_type,
-            "chat_id": snapshot.chat_id,
-            "chat_name": snapshot.chat_name,
-            "exported_at": snapshot.exported_at.isoformat(),
-            "record_count": len(snapshot.messages),
-            "metadata": snapshot.metadata,
-            "data_file": data_path.name,
-            "assets_dir": final_assets_dir.name,
-            "asset_summary": summary,
-            "missing_breakdown": _summarize_missing_breakdown(assets),
+                "schema_version": 1,
+                "chat_type": snapshot.chat_type,
+                "chat_id": snapshot.chat_id,
+                "chat_name": snapshot.chat_name,
+                "exported_at": snapshot.exported_at.isoformat(),
+                "record_count": len(snapshot.messages),
+                "metadata": snapshot.metadata,
+                "data_file": data_path.name,
+                "assets_dir": final_assets_dir.name,
+                "asset_summary": summary,
+                "missing_breakdown": _summarize_missing_breakdown(assets),
             },
             assets=assets,
         )
@@ -616,7 +620,7 @@ def materialize_snapshot_media(
         )
         try:
             copy_started = monotonic()
-            _copy_asset_file_fast(resolved_path, target_path)
+            copy_stats = _copy_asset_file_fast(resolved_path, target_path)
             copy_elapsed_s = monotonic() - copy_started
             _emit_materialization_substep_trace(
                 progress_callback,
@@ -628,6 +632,7 @@ def materialize_snapshot_media(
                 source_size_bytes=_safe_file_size(resolved_path),
                 target_size_bytes=_safe_file_size(target_path),
                 resolver=asset.resolver,
+                copy_stats=copy_stats,
             )
         except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
             _emit_materialization_substep_trace(
@@ -866,7 +871,7 @@ def materialize_snapshot_media(
                 )
                 try:
                     copy_started = monotonic()
-                    _copy_asset_file_fast(resolved_path, target_path)
+                    copy_stats = _copy_asset_file_fast(resolved_path, target_path)
                 except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
                     _emit_materialization_substep_trace(
                         progress_callback,
@@ -896,6 +901,7 @@ def materialize_snapshot_media(
                     source_size_bytes=_safe_file_size(resolved_path),
                     target_size_bytes=_safe_file_size(target_path),
                     resolver=asset.resolver,
+                    copy_stats=copy_stats,
                 )
                 asset.status = "copied"
                 asset.exported_rel_path = rel_path.as_posix()
@@ -1023,13 +1029,25 @@ def _ensure_export_parent(
     created_export_dirs.add(cache_key)
 
 
-def _copy_asset_file_fast(source_path: Path, target_path: Path) -> None:
+def _copy_asset_file_fast(source_path: Path, target_path: Path) -> dict[str, Any]:
     source_anchor = str(source_path.anchor or "").strip().casefold()
     target_anchor = str(target_path.anchor or "").strip().casefold()
+    source_size_bytes = _safe_file_size(source_path)
     if source_anchor and target_anchor and source_anchor != target_anchor:
-        _copy_asset_file_buffered(source_path, target_path)
-        return
+        chunk_count = _copy_asset_file_buffered(source_path, target_path)
+        return {
+            "copy_mode": "buffered_cross_volume",
+            "copy_chunk_count": chunk_count,
+            "copy_buffer_bytes": BUFFERED_COPY_CHUNK_BYTES,
+            "copy_bytes_total": source_size_bytes,
+        }
     shutil.copyfile(source_path, target_path)
+    return {
+        "copy_mode": "copyfile_same_volume",
+        "copy_chunk_count": 1,
+        "copy_buffer_bytes": 0,
+        "copy_bytes_total": source_size_bytes,
+    }
 
 
 def _copy_asset_file_buffered(
@@ -1037,15 +1055,18 @@ def _copy_asset_file_buffered(
     target_path: Path,
     *,
     chunk_bytes: int = BUFFERED_COPY_CHUNK_BYTES,
-) -> None:
+) -> int:
     buffer = bytearray(max(64 * 1024, int(chunk_bytes)))
     view = memoryview(buffer)
+    chunk_count = 0
     with source_path.open("rb", buffering=0) as source_handle, target_path.open("wb", buffering=0) as target_handle:
         while True:
             bytes_read = source_handle.readinto(buffer)
             if not bytes_read:
                 break
             target_handle.write(view[:bytes_read])
+            chunk_count += 1
+    return chunk_count
 
 
 def _lookup_future_local_identity_resolution(
@@ -1347,6 +1368,7 @@ def _emit_materialization_substep_trace(
     source_size_bytes: int | None = None,
     target_size_bytes: int | None = None,
     resolver: str | None = None,
+    copy_stats: dict[str, Any] | None = None,
 ) -> None:
     if progress_callback is None:
         return
@@ -1394,6 +1416,11 @@ def _emit_materialization_substep_trace(
         payload["detail"] = detail
     if resolver:
         payload["resolver"] = resolver
+    if isinstance(copy_stats, dict):
+        for key, value in copy_stats.items():
+            if value is None or value == "":
+                continue
+            payload[key] = value
     progress_callback(payload)
 
 
