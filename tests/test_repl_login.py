@@ -200,6 +200,42 @@ def test_repl_export_tail_page_size_matches_cli_cap(monkeypatch) -> None:
     assert captured == {"data_count": 2000, "page_size": 500}
 
 
+def test_repl_watch_opens_history_only_when_ws_is_unavailable(monkeypatch) -> None:
+    repl = SlashRepl()
+    captured: dict[str, object] = {}
+    target = ChatTarget(chat_type="group", chat_id="922065597", name="蕾米二次元萌萌群")
+
+    def _ensure(endpoint: str, *args, **kwargs):
+        _ = args, kwargs
+        if endpoint == "onebot_ws":
+            raise RuntimeError(
+                "NapCat WebUI is running, but onebot_ws is still not listening at ws://127.0.0.1:3001."
+            )
+        return None
+
+    class _DummyView:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(repl, "_ensure_endpoint_ready", _ensure)
+    monkeypatch.setattr(repl, "_prime_target_cache", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(repl, "_resolve_target", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(repl, "_require_gateway", lambda: object())
+    monkeypatch.setattr(repl, "_require_service", lambda: object())
+    monkeypatch.setattr("qq_data_cli.watch_view.WatchConversationView", _DummyView)
+
+    repl._handle_watch(["group", "蕾米二次元萌萌群"])
+
+    assert captured["target"] is target
+    assert captured["history_limit"] == 80
+    assert captured["live_events_enabled"] is False
+    assert "实时监听当前不可用" in str(captured["initial_notice_text"])
+    assert "当前窗口仍可继续查看历史并执行导出" in str(captured["initial_notice_text"])
+
+
 def test_repl_quick_login_completion_returns_pinned_uin_without_blocking_on_service(monkeypatch) -> None:
     repl = SlashRepl()
     repl._settings = repl._settings.model_copy(update={"quick_login_uin": "3956020260"})

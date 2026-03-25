@@ -588,7 +588,7 @@ class SlashRepl:
         self._run_single_export(parsed, target=target, batch_prefix=None)
 
     def _handle_watch(self, argv: list[str]) -> None:
-        from qq_data_cli.watch_view import WatchConversationView
+        from qq_data_cli.watch_view import WatchConversationView, _friendly_watch_runtime_notice
         from qq_data_core import WatchRequest
 
         positionals, options = _parse_options(
@@ -600,7 +600,23 @@ class SlashRepl:
             raise ValueError("Usage: /watch group|friend <name-or-id> [--refresh] [--limit N]")
 
         self._ensure_endpoint_ready("onebot_http")
-        self._ensure_endpoint_ready("onebot_ws")
+        live_events_enabled = True
+        initial_notice_text = ""
+        try:
+            self._ensure_endpoint_ready("onebot_ws")
+        except RuntimeError as exc:
+            live_events_enabled = False
+            initial_notice_text = _friendly_watch_runtime_notice(
+                "实时监听当前不可用",
+                exc,
+                suffix="当前窗口仍可继续查看历史并执行导出。",
+            )
+            self._logger.warning(
+                "watch_live_events_disabled chat_type=%s query=%s reason=%s",
+                positionals[0],
+                positionals[1],
+                exc,
+            )
         chat_type = _normalize_chat_type(positionals[0])
         self._prime_target_cache(chat_type, quiet=False, endpoint_ready=True)
         target = self._resolve_target(chat_type, positionals[1], refresh=bool(options.get("refresh")))
@@ -618,13 +634,16 @@ class SlashRepl:
             request=request,
             history_limit=history_limit,
             ui_profile=self._ui_profile,
+            live_events_enabled=live_events_enabled,
+            initial_notice_text=initial_notice_text,
         )
         self._logger.info(
-            "watch_open chat_type=%s chat_id=%s chat_name=%s history_limit=%s",
+            "watch_open chat_type=%s chat_id=%s chat_name=%s history_limit=%s live_events_enabled=%s",
             chat_type,
             target.chat_id,
             target.display_name,
             history_limit,
+            live_events_enabled,
         )
         try:
             asyncio.run(view.run())
