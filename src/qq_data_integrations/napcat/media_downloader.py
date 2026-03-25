@@ -33,6 +33,8 @@ from .fast_history_client import (
 )
 from .http_client import NapCatApiError, NapCatApiTimeoutError, NapCatHttpClient
 
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
 
 class NapCatMediaDownloader:
     OLD_CONTEXT_BUCKET_MIN_AGE_DAYS = 120
@@ -4125,6 +4127,27 @@ class NapCatMediaDownloader:
             payload["url"] = remote_url
         return payload
 
+    def _cached_public_prefetch_result_for_request(
+        self,
+        request: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        direct_payload = self._direct_public_token_payload_for_request(request)
+        if not isinstance(request, dict) or not isinstance(direct_payload, dict):
+            return None
+        action = str(direct_payload.get("public_action") or "").strip().lower()
+        token = str(direct_payload.get("public_file_token") or "").strip()
+        if not action or not token:
+            return None
+        cache_key = self._public_token_prefetch_key(
+            request_data=request,
+            action=action,
+            token=token,
+        )
+        cached_result, _future = self._public_token_prefetch_state(cache_key)
+        if cached_result is not ...:
+            return cached_result if isinstance(cached_result, dict) else None
+        return None
+
     def _peek_public_token_prefetch(
         self,
         *,
@@ -5370,7 +5393,7 @@ class NapCatMediaDownloader:
         if not self._has_forward_parent_hint(hint):
             return None
         asset_type = str(request.get("asset_type") or "").strip().lower()
-        if asset_type not in {"file", "video", "speech"}:
+        if asset_type not in {"image", "file", "video", "speech"}:
             return None
         raw_timestamp = request.get("timestamp_ms")
         if not isinstance(raw_timestamp, (int, float)):
@@ -5407,6 +5430,7 @@ class NapCatMediaDownloader:
         normalized = str(route or "").strip().lower()
         if asset_age >= timedelta(days=NapCatMediaDownloader.FORWARD_TIMEOUT_STORM_GLOBAL_MIN_AGE_DAYS):
             if normalized in {
+                "public_token_get_image",
                 "public_token_get_file",
                 "public_token_get_record",
                 "forward_context_materialize",
@@ -5754,6 +5778,8 @@ class NapCatMediaDownloader:
         if not self._has_forward_parent_hint(hint):
             return False
         return (
+            self._forward_context_timed_out(request, materialize=materialize)
+            or
             self._forward_context_empty(request, materialize=materialize)
             or self._forward_context_error(request, materialize=materialize)
             or self._forward_context_unavailable(request, materialize=materialize)
@@ -6282,27 +6308,37 @@ class NapCatMediaDownloader:
         if self._has_forward_parent_hint(hint):
             return None
         cached_context_payload = request.get("_context_payload")
-        direct_payload = payload if isinstance(payload, dict) else (
+        context_payload = payload if isinstance(payload, dict) else (
             cached_context_payload if isinstance(cached_context_payload, dict) else None
         )
-        if direct_payload is None:
-            direct_payload = self._direct_public_token_payload_for_request(request)
-        if self._has_terminal_top_level_image_local_download_dead_signal(
-            request,
-            payload=direct_payload,
-        ):
-            return "qq_expired_after_napcat"
-        local_placeholder_missing = self._classify_image_placeholder_missing_from_evidence(
-            request,
-            payload=direct_payload,
+        direct_payload = self._direct_public_token_payload_for_request(request)
+        prefetched_public = self._cached_public_prefetch_result_for_request(request)
+        prefetched_public_payload = (
+            prefetched_public.get("payload") if isinstance(prefetched_public, dict) else None
         )
-        if local_placeholder_missing is not None:
-            return local_placeholder_missing
-        if self._has_terminal_top_level_image_missing_signal(
-            request,
-            payload=direct_payload,
-        ):
-            return "qq_expired_after_napcat"
+        candidate_payloads: list[dict[str, Any]] = []
+        for candidate in (context_payload, prefetched_public_payload, direct_payload):
+            if isinstance(candidate, dict) and candidate not in candidate_payloads:
+                candidate_payloads.append(candidate)
+        for candidate_payload in candidate_payloads:
+            if self._has_terminal_top_level_image_local_download_dead_signal(
+                request,
+                payload=candidate_payload,
+            ):
+                return "qq_expired_after_napcat"
+        for candidate_payload in candidate_payloads:
+            if self._has_terminal_top_level_image_missing_signal(
+                request,
+                payload=candidate_payload,
+            ):
+                return "qq_expired_after_napcat"
+        for candidate_payload in candidate_payloads:
+            local_placeholder_missing = self._classify_image_placeholder_missing_from_evidence(
+                request,
+                payload=candidate_payload,
+            )
+            if local_placeholder_missing is not None:
+                return local_placeholder_missing
         return None
 
     def _classify_terminal_top_level_file_like_missing(
@@ -6632,7 +6668,7 @@ class NapCatMediaDownloader:
         request: dict[str, Any] | None = None,
     ) -> float:
         normalized_action = str(action or "").strip().lower()
-        if normalized_action in {"get_file", "get_record"} and self._is_forward_expensive_terminal_candidate(request):
+        if normalized_action in {"get_image", "get_file", "get_record"} and self._is_forward_expensive_terminal_candidate(request):
             return float(self.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S)
         return float(self.PUBLIC_TOKEN_ACTION_TIMEOUT_S)
 
@@ -6705,7 +6741,7 @@ class NapCatMediaDownloader:
         if not self._has_forward_parent_hint(hint):
             return False
         asset_type = str(request.get("asset_type") or "").strip().lower()
-        if asset_type not in {"file", "video", "speech"}:
+        if asset_type not in {"image", "file", "video", "speech"}:
             return False
         return True
 

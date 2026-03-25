@@ -42,6 +42,17 @@ class _TimeoutPublicRecordClient:
         raise NapCatApiTimeoutError("NapCat action timed out: get_record")
 
 
+class _TimeoutPublicImageClient:
+    def __init__(self) -> None:
+        self.get_image_calls = 0
+        self.timeouts: list[float | None] = []
+
+    def get_image(self, *args, **kwargs):
+        self.get_image_calls += 1
+        self.timeouts.append(kwargs.get("timeout"))
+        raise NapCatApiTimeoutError("NapCat action timed out: get_image")
+
+
 class _MissingDirectFileClient:
     def __init__(self) -> None:
         self.get_file_calls = 0
@@ -1096,6 +1107,42 @@ def test_recent_forward_video_uses_shorter_public_token_timeout_when_terminal_ca
     assert client.timeouts == [downloader.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S]
 
 
+def test_old_forward_image_uses_shorter_public_token_timeout() -> None:
+    client = _TimeoutPublicImageClient()
+    downloader = NapCatMediaDownloader(client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_request("old-forward-image-timeout.png"), days=240),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Pic\2025-05\Ori\old-forward-image-timeout.png",
+    )
+
+    assert downloader._call_public_action_with_token(
+        "get_image",
+        "old-forward-image-timeout-token",
+        request=request,
+    ) is None
+
+    assert client.get_image_calls == 1
+    assert client.timeouts == [downloader.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S]
+
+
+def test_recent_forward_image_uses_shorter_public_token_timeout_when_terminal_candidate() -> None:
+    client = _TimeoutPublicImageClient()
+    downloader = NapCatMediaDownloader(client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_request("recent-forward-image-timeout.png"), days=7),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Pic\2026-03\Ori\recent-forward-image-timeout.png",
+    )
+
+    assert downloader._call_public_action_with_token(
+        "get_image",
+        "recent-forward-image-timeout-token",
+        request=request,
+    ) is None
+
+    assert client.get_image_calls == 1
+    assert client.timeouts == [downloader.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S]
+
+
 def test_old_forward_video_uses_shorter_forward_context_timeouts() -> None:
     fast_client = _RecordingForwardClient()
     downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
@@ -1866,6 +1913,37 @@ def test_classify_forward_missing_keeps_forward_image_with_dead_remote_but_no_te
     classification = downloader._classify_forward_missing(request)
 
     assert classification is None
+
+
+def test_resolve_for_export_classifies_prefetched_forward_image_with_dead_remote_and_metadata_timeout_as_background() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient(), remote_base_url="http://127.0.0.1:3000")
+    request = _mark_request_old(_build_forward_request("forward-prefetched-dead.jpg"), days=7)
+    request["download_hint"]["url"] = (
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-prefetched&spec=0"
+    )
+    key = downloader._request_key(request)
+    timeout_cache_key = downloader._forward_context_timeout_key(request, materialize=False)
+    assert timeout_cache_key is not None
+    downloader._prefetched_forward_media[key] = (None, None)
+    downloader._prefetched_forward_media_payloads[key] = {
+        "asset_type": "image",
+        "file_name": "forward-prefetched-dead.jpg",
+        "url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-prefetched&spec=0",
+        "remote_url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-prefetched&spec=0",
+    }
+    downloader._forward_context_timeout_cache.add(timeout_cache_key)
+    downloader._remember_remote_media_failure_reason(
+        "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=dead-forward-prefetched&spec=0",
+        "expired_remote",
+    )
+    downloader._remember_remote_media_failure_reason(
+        "http://127.0.0.1:3000/download?appid=1407&fileid=dead-forward-prefetched&spec=0",
+        "unsupported_local_download",
+    )
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
 
 
 def test_classify_forward_missing_keeps_forward_image_without_remote_or_public_handle_actionable_even_after_metadata_timeout() -> None:

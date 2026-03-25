@@ -727,6 +727,26 @@ class WatchConversationView:
             self._download_notice_text = self._format_watch_download_progress(update)
             self._invalidate()
             return
+        if phase == "materialize_asset_substep" and str(update.get("stage") or "") == "done":
+            status = str(update.get("status") or "")
+            if status in {"timeout", "unavailable", "storm_skip"}:
+                substep = str(update.get("substep") or "-")
+                asset_type = str(update.get("asset_type") or "-")
+                file_name = str(update.get("file_name") or "").strip() or "-"
+                timeout_s = float(update.get("timeout_s") or 0.0)
+                elapsed = float(update.get("elapsed_s") or 0.0)
+                detail = (
+                    f"Export asset substep {status}... substep={substep} "
+                    f"asset={asset_type}:{file_name}"
+                )
+                if timeout_s > 0:
+                    detail += f" timeout={timeout_s:.1f}s"
+                if elapsed > 0:
+                    detail += f" elapsed={elapsed:.1f}s"
+                detail += " continuing=1"
+                self._notice_text = detail
+                self._invalidate()
+                return
         if phase == "materialize_assets":
             current = int(update.get("current") or 0)
             total = int(update.get("total") or 0)

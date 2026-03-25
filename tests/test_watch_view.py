@@ -73,3 +73,29 @@ def test_start_background_tasks_skips_live_pump_when_disabled() -> None:
 
     assert view._pump_task is None
     view._app.create_background_task.assert_not_called()
+
+
+def test_apply_export_progress_surfaces_asset_substep_timeout_in_notice_text() -> None:
+    view = object.__new__(WatchConversationView)
+    view._notice_text = ""
+    view._invalidate = Mock()
+
+    WatchConversationView._apply_export_progress(
+        view,
+        {
+            "phase": "materialize_asset_substep",
+            "stage": "done",
+            "status": "timeout",
+            "substep": "public_token_get_image",
+            "asset_type": "image",
+            "file_name": "bad.png",
+            "timeout_s": 12.0,
+            "elapsed_s": 12.006,
+        },
+    )
+
+    assert "Export asset substep timeout..." in view._notice_text
+    assert "substep=public_token_get_image" in view._notice_text
+    assert "asset=image:bad.png" in view._notice_text
+    assert "continuing=1" in view._notice_text
+    view._invalidate.assert_called_once_with()
