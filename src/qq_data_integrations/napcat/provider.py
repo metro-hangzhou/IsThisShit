@@ -2211,9 +2211,12 @@ class NapCatHistoryProvider:
     @staticmethod
     def _is_structurally_valid_forward_detail_payload(payload: Any) -> bool:
         if isinstance(payload, list):
-            return True
+            return not payload or any(isinstance(item, dict) for item in payload)
         if isinstance(payload, dict):
-            return isinstance(payload.get("messages"), list)
+            messages = payload.get("messages")
+            return isinstance(messages, list) and (
+                not messages or any(isinstance(item, dict) for item in messages)
+            )
         return False
 
     def _prefetch_forward_details_via_fast_plugin(
