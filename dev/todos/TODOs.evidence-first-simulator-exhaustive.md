@@ -258,6 +258,47 @@ Remaining gap after this pass:
 - `provider_forward_detail_antiregression` is only partially complete
   - sorted-flag wrong and tail-hydrate skip boundaries are now locked
   - partial/empty batch-detail success semantics for full export still need explicit coverage
+
+## [2026-03-25] Progress Update: Full-Snapshot Forward Detail + Second-Pass Gate
+
+This pass closed two of the highest-value anti-regression gaps called out by the code audits:
+
+- `provider_forward_detail_antiregression`
+  - full-export integration is now explicitly covered for:
+    - `batch ok + empty payload -> history fallback`
+    - `batch partial items -> uncovered target single fast-plugin fallback`
+    - `batch ok + malformed/no data -> do not count as covered`
+    - `mixed already-resolved + terminal unavailable -> preserve both metadata counters`
+  - provider batch prefetch logic is now stricter:
+    - `ok=True` no longer counts as covered unless payload shape is structurally valid
+    - valid empty `messages=[]` remains covered and falls through to history fallback
+    - malformed `ok` items remain eligible for single fast-plugin fallback
+
+- `second_pass_gate_stability_under_prefetch_variants`
+  - downloader tests now lock the gate across:
+    - no prefetch state
+    - pending future
+    - future done but not finalized
+    - cached payload-only prefetch
+    - cached remote-attempted-failed prefetch
+    - cached terminal public outcome
+    - terminal top-level request-state placeholder
+    - terminal `_context_payload` placeholder
+
+Next highest-value simulator work now is no longer the basic gate itself, but the missing simulator expression power:
+
+- add a prefetch-state seeding runner for:
+  - `_public_token_prefetch_cache`
+  - `_public_token_prefetch_futures`
+  - `_prefetched_media_payloads`
+  - `_prefetched_forward_media_payloads`
+  - request-level `_context_payload`
+- add explicit scenario dimensions for:
+  - `hint_file_id_state = none | public_token | direct_file_id`
+  - composite payload states such as:
+    - `public_token + empty_local`
+    - `public_token + stale_local`
+    - `public_token + zero_local`
 - `future_local_identity_cross_topology` is partially complete
   - unresolved/recoverable cross-topology cases are now covered
   - weak-key-first vs strong-key-first promotion still needs dedicated matrix coverage

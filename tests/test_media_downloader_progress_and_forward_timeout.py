@@ -3673,3 +3673,110 @@ def test_second_pass_public_retry_only_runs_when_prefetch_state_is_pending() -> 
 
     downloader._store_public_token_prefetch_result(cache_key, None, future=pending_future)
     assert downloader.should_attempt_second_pass_public_retry(request) is False
+
+
+def test_second_pass_public_retry_gate_remains_stable_across_prefetch_and_terminal_variants() -> None:
+    def _cache_key_for(
+        downloader: NapCatMediaDownloader,
+        request: dict[str, object],
+    ) -> tuple[str, str, str, str]:
+        direct_payload = downloader._direct_public_token_payload_for_request(request)
+        assert direct_payload is not None
+        return downloader._public_token_prefetch_key(
+            request_data=request,
+            action=str(direct_payload["public_action"]),
+            token=str(direct_payload["public_file_token"]),
+        )
+
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _second_pass_request()
+    cache_key = _cache_key_for(downloader, request)
+
+    assert downloader.should_attempt_second_pass_public_retry(request) is False
+
+    pending_future: Future[dict[str, object] | None] = Future()
+    downloader._public_token_prefetch_futures[cache_key] = pending_future
+    assert downloader.should_attempt_second_pass_public_retry(request) is True
+
+    pending_future.set_result(None)
+    assert downloader.should_attempt_second_pass_public_retry(request) is True
+
+    downloader._store_public_token_prefetch_result(
+        cache_key,
+        {
+            "payload": {
+                "public_action": "get_image",
+                "public_file_token": "live-token",
+            }
+        },
+        future=pending_future,
+    )
+    assert downloader.should_attempt_second_pass_public_retry(request) is False
+
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request = _second_pass_request()
+    cache_key = _cache_key_for(downloader, request)
+    downloader._store_public_token_prefetch_result(
+        cache_key,
+        {
+            "payload": {
+                "public_action": "get_image",
+                "public_file_token": "live-token",
+            },
+            "remote_attempted": True,
+        },
+    )
+    assert downloader.should_attempt_second_pass_public_retry(request) is False
+
+    downloader = NapCatMediaDownloader(_DummyClient())
+    terminal_request = {
+        "asset_type": "image",
+        "file_name": "terminal-image.png",
+        "timestamp_ms": 1757142395000,
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Pic\2025-09\Ori\terminal-image.png",
+        "download_hint": {
+            "file_id": "1528803999",
+            "url": "/gchatpic_new/0/0-0-terminal/0?term=2",
+        },
+    }
+    terminal_cache_key = _cache_key_for(downloader, terminal_request)
+    downloader._store_public_token_prefetch_result(
+        terminal_cache_key,
+        {
+            "payload": {
+                "_known_missing_classification": "qq_not_downloaded_local_placeholder",
+                "public_action": "get_image",
+                "public_file_token": "1528803999",
+            }
+        },
+    )
+    assert downloader.should_attempt_second_pass_public_retry(terminal_request) is False
+
+    downloader = NapCatMediaDownloader(_DummyClient())
+    zero_byte_root = _workspace_temp_dir()
+    try:
+        zero_byte_path = zero_byte_root / "Pic" / "2025-09" / "Ori" / "terminal-image.png"
+        zero_byte_path.parent.mkdir(parents=True, exist_ok=True)
+        zero_byte_path.write_bytes(b"")
+        terminal_request = {
+            "asset_type": "image",
+            "file_name": "terminal-image.png",
+            "timestamp_ms": 1757142395000,
+            "source_path": str(zero_byte_path),
+            "download_hint": {
+                "file_id": "1528803999",
+                "url": "/gchatpic_new/0/0-0-terminal/0?term=2",
+            },
+        }
+        downloader._public_token_action_outcomes[("get_image", "1528803999")] = None
+        assert downloader.should_attempt_second_pass_public_retry(terminal_request) is False
+
+        context_terminal_request = dict(terminal_request)
+        context_terminal_request["_context_payload"] = {
+            "public_action": "get_image",
+            "public_file_token": "1528803999",
+            "file": str(zero_byte_path),
+        }
+        assert downloader.should_attempt_second_pass_public_retry(context_terminal_request) is False
+    finally:
+        shutil.rmtree(zero_byte_root, ignore_errors=True)

@@ -2199,9 +2199,22 @@ class NapCatHistoryProvider:
                 continue
             if not item.get("ok"):
                 continue
-            nested_messages = self._extract_messages(item.get("data"))
-            results[key] = ((nested_messages or None), None)
+            data = item.get("data")
+            nested_messages = self._extract_messages(data)
+            if nested_messages:
+                results[key] = (nested_messages, None)
+                continue
+            if self._is_structurally_valid_forward_detail_payload(data):
+                results[key] = (None, None)
         return results
+
+    @staticmethod
+    def _is_structurally_valid_forward_detail_payload(payload: Any) -> bool:
+        if isinstance(payload, list):
+            return True
+        if isinstance(payload, dict):
+            return isinstance(payload.get("messages"), list)
+        return False
 
     def _prefetch_forward_details_via_fast_plugin(
         self,
