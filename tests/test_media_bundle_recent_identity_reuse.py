@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import shutil
 
+import qq_data_core.media_bundle as media_bundle
 from qq_data_core.media_bundle import materialize_snapshot_media
 from qq_data_core.models import NormalizedMessage, NormalizedSegment, NormalizedSnapshot
 
@@ -45,6 +46,16 @@ class _MissingAssetManager:
         _ = request
         return None, None
 
+    def should_attempt_second_pass_public_retry(self, request):
+        _ = request
+        return True
+
+
+class _NoSecondPassRetryOpportunityManager(_MissingAssetManager):
+    def should_attempt_second_pass_public_retry(self, request):
+        _ = request
+        return False
+
 
 class _RecoveringPublicRetryManager(_MissingAssetManager):
     def __init__(self, resolved_path: Path, *, tracked_asset_types: set[str] | None = None) -> None:
@@ -75,6 +86,90 @@ class _ResolvedAssetManager(_MissingAssetManager):
             return None, None
         self.resolve_calls += 1
         return self.resolved_path, "napcat_forward_remote_url"
+
+
+def test_normalize_file_name_avoids_header_probe_for_trusted_image_suffix(monkeypatch) -> None:
+    called = False
+
+    def _fake_guess_extension(_path: Path) -> str:
+        nonlocal called
+        called = True
+        return ".jpg"
+
+    monkeypatch.setattr(media_bundle, "_guess_extension", _fake_guess_extension)
+
+    name = media_bundle._normalize_file_name(  # type: ignore[attr-defined]
+        "example.png",
+        resolved_path=Path("C:/tmp/example.png"),
+        asset_type="image",
+    )
+
+    assert name == "example.png"
+    assert called is False
+
+
+def test_normalize_file_name_still_probes_when_suffix_missing(monkeypatch) -> None:
+    called = False
+
+    def _fake_guess_extension(_path: Path) -> str:
+        nonlocal called
+        called = True
+        return ".png"
+
+    monkeypatch.setattr(media_bundle, "_guess_extension", _fake_guess_extension)
+
+    name = media_bundle._normalize_file_name(  # type: ignore[attr-defined]
+        "example",
+        resolved_path=Path("C:/tmp/example"),
+        asset_type="image",
+    )
+
+    assert name == "example.png"
+    assert called is True
+
+
+def test_copy_asset_file_fast_uses_buffered_copy_for_cross_volume(monkeypatch) -> None:
+    called: list[tuple[Path, Path]] = []
+
+    def _fake_buffered(source_path: Path, target_path: Path, *, chunk_bytes: int = media_bundle.BUFFERED_COPY_CHUNK_BYTES):
+        _ = chunk_bytes
+        called.append((source_path, target_path))
+
+    monkeypatch.setattr(media_bundle, "_copy_asset_file_buffered", _fake_buffered)
+    monkeypatch.setattr(
+        media_bundle.shutil,
+        "copyfile",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("plain copyfile should not run")),
+    )
+
+    media_bundle._copy_asset_file_fast(  # type: ignore[attr-defined]
+        Path(r"C:\QQ\source.jpg"),
+        Path(r"D:\exports\source.jpg"),
+    )
+
+    assert called == [(Path(r"C:\QQ\source.jpg"), Path(r"D:\exports\source.jpg"))]
+
+
+def test_copy_asset_file_fast_uses_plain_copyfile_for_same_volume(monkeypatch) -> None:
+    calls: list[tuple[Path, Path]] = []
+
+    monkeypatch.setattr(
+        media_bundle.shutil,
+        "copyfile",
+        lambda source_path, target_path: calls.append((Path(source_path), Path(target_path))),
+    )
+    monkeypatch.setattr(
+        media_bundle,
+        "_copy_asset_file_buffered",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("buffered copy should not run")),
+    )
+
+    media_bundle._copy_asset_file_fast(  # type: ignore[attr-defined]
+        Path(r"D:\QQ\source.jpg"),
+        Path(r"D:\exports\source.jpg"),
+    )
+
+    assert calls == [(Path(r"D:\QQ\source.jpg"), Path(r"D:\exports\source.jpg"))]
 
 
 def _forward_image_message(*, file_name: str, md5: str, timestamp_ms: int) -> NormalizedMessage:
@@ -322,11 +417,12 @@ def test_recent_forward_image_missing_is_reused_after_later_top_level_success() 
         first_missing_resolver="missing_after_napcat",
         second_file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
         second_md5="e23a4961d16c0004dbccb8884a8e427b",
-        expect_statuses=["reused", "copied"],
+        expect_statuses=["copied", "reused"],
         expect_public_retry_calls=0,
     )
 
     assert assets[0].exported_rel_path == assets[1].exported_rel_path
+    assert assets[0].resolver == "bundle_future_local_identity_evidence"
     assert assets[0].missing_kind is None
     assert assets[0].note is None
 
@@ -351,11 +447,12 @@ def test_recent_forward_background_missing_is_reused_after_later_top_level_succe
         first_missing_resolver="qq_expired_after_napcat",
         second_file_name="E23A4961D16C0004DBCCB8884A8E427B.jpg",
         second_md5="e23a4961d16c0004dbccb8884a8e427b",
-        expect_statuses=["reused", "copied"],
+        expect_statuses=["copied", "reused"],
         expect_public_retry_calls=0,
     )
 
     assert assets[0].exported_rel_path == assets[1].exported_rel_path
+    assert assets[0].resolver == "bundle_future_local_identity_evidence"
     assert assets[0].missing_kind is None
     assert assets[0].note is None
 
@@ -397,8 +494,9 @@ def test_recent_forward_image_missing_reuses_later_file_id_backed_success() -> N
             media_download_manager=manager,
         )
 
-        assert [item.status for item in assets] == ["reused", "copied"]
+        assert [item.status for item in assets] == ["copied", "reused"]
         assert assets[0].exported_rel_path == assets[1].exported_rel_path
+        assert assets[0].resolver == "bundle_future_local_identity_evidence"
         assert assets[0].missing_kind is None
         assert assets[0].note is None
         assert manager.public_retry_calls == 0
@@ -429,6 +527,94 @@ def test_first_pass_top_level_image_uses_future_local_identity_evidence() -> Non
                 _top_level_image_message(
                     file_name="SHARED-TOP-LEVEL.jpg",
                     md5="shared-top-level-md5",
+                    source_path=str(actual_image_path),
+                    timestamp_ms=1768035301000,
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["copied", "reused"]
+        assert assets[0].resolver == "bundle_future_local_identity_evidence"
+        assert assets[0].exported_rel_path == assets[1].exported_rel_path
+        assert manager.resolve_calls == 0
+        assert manager.public_retry_calls == 0
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_first_pass_forward_image_uses_future_local_identity_evidence() -> None:
+    temp_root = Path(".") / "state" / "test_temp_future_local_identity_forward_image"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        actual_image_path = temp_root / "SHARED-FORWARD.jpg"
+        actual_image_path.write_bytes(b"image-bytes")
+        manager = _MissingAssetManager(missing_resolver="missing_after_napcat")
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _forward_image_message(
+                    file_name="SHARED-FORWARD.jpg",
+                    md5="shared-forward-md5",
+                    timestamp_ms=1768035294000,
+                ),
+                _top_level_image_message(
+                    file_name="SHARED-FORWARD.jpg",
+                    md5="shared-forward-md5",
+                    source_path=str(actual_image_path),
+                    timestamp_ms=1768035301000,
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["copied", "reused"]
+        assert assets[0].resolver == "bundle_future_local_identity_evidence"
+        assert assets[0].exported_rel_path == assets[1].exported_rel_path
+        assert manager.resolve_calls == 0
+        assert manager.public_retry_calls == 0
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_first_pass_forward_image_uses_future_local_identity_evidence() -> None:
+    temp_root = Path(".") / "state" / "test_temp_future_local_identity_forward_image"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        actual_image_path = temp_root / "SHARED-FORWARD.jpg"
+        actual_image_path.write_bytes(b"image-bytes")
+        manager = _MissingAssetManager(missing_resolver="missing_after_napcat")
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _forward_image_message(
+                    file_name="SHARED-FORWARD.jpg",
+                    md5="shared-forward-md5",
+                    timestamp_ms=1768035294000,
+                ),
+                _top_level_image_message(
+                    file_name="SHARED-FORWARD.jpg",
+                    md5="shared-forward-md5",
                     source_path=str(actual_image_path),
                     timestamp_ms=1768035301000,
                 ),
@@ -526,6 +712,43 @@ def test_recent_forward_public_retry_clears_missing_kind_after_recovery() -> Non
         assert assets[0].missing_kind is None
         assert assets[0].note is None
         assert manager.public_retry_calls == 1
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_second_pass_public_retry_is_skipped_without_new_evidence() -> None:
+    temp_root = Path(".") / "state" / "test_temp_public_retry_skip_without_new_evidence"
+    try:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        temp_root.mkdir(parents=True, exist_ok=True)
+        manager = _NoSecondPassRetryOpportunityManager(missing_resolver="missing_after_napcat")
+        snapshot = NormalizedSnapshot(
+            chat_type="group",
+            chat_id="922065597",
+            chat_name="蕾米二次元萌萌群",
+            exported_at=datetime.now(timezone.utc),
+            messages=[
+                _top_level_image_message_with_file_id(
+                    file_name="skip-second-pass.jpg",
+                    md5="skip-second-pass-md5",
+                    source_path=str(temp_root / "missing" / "skip-second-pass.jpg"),
+                    timestamp_ms=1768035301000,
+                    file_id="stale-direct-token",
+                    url="/download?appid=1407&fileid=stale-direct-token&spec=0",
+                ),
+            ],
+        )
+
+        assets = materialize_snapshot_media(
+            snapshot,
+            temp_root / "assets",
+            media_resolution_mode="napcat_only",
+            media_download_manager=manager,
+        )
+
+        assert [item.status for item in assets] == ["missing"]
+        assert assets[0].missing_kind == "missing_after_napcat"
+        assert manager.public_retry_calls == 0
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 

@@ -88,13 +88,18 @@ def test_export_perf_report_includes_stage_page_and_materialize_breakdown(tmp_pa
         "materialize_asset_substep",
         {
             "stage": "done",
-            "substep": "public_token_get_image",
-            "status": "ok",
+            "substep": "copy_asset_file",
+            "status": "done",
             "asset_type": "image",
             "file_name": "A.png",
             "elapsed_s": 0.078,
             "message_id_raw": "1",
             "element_id": "2",
+            "resolver": "direct_local_path",
+            "source_size_bytes": 2048,
+            "source_drive": "C:\\",
+            "target_drive": "D:\\",
+            "same_volume": False,
         },
     )
 
@@ -102,19 +107,23 @@ def test_export_perf_report_includes_stage_page_and_materialize_breakdown(tmp_pa
 
     assert report["record_count"] == 20
     assert report["total_elapsed_s"] >= 0
+    assert report["pages_scanned"] == 4
     assert report["stage_breakdown"][0]["name"] == "app.fetch_snapshot"
     assert report["history_page_breakdown"][0]["name"] == "tail_scan:napcat_fast_history_bulk"
     assert report["fetch_stage_breakdown"][0]["name"] == "app.fetch_snapshot"
     assert report["materialize_asset_breakdown"][0]["asset_type"] == "image"
     assert report["materialize_asset_breakdown"][0]["resolver"] == "napcat_public_token_get_image"
-    assert report["materialize_stage_breakdown"][0]["substep"] == "public_token_get_image"
+    assert report["materialize_stage_breakdown"][0]["substep"] == "copy_asset_file"
+    assert report["copy_io_breakdown"][0]["substep"] == "copy_asset_file"
+    assert report["copy_io_breakdown"][0]["same_volume"] is False
+    assert report["copy_io_breakdown"][0]["bytes_total"] == 2048
     assert report["scan_phase_breakdown"][0]["name"] == "tail_scan"
     assert report["scan_summaries"][0]["scan_phase"] == "tail_scan"
     assert report["tail_bulk_chunk_breakdown"][0]["chunk_index"] == 1
     assert report["tail_forward_hydrate_windows"][0]["window_index"] == 1
     assert report["tail_forward_hydrate_windows"][0]["forward_ref_count"] == 3
     assert report["top_materialize_steps"][0]["file_name"] == "A.png"
-    assert report["top_materialize_substeps"][0]["substep"] == "public_token_get_image"
+    assert report["top_materialize_substeps"][0]["substep"] == "copy_asset_file"
 
     writer.close()
     report_path = writer.persist_report(record_count=20)

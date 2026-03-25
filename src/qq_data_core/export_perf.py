@@ -72,6 +72,12 @@ def _summarize_timing_bucket(name: str, bucket: dict[str, Any]) -> dict[str, Any
     }
     if bucket.get("errors"):
         result["errors"] = int(bucket.get("errors") or 0)
+    if "bytes_total" in bucket:
+        result["bytes_total"] = int(bucket.get("bytes_total") or 0)
+    if "same_volume_count" in bucket:
+        result["same_volume_count"] = int(bucket.get("same_volume_count") or 0)
+    if "cross_volume_count" in bucket:
+        result["cross_volume_count"] = int(bucket.get("cross_volume_count") or 0)
     if bucket.get("max_payload"):
         result["max_payload"] = bucket["max_payload"]
     return result
@@ -184,6 +190,7 @@ class ExportPerfTraceWriter:
         self._substep_buckets: dict[str, dict[str, Any]] = {}
         self._materialize_asset_buckets: dict[str, dict[str, Any]] = {}
         self._materialize_stage_buckets: dict[str, dict[str, Any]] = {}
+        self._copy_io_buckets: dict[str, dict[str, Any]] = {}
         self._closed = False
         self.report_path = self.path.with_suffix(".report.json")
 
@@ -252,6 +259,7 @@ class ExportPerfTraceWriter:
         if kind == "history_page_done":
             mode = str(payload.get("mode") or "").strip() or "unknown"
             history_source = str(payload.get("history_source") or "").strip() or "unknown"
+            self._pages_scanned = max(self._pages_scanned, int(payload.get("pages_scanned") or 0))
             bucket_name = f"{mode}:{history_source}"
             bucket = self._history_page_buckets.setdefault(
                 bucket_name,
@@ -431,6 +439,49 @@ class ExportPerfTraceWriter:
                 payload=payload,
                 max_payload_omit={"elapsed_s", "elapsed_ms"},
             )
+            if substep in {"copy_asset_file", "second_pass_copy_asset_file"}:
+                same_volume = bool(payload.get("same_volume"))
+                source_drive = str(payload.get("source_drive") or "").strip() or "-"
+                target_drive = str(payload.get("target_drive") or "").strip() or "-"
+                resolver = str(payload.get("resolver") or "").strip() or "-"
+                source_size_bytes = int(payload.get("source_size_bytes") or 0)
+                size_bucket = _size_bucket_label(source_size_bytes)
+                copy_bucket_name = (
+                    f"{asset_type}:{substep}:resolver={resolver}:same_volume={same_volume}:"
+                    f"size_bucket={size_bucket}:{source_drive}->{target_drive}"
+                )
+                copy_bucket = self._copy_io_buckets.setdefault(
+                    copy_bucket_name,
+                    {
+                        "count": 0,
+                        "total_s": 0.0,
+                        "max_s": 0.0,
+                        "errors": 0,
+                        "asset_type": asset_type,
+                        "substep": substep,
+                        "resolver": resolver,
+                        "same_volume": same_volume,
+                        "source_drive": source_drive,
+                        "target_drive": target_drive,
+                        "size_bucket": size_bucket,
+                        "bytes_total": 0,
+                        "same_volume_count": 0,
+                        "cross_volume_count": 0,
+                    },
+                )
+                if status in {"error", "timeout", "cached_error"}:
+                    copy_bucket["errors"] = int(copy_bucket.get("errors") or 0) + 1
+                copy_bucket["bytes_total"] = int(copy_bucket.get("bytes_total") or 0) + source_size_bytes
+                if same_volume:
+                    copy_bucket["same_volume_count"] = int(copy_bucket.get("same_volume_count") or 0) + 1
+                else:
+                    copy_bucket["cross_volume_count"] = int(copy_bucket.get("cross_volume_count") or 0) + 1
+                _update_timing_bucket(
+                    copy_bucket,
+                    elapsed_s=elapsed_s,
+                    payload=payload,
+                    max_payload_omit={"elapsed_s", "elapsed_ms"},
+                )
             _append_top_event(
                 self._top_materialize_substeps,
                 elapsed_s=elapsed_s,
@@ -574,6 +625,21 @@ class ExportPerfTraceWriter:
                 row["substep"] = bucket.get("substep")
                 row["status"] = bucket.get("status")
                 materialize_stage_breakdown.append(row)
+            copy_io_breakdown = []
+            for name, bucket in sorted(
+                self._copy_io_buckets.items(),
+                key=lambda item: float(item[1].get("total_s") or 0.0),
+                reverse=True,
+            ):
+                row = _summarize_timing_bucket(name, bucket)
+                row["asset_type"] = bucket.get("asset_type")
+                row["substep"] = bucket.get("substep")
+                row["resolver"] = bucket.get("resolver")
+                row["same_volume"] = bool(bucket.get("same_volume"))
+                row["source_drive"] = bucket.get("source_drive")
+                row["target_drive"] = bucket.get("target_drive")
+                row["size_bucket"] = bucket.get("size_bucket")
+                copy_io_breakdown.append(row)
             return {
                 **summary,
                 "total_elapsed_s": summary["elapsed_s"],
@@ -585,6 +651,7 @@ class ExportPerfTraceWriter:
                 "scan_phase_breakdown": scan_phase_breakdown,
                 "materialize_stage_breakdown": materialize_stage_breakdown,
                 "materialize_asset_breakdown": materialize_asset_breakdown,
+                "copy_io_breakdown": copy_io_breakdown,
                 "scan_summaries": list(self._scan_summaries),
                 "page_size_adapt_events": list(self._page_size_adapt_events),
                 "forward_expand_runs": list(self._forward_expand_runs),
@@ -613,3 +680,19 @@ class ExportPerfTraceWriter:
             self._handle.flush()
             self._handle.close()
             os.replace(self._temp_path, self.path)
+
+
+def _size_bucket_label(size_bytes: int) -> str:
+    if size_bytes <= 0:
+        return "0"
+    if size_bytes < 64 * 1024:
+        return "<64KiB"
+    if size_bytes < 256 * 1024:
+        return "64-256KiB"
+    if size_bytes < 1024 * 1024:
+        return "256KiB-1MiB"
+    if size_bytes < 8 * 1024 * 1024:
+        return "1-8MiB"
+    if size_bytes < 32 * 1024 * 1024:
+        return "8-32MiB"
+    return ">=32MiB"

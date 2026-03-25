@@ -24,6 +24,7 @@ from .models import ExportBundleResult, MaterializedAsset, NormalizedMessage, No
 from .paths import atomic_write_bytes, build_timestamp_token
 
 MATERIALIZE_SLOW_STEP_WARN_S = 5.0
+BUFFERED_COPY_CHUNK_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +301,7 @@ def materialize_snapshot_media(
     future_local_identity_map = _build_future_local_identity_resolution_map(candidate_entries)
     occupied_export_paths: dict[str, str] = {}
     resolution_cache: dict[tuple[Any, ...], tuple[Path | None, str]] = {}
+    created_export_dirs: set[str] = set()
     assets: list[MaterializedAsset] = []
     second_pass_candidates: list[tuple[MaterializedAsset, _AssetCandidate]] = []
     copied_count = 0
@@ -603,7 +605,7 @@ def materialize_snapshot_media(
         )
         target_path = assets_dir / rel_path
         mkdir_started = monotonic()
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_export_parent(target_path.parent, created_export_dirs)
         _emit_materialization_substep_trace(
             progress_callback,
             substep="ensure_export_parent",
@@ -614,7 +616,7 @@ def materialize_snapshot_media(
         )
         try:
             copy_started = monotonic()
-            shutil.copy2(resolved_path, target_path)
+            _copy_asset_file_fast(resolved_path, target_path)
             copy_elapsed_s = monotonic() - copy_started
             _emit_materialization_substep_trace(
                 progress_callback,
@@ -783,6 +785,19 @@ def materialize_snapshot_media(
                 "timestamp_ms": candidate.timestamp_ms,
                 "download_hint": candidate.download_hint,
             }
+            if (
+                hasattr(media_download_manager, "should_attempt_second_pass_public_retry")
+                and not media_download_manager.should_attempt_second_pass_public_retry(request_payload)
+            ):
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_public_retry",
+                    candidate=candidate,
+                    elapsed_s=0.0,
+                    status="skip_no_new_evidence",
+                    detail="skipped repeated public token retry without pending prefetch result",
+                )
+                continue
             with suppress(Exception):
                 public_retry_started = monotonic()
                 resolved_path, resolver = media_download_manager.resolve_via_public_token_route(
@@ -839,7 +854,7 @@ def materialize_snapshot_media(
                 )
                 target_path = assets_dir / rel_path
                 mkdir_started = monotonic()
-                target_path.parent.mkdir(parents=True, exist_ok=True)
+                _ensure_export_parent(target_path.parent, created_export_dirs)
                 _emit_materialization_substep_trace(
                     progress_callback,
                     substep="second_pass_ensure_export_parent",
@@ -851,7 +866,7 @@ def materialize_snapshot_media(
                 )
                 try:
                     copy_started = monotonic()
-                    shutil.copy2(resolved_path, target_path)
+                    _copy_asset_file_fast(resolved_path, target_path)
                 except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
                     _emit_materialization_substep_trace(
                         progress_callback,
@@ -987,8 +1002,6 @@ def _build_future_local_identity_resolution_map(
     for index, (_message, candidate) in enumerate(candidate_entries, start=1):
         if candidate.asset_type != "image":
             continue
-        if _candidate_has_forward_parent_hint(candidate):
-            continue
         resolved_path = _existing_path(candidate.source_path)
         if resolved_path is None:
             continue
@@ -999,6 +1012,42 @@ def _build_future_local_identity_resolution_map(
     return future_identity_map
 
 
+def _ensure_export_parent(
+    parent: Path,
+    created_export_dirs: set[str],
+) -> None:
+    cache_key = str(parent).casefold()
+    if cache_key in created_export_dirs:
+        return
+    parent.mkdir(parents=True, exist_ok=True)
+    created_export_dirs.add(cache_key)
+
+
+def _copy_asset_file_fast(source_path: Path, target_path: Path) -> None:
+    source_anchor = str(source_path.anchor or "").strip().casefold()
+    target_anchor = str(target_path.anchor or "").strip().casefold()
+    if source_anchor and target_anchor and source_anchor != target_anchor:
+        _copy_asset_file_buffered(source_path, target_path)
+        return
+    shutil.copyfile(source_path, target_path)
+
+
+def _copy_asset_file_buffered(
+    source_path: Path,
+    target_path: Path,
+    *,
+    chunk_bytes: int = BUFFERED_COPY_CHUNK_BYTES,
+) -> None:
+    buffer = bytearray(max(64 * 1024, int(chunk_bytes)))
+    view = memoryview(buffer)
+    with source_path.open("rb", buffering=0) as source_handle, target_path.open("wb", buffering=0) as target_handle:
+        while True:
+            bytes_read = source_handle.readinto(buffer)
+            if not bytes_read:
+                break
+            target_handle.write(view[:bytes_read])
+
+
 def _lookup_future_local_identity_resolution(
     candidate: _AssetCandidate,
     *,
@@ -1006,8 +1055,6 @@ def _lookup_future_local_identity_resolution(
     future_identity_map: dict[tuple[Any, ...], list[tuple[int, Path, str]]],
 ) -> tuple[Path, str] | None:
     if candidate.asset_type != "image":
-        return None
-    if _candidate_has_forward_parent_hint(candidate):
         return None
     for identity_key in _asset_recent_identity_keys(candidate):
         candidates = future_identity_map.get(identity_key)
@@ -2506,8 +2553,10 @@ def _allocate_export_rel_path(
 
 def _normalize_file_name(name: str, *, resolved_path: Path, asset_type: str) -> str:
     clean = "".join(char if char not in '<>:"/\\|?*' else "_" for char in name).strip() or f"{asset_type}_{_short_hash(str(resolved_path))}"
-    guessed = _guess_extension(resolved_path)
     suffix = Path(clean).suffix.lower()
+    if suffix and _has_trusted_media_suffix(asset_type=asset_type, suffix=suffix):
+        return clean
+    guessed = _guess_extension(resolved_path)
     if suffix:
         if _should_replace_suffix(asset_type=asset_type, current_suffix=suffix, guessed_suffix=guessed):
             return Path(clean).with_suffix(guessed).name
@@ -2530,9 +2579,23 @@ def _should_replace_suffix(*, asset_type: str, current_suffix: str, guessed_suff
     return True
 
 
+def _has_trusted_media_suffix(*, asset_type: str, suffix: str) -> bool:
+    normalized = suffix.lower()
+    trusted_suffixes = {
+        "image": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"},
+        "sticker": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"},
+        "video": {".mp4", ".mov", ".avi", ".mkv", ".webm"},
+        "speech": {".amr", ".silk", ".ogg", ".wav", ".mp3", ".m4a"},
+    }.get(asset_type)
+    if not trusted_suffixes:
+        return False
+    return normalized in trusted_suffixes
+
+
 def _guess_extension(path: Path) -> str:
     try:
-        header = path.read_bytes()[:16]
+        with path.open("rb") as handle:
+            header = handle.read(16)
     except Exception:
         return path.suffix
     if header.startswith(b"\xff\xd8\xff"):
