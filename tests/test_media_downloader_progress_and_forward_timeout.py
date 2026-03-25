@@ -691,6 +691,7 @@ def _build_context_hint_request(file_name: str) -> dict[str, object]:
 
 def test_settle_export_download_progress_clears_pending_counts() -> None:
     downloader = NapCatMediaDownloader(_DummyClient())
+    downloader._remote_base_url = "http://127.0.0.1:6099"
     downloader.begin_export_download_tracking([{"asset_type": "image", "download_hint": {}}])
     cache_key = ("image", "queued")
     downloader._download_operation_states[cache_key] = "queued"
@@ -1243,6 +1244,37 @@ def test_recent_forward_video_public_token_timeout_is_classified_before_targeted
     assert client.timeouts == [downloader.OLD_FORWARD_EXPENSIVE_PUBLIC_TOKEN_TIMEOUT_S]
     assert len(fast_client.calls) == 1
     assert fast_client.calls[0].get("materialize") is False
+
+
+def test_forward_video_direct_public_timeout_without_prefetched_metadata_skips_materialize() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request = _set_forward_stale_local_path(
+        _mark_request_old(_build_forward_video_request("direct-token-only-timeout.mp4"), days=180),
+        r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Video\2025-09\Ori\direct-token-only-timeout.mp4",
+    )
+    request["download_hint"] = {
+        **dict(request.get("download_hint") or {}),
+        "file_id": "direct-token-only-timeout",
+    }
+    materialize_calls: list[bool] = []
+
+    def _unexpected_forward_context(
+        request_data: dict[str, object],
+        *,
+        materialize: bool,
+        trace_callback=None,
+    ):
+        materialize_calls.append(materialize)
+        return None
+
+    downloader._download_via_forward_context = _unexpected_forward_context  # type: ignore[method-assign]
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert client.get_file_calls == 1
+    assert materialize_calls == [False]
 
 
 def test_forward_video_metadata_only_direct_public_token_file_not_found_skips_materialize() -> None:
@@ -2339,6 +2371,70 @@ def test_request_scoped_public_timeout_key_is_candidate_aware() -> None:
     assert key_a != key_b
 
 
+def test_forward_image_public_timeout_key_is_parent_scoped() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request_a = _set_forward_parent_identity(
+        _build_forward_request("candidate-a.jpg"),
+        message_id_raw="parent-1",
+        element_id="element-1",
+    )
+    request_b = _set_forward_parent_identity(
+        _build_forward_request("candidate-b.jpg"),
+        message_id_raw="parent-1",
+        element_id="element-1",
+    )
+
+    key_a = downloader._request_scoped_public_action_timeout_key(
+        request_a,
+        action="get_image",
+        token="token-a",
+    )
+    key_b = downloader._request_scoped_public_action_timeout_key(
+        request_b,
+        action="get_image",
+        token="token-b",
+    )
+
+    assert key_a is not None
+    assert key_a == key_b
+
+
+def test_forward_image_public_timeout_skips_sibling_public_retry_after_first_timeout() -> None:
+    client = _TimeoutPublicImageClient()
+    payload_a = {
+        "asset_type": "image",
+        "file_name": "timeout-a.jpg",
+        "public_action": "get_image",
+        "public_file_token": "timeout-token-a",
+    }
+    payload_b = {
+        "asset_type": "image",
+        "file_name": "timeout-b.jpg",
+        "public_action": "get_image",
+        "public_file_token": "timeout-token-b",
+    }
+    fast_client = _ForwardImageMissingLocalPayloadClient(payload_a)
+    downloader = NapCatMediaDownloader(client, fast_client=fast_client)
+    request_a = _set_forward_parent_identity(
+        _build_forward_request("timeout-a.jpg"),
+        message_id_raw="parent-timeout",
+        element_id="element-timeout",
+    )
+    request_b = _set_forward_parent_identity(
+        _build_forward_request("timeout-b.jpg"),
+        message_id_raw="parent-timeout",
+        element_id="element-timeout",
+    )
+
+    resolved_a = downloader.resolve_for_export(request_a)
+    fast_client.payload = dict(payload_b)
+    resolved_b = downloader.resolve_for_export(request_b)
+
+    assert resolved_a[0] is None
+    assert resolved_b[0] is None
+    assert client.get_image_calls == 1
+
+
 def test_remote_media_download_prepares_cache_dir_on_first_use() -> None:
     temp_root = _workspace_temp_dir()
     downloader = _RemoteMediaDownloader(temp_root / "remote_cache")
@@ -2466,6 +2562,7 @@ def test_resolve_via_context_only_does_not_skip_old_placeholder_image_without_te
     sibling_placeholder.parent.mkdir(parents=True, exist_ok=True)
     sibling_placeholder.write_bytes(b"")
     downloader = NapCatMediaDownloader(_DummyClient())
+    downloader._remote_base_url = "http://127.0.0.1:6099"
     request = {
         "asset_type": "image",
         "file_name": source_path.name,
@@ -2675,6 +2772,46 @@ def test_stale_image_neighbor_lookup_is_cached_per_source_path() -> None:
         assert second[0] == sibling_path.resolve()
         assert first_probe_count > 0
         assert downloader.base_dir_index_builds == first_probe_count
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def test_resolve_for_export_prefers_top_level_https_remote_over_direct_public_token_round_trip() -> None:
+    class _ExplodingImageClient:
+        def __init__(self) -> None:
+            self.get_image_calls = 0
+
+        def get_image(self, *args, **kwargs):
+            self.get_image_calls += 1
+            raise AssertionError("direct get_image should not run when a direct https media URL is already available")
+
+    temp_root = _workspace_temp_dir()
+    remote_target = temp_root / "remote_media" / "top-level-https-first.jpg"
+    remote_target.parent.mkdir(parents=True, exist_ok=True)
+    remote_target.write_bytes(b"remote")
+    client = _ExplodingImageClient()
+    downloader = NapCatMediaDownloader(client)
+    request = {
+        "asset_type": "image",
+        "file_name": remote_target.name,
+        "download_hint": {
+            "file_id": "token-direct-https",
+            "url": "https://gchat.qpic.cn/gchatpic_new/0/0-0-directhttps/0",
+        },
+    }
+    remote_calls: list[str] = []
+
+    def _download_remote_media(*, asset_type: str, file_name: str | None, hint: dict[str, object]) -> str | None:
+        remote_calls.append(str(hint.get("url") or ""))
+        return str(remote_target)
+
+    downloader._download_remote_media = _download_remote_media  # type: ignore[method-assign]
+
+    try:
+        resolved = downloader.resolve_for_export(request)
+        assert resolved == (remote_target.resolve(), "napcat_public_token_get_image_remote_url")
+        assert client.get_image_calls == 0
+        assert remote_calls == ["https://gchat.qpic.cn/gchatpic_new/0/0-0-directhttps/0"]
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 

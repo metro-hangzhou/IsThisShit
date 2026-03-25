@@ -6,6 +6,7 @@ from threading import Lock
 import time
 
 from qq_data_core.models import EXPORT_TIMEZONE, ExportRequest, SourceChatSnapshot
+from qq_data_integrations.napcat.fast_history_client import NapCatFastHistoryUnavailable
 from qq_data_integrations.napcat.http_client import NapCatApiError
 from qq_data_integrations.napcat.provider import FORWARD_ELEMENT_TYPE, NapCatHistoryProvider
 
@@ -826,6 +827,64 @@ def test_fetch_snapshot_tail_skips_tail_forward_hydrate_only_when_forwards_are_a
     assert done_event["hydrated_forward_count"] == 0
 
 
+def test_fetch_snapshot_tail_does_not_skip_tail_forward_hydrate_for_malformed_truthy_forward_content() -> None:
+    class _FastClient:
+        def hydrate_forward_detail_batch(self, *args, **kwargs):
+            return {"messages": []}
+
+    malformed_forward = _forward_reference_message("forward-msg", "200")
+    malformed_forward["message"] = [
+        {
+            "type": "forward",
+            "data": {"id": "forward-forward-msg", "content": "not-a-real-forward-tree"},
+        }
+    ]
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=_FastClient())
+    provider._collect_fast_history_tail_bulk = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "messages": [malformed_forward],
+        "seen_keys": {"forward-msg"},
+        "next_anchor": "anchor-1",
+        "next_anchor_message_seq": "200",
+        "pages_scanned": 1,
+        "completed": True,
+        "history_source": "napcat_fast_history_bulk",
+        "bulk_duration_s": 0.25,
+        "bulk_chunks": 1,
+        "bulk_chunk_limit": 5000,
+        "partial_fallback": False,
+        "page_size": 200,
+        "messages_sorted_ascending": True,
+        "page_call_breakdown": [],
+    }
+    provider._finalize_snapshot = lambda snapshot, progress_callback=None: snapshot  # type: ignore[method-assign]
+    hydrate_calls: list[int] = []
+
+    def fake_hydrate(*_args, **_kwargs):
+        hydrate_calls.append(1)
+        return 1
+
+    provider._hydrate_fast_history_tail_forwards_bulk = fake_hydrate  # type: ignore[method-assign]
+    progress: list[dict[str, object]] = []
+
+    provider.fetch_snapshot_tail(
+        ExportRequest(chat_type="group", chat_id="922065597", chat_name="test", limit=5000),
+        data_count=5000,
+        page_size=500,
+        progress_callback=progress.append,
+    )
+
+    assert hydrate_calls == [1]
+    done_event = next(
+        row
+        for row in progress
+        if row.get("phase") == "pipeline_stage"
+        and row.get("stage") == "provider.tail_forward_hydrate"
+        and row.get("status") == "done"
+    )
+    assert "skip_reason" not in done_event
+    assert done_event["hydrated_forward_count"] == 1
+
+
 def test_fetch_full_snapshot_prefers_plugin_full_bulk_route() -> None:
     class _FastClient:
         def __init__(self) -> None:
@@ -877,7 +936,7 @@ def test_fetch_full_snapshot_prefers_plugin_full_bulk_route() -> None:
         {
             "chat_type": "group",
             "chat_id": "922065597",
-            "data_count": 13000,
+            "data_count": 64000,
             "page_size": 200,
             "history_fetch_strategy": "seq_window",
             "include_debug_stats": False,
@@ -1448,6 +1507,230 @@ def test_fetch_full_snapshot_fast_bulk_mixed_resolved_and_terminal_unavailable_s
 
     assert snapshot.metadata["forward_detail_count"] == 2
     assert snapshot.metadata["forward_structure_unavailable_count"] == 1
+
+
+def test_fetch_full_snapshot_fast_bulk_batch_unavailable_falls_back_to_single_fast_plugin() -> None:
+    class _Client:
+        def get_group_msg_history(self, *args, **kwargs):
+            raise AssertionError("history retry should not be needed when single fast-plugin fallback resolves both targets")
+
+        def get_forward_msg(self, message_id: str):
+            raise AssertionError("get_forward_msg should not run when single fast-plugin fallback resolves both targets")
+
+    class _FastClient:
+        def __init__(self) -> None:
+            self.single_calls: list[dict[str, object]] = []
+
+        def get_history_full_bulk(
+            self,
+            chat_type: str,
+            chat_id: str,
+            *,
+            data_count: int,
+            page_size: int,
+            history_fetch_strategy: str | None = None,
+            include_debug_stats: bool = False,
+            timeout=None,
+        ):
+            return {
+                "messages": [
+                    _plugin_forward_target("m-forward-1", "23388"),
+                    _plugin_forward_target("m-forward-2", "23389"),
+                ],
+                "pages_scanned": 1,
+                "page_size": 200,
+                "requested_data_count": data_count,
+                "exhausted": True,
+                "elapsed_ms": 123,
+            }
+
+        def hydrate_forward_detail_batch(self, items):
+            raise NapCatFastHistoryUnavailable("route unavailable")
+
+        def hydrate_forward_detail(self, **kwargs):
+            self.single_calls.append(kwargs)
+            return {
+                "messages": [
+                    {
+                        "message_id": f"nested-{kwargs['message_id_raw']}",
+                        "message_seq": "2",
+                        "sender": {"uin": "42", "nickname": "Alice"},
+                        "rawMessage": {
+                            "msgId": f"nested-{kwargs['message_id_raw']}",
+                            "msgSeq": "2",
+                            "senderUin": "42",
+                            "sendNickName": "Alice",
+                            "peerUid": str(kwargs["peer_uid"]),
+                            "chatType": kwargs["chat_type_raw"],
+                            "elements": [
+                                {
+                                    "elementType": 1,
+                                    "textElement": {"content": "hello single"},
+                                }
+                            ],
+                        },
+                    }
+                ]
+            }
+
+    fast_client = _FastClient()
+    snapshot = NapCatHistoryProvider(_Client(), fast_client=fast_client).fetch_full_snapshot(
+        ExportRequest(chat_type="group", chat_id="922065597", chat_name="test", limit=13000),
+        page_size=500,
+        progress_callback=None,
+    )
+
+    assert len(fast_client.single_calls) == 2
+    assert snapshot.metadata["forward_detail_count"] == 2
+
+
+def test_fetch_full_snapshot_fast_bulk_partial_batch_then_single_empty_payload_falls_back_to_history() -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.history_calls: list[str] = []
+
+        def get_group_msg_history(self, chat_id: str, *, message_seq: str | None = None, **kwargs):
+            self.history_calls.append(str(message_seq or ""))
+            return {
+                "messages": [
+                    {
+                        "message_id": "m-forward-2",
+                        "message_seq": "23389",
+                        "message": [
+                            {
+                                "type": "forward",
+                                "data": {
+                                    "id": "fwd-2",
+                                    "content": [{"message_id": "nested-history"}],
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+
+        def get_forward_msg(self, message_id: str):
+            raise AssertionError("get_forward_msg should not run when history retry already resolves the uncovered target")
+
+    class _FastClient:
+        def __init__(self) -> None:
+            self.single_calls: list[dict[str, object]] = []
+
+        def get_history_full_bulk(
+            self,
+            chat_type: str,
+            chat_id: str,
+            *,
+            data_count: int,
+            page_size: int,
+            history_fetch_strategy: str | None = None,
+            include_debug_stats: bool = False,
+            timeout=None,
+        ):
+            return {
+                "messages": [
+                    _plugin_forward_target("m-forward-1", "23388"),
+                    _plugin_forward_target("m-forward-2", "23389"),
+                ],
+                "pages_scanned": 1,
+                "page_size": 200,
+                "requested_data_count": data_count,
+                "exhausted": True,
+                "elapsed_ms": 123,
+            }
+
+        def hydrate_forward_detail_batch(self, items):
+            return {
+                "items": [
+                    {
+                        "ok": True,
+                        "data": {
+                            "messages": [
+                                {
+                                    "message_id": "nested-batch",
+                                    "message_seq": "1",
+                                    "sender": {"uin": "42", "nickname": "Alice"},
+                                    "rawMessage": {
+                                        "msgId": "nested-batch",
+                                        "msgSeq": "1",
+                                        "senderUin": "42",
+                                        "sendNickName": "Alice",
+                                        "peerUid": str(items[0]["peer_uid"]),
+                                        "chatType": items[0]["chat_type_raw"],
+                                        "elements": [
+                                            {
+                                                "elementType": 1,
+                                                "textElement": {"content": "hello batch"},
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                    {"ok": False, "error": "temporary batch miss"},
+                ]
+            }
+
+        def hydrate_forward_detail(self, **kwargs):
+            self.single_calls.append(kwargs)
+            return {"messages": []}
+
+    client = _Client()
+    fast_client = _FastClient()
+    snapshot = NapCatHistoryProvider(client, fast_client=fast_client).fetch_full_snapshot(
+        ExportRequest(chat_type="group", chat_id="922065597", chat_name="test", limit=13000),
+        page_size=500,
+        progress_callback=None,
+    )
+
+    assert len(fast_client.single_calls) == 1
+    assert fast_client.single_calls[0]["message_id_raw"] == "m-forward-2"
+    assert client.history_calls == ["23389"]
+    assert snapshot.metadata["forward_detail_count"] == 2
+
+
+def test_fetch_full_snapshot_prefers_large_direct_full_bulk_target_for_full_history() -> None:
+    class _Client:
+        def get_group_msg_history(self, *args, **kwargs):
+            raise AssertionError("full-history bulk should satisfy this small sample without page fallback")
+
+    class _FastClient:
+        def __init__(self) -> None:
+            self.requested_data_count: int | None = None
+
+        def get_history_full_bulk(
+            self,
+            chat_type: str,
+            chat_id: str,
+            *,
+            data_count: int,
+            page_size: int,
+            history_fetch_strategy: str | None = None,
+            include_debug_stats: bool = False,
+            timeout=None,
+        ):
+            self.requested_data_count = data_count
+            return {
+                "messages": [
+                    _message("m-1", "23388"),
+                ],
+                "pages_scanned": 1,
+                "page_size": 200,
+                "requested_data_count": data_count,
+                "exhausted": True,
+                "elapsed_ms": 123,
+            }
+
+    fast_client = _FastClient()
+    snapshot = NapCatHistoryProvider(_Client(), fast_client=fast_client).fetch_full_snapshot(
+        ExportRequest(chat_type="group", chat_id="922065597", chat_name="test", limit=20),
+        page_size=500,
+        progress_callback=None,
+    )
+
+    assert fast_client.requested_data_count == 64000
+    assert len(snapshot.messages) == 1
 
 
 def test_fast_plugin_bulk_routes_use_collected_count_guard() -> None:

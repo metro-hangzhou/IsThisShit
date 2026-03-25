@@ -1250,6 +1250,26 @@ class NapCatMediaDownloader:
                     request,
                     direct_public_token_resolved,
                 )
+            if asset_type in {"video", "file", "speech"}:
+                classified_old_forward_missing = self._classify_old_forward_expensive_missing(
+                    request,
+                    payload=forward_payload
+                    if isinstance(forward_payload, dict)
+                    else self._direct_public_token_payload_for_request(request),
+                    failure_signal_mode="strict",
+                )
+                if classified_old_forward_missing is not None:
+                    self._emit_missing_classification_trace(
+                        trace_callback,
+                        request,
+                        substep="forward_missing_classification",
+                        classification=classified_old_forward_missing,
+                    )
+                    return self._remember_shared_outcome(
+                        shared_key,
+                        request,
+                        (None, classified_old_forward_missing),
+                    )
             attempted_direct_forward_file_id = False
             if asset_type in {"video", "file"} and self._should_prefer_direct_file_id_before_targeted_materialize(
                 request,
@@ -3174,6 +3194,36 @@ class NapCatMediaDownloader:
         )
         if prefetched_remote is not None:
             return prefetched_remote, f"napcat_public_token_{action}_remote_url_prefetched"
+        if self._should_prefer_direct_http_remote_before_public_action(
+            request=request,
+            data=data,
+            action=action,
+        ):
+            remote_downloaded = self._resolve_remote_from_public_payload(
+                data,
+                data,
+                action=action,
+                request=request,
+                trace_callback=trace_callback,
+            )
+            if remote_downloaded is not None:
+                return remote_downloaded, f"napcat_public_token_{action}_remote_url"
+            classified_after_direct_remote = self._classify_missing_from_public_payload(
+                data,
+                old_bucket=old_bucket,
+                expired_candidate=expired_candidate,
+                request=request,
+            )
+            if classified_after_direct_remote is not None:
+                if request is not None:
+                    self._emit_missing_classification_trace(
+                        trace_callback,
+                        request,
+                        substep=f"public_token_{action}_remote_classification",
+                        classification=classified_after_direct_remote,
+                    )
+                return None, classified_after_direct_remote
+            return None
         payload: dict[str, Any] | None = None
         prefetch_request_data = request if isinstance(request, dict) else data
         prefetched_public = self._peek_public_token_prefetch(
@@ -3271,6 +3321,30 @@ class NapCatMediaDownloader:
                 )
             return None, classified_after_remote_failure
         return None
+
+    def _should_prefer_direct_http_remote_before_public_action(
+        self,
+        *,
+        request: dict[str, Any] | None,
+        data: dict[str, Any] | None,
+        action: str,
+    ) -> bool:
+        if not isinstance(request, dict) or not isinstance(data, dict):
+            return False
+        if str(action or "").strip().lower() != "get_image":
+            return False
+        if str(request.get("asset_type") or "").strip().lower() != "image":
+            return False
+        hint = self._request_hint(request)
+        if self._has_forward_parent_hint(hint):
+            return False
+        raw_remote_url = self._public_payload_remote_url(data)
+        if not raw_remote_url:
+            return False
+        parsed = urlparse(raw_remote_url)
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False
+        return self._asset_location_kind(raw_remote_url) == "https_url"
 
     def _remember_shared_outcome(
         self,
@@ -5955,7 +6029,11 @@ class NapCatMediaDownloader:
                 return None
         elif normalized_mode not in {"", "none"}:
             raise ValueError(f"unsupported failure_signal_mode: {failure_signal_mode}")
-        if self._has_direct_forward_file_identifier(request, payload=payload) and not self._has_failed_direct_forward_file_identifier(
+        direct_file_identifier = self._direct_forward_file_identifier(
+            request,
+            payload=payload,
+        )
+        if direct_file_identifier.startswith("/") and not self._has_failed_direct_forward_file_identifier(
             request,
         ):
             return None
@@ -6766,13 +6844,23 @@ class NapCatMediaDownloader:
         *,
         payload: dict[str, Any] | None = None,
     ) -> bool:
-        return self._has_live_http_media_url(
+        if not self._has_live_http_media_url(
             request,
             payload=payload,
-        ) and not self._has_failed_forward_remote_url(
+        ):
+            return False
+        if self._has_failed_forward_remote_url(
+            request,
+            payload=payload,
+        ):
+            return False
+        candidate_reasons = self._request_remote_failure_reasons(
             request,
             payload=payload,
         )
+        if any(reason != "unsupported_local_download" for reason in candidate_reasons.values()):
+            return False
+        return True
 
     def _has_direct_forward_file_identifier(
         self,
@@ -7268,10 +7356,12 @@ class NapCatMediaDownloader:
         if not isinstance(request, dict):
             return None
         asset_type = str(request.get("asset_type") or "").strip()
-        if asset_type not in {"file", "video", "speech"}:
+        if asset_type not in {"image", "file", "video", "speech"}:
             return None
         hint = NapCatMediaDownloader._request_hint(request)
         if not NapCatMediaDownloader._has_forward_parent_hint(hint):
+            return None
+        if asset_type == "image" and action != "get_image":
             return None
         if asset_type in {"file", "video"} and action != "get_file":
             return None
@@ -7279,12 +7369,15 @@ class NapCatMediaDownloader:
             return None
         parent = hint.get("_forward_parent")
         assert isinstance(parent, dict)
-        discriminator = (
-            str(token or "").strip(),
-            str(request.get("file_name") or "").strip().lower(),
-            str(request.get("md5") or "").strip().lower(),
-            str(hint.get("file_id") or "").strip(),
-        )
+        if asset_type == "image":
+            discriminator: tuple[str, ...] = ()
+        else:
+            discriminator = (
+                str(token or "").strip(),
+                str(request.get("file_name") or "").strip().lower(),
+                str(request.get("md5") or "").strip().lower(),
+                str(hint.get("file_id") or "").strip(),
+            )
         return (
             "forward_public_timeout",
             action,

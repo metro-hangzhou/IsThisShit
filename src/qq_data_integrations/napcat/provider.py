@@ -32,6 +32,7 @@ SPARSE_TAIL_FORWARD_HYDRATE_MIN_WINDOW_MESSAGES = 100
 SPARSE_TAIL_FORWARD_HYDRATE_MAX_FORWARD_REFS = 4
 FORWARD_DETAIL_PREFETCH_WORKERS = 6
 FAST_HISTORY_BULK_FETCH_STRATEGY = "seq_window"
+FAST_HISTORY_FULL_BULK_PREFERRED_DATA_COUNT = 64000
 
 
 class NapCatHistoryProvider:
@@ -1239,7 +1240,10 @@ class NapCatHistoryProvider:
     ) -> dict[str, Any] | None:
         if self._fast_client is None or self._fast_mode == "off":
             return None
-        target_count = max(int(request.limit or 0), FAST_HISTORY_BULK_SAFE_DATA_COUNT)
+        target_count = max(
+            int(request.limit or 0),
+            FAST_HISTORY_FULL_BULK_PREFERRED_DATA_COUNT,
+        )
         direct_full_payload = self._fetch_fast_history_full_bulk(
             request,
             data_count=target_count,
@@ -2772,9 +2776,17 @@ class NapCatHistoryProvider:
         for segment in onebot_segments:
             if not isinstance(segment, dict) or segment.get("type") != "forward":
                 continue
-            if (segment.get("data") or {}).get("content"):
+            data = segment.get("data")
+            if self._segment_has_structurally_resolved_forward_content(data):
                 return True
         return False
+
+    @staticmethod
+    def _segment_has_structurally_resolved_forward_content(data: Any) -> bool:
+        if not isinstance(data, dict):
+            return False
+        content = data.get("content")
+        return isinstance(content, list) and any(isinstance(item, dict) for item in content)
 
     def _iter_forward_targets(
         self,
