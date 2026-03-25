@@ -434,7 +434,7 @@ async function fetchHistoryTailBulk(ctx, payload) {
   const chunkStats = [];
   let collectedCount = 0;
 
-  while (collected.length < requestedDataCount) {
+  while (collectedCount < requestedDataCount) {
     const pageCall = await fetchHistoryWindow(
       ctx,
       peer,
@@ -551,7 +551,7 @@ async function fetchHistoryFullBulk(ctx, payload) {
   const startedAt = Date.now();
   let collectedCount = 0;
 
-  while (collected.length < requestedDataCount) {
+  while (collectedCount < requestedDataCount) {
     const pageCall = await fetchHistoryWindow(
       ctx,
       peer,

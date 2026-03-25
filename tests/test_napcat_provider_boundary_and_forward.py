@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from threading import Lock
 import time
 
@@ -718,6 +719,15 @@ def test_fetch_full_snapshot_prefers_plugin_full_bulk_route() -> None:
             "include_debug_stats": False,
         }
     ]
+
+
+def test_fast_plugin_bulk_routes_use_collected_count_guard() -> None:
+    source = Path(
+        "NapCat/napcat/plugins/napcat-plugin-qq-data-fast/index.mjs"
+    ).read_text(encoding="utf-8")
+
+    assert "while (collected.length < requestedDataCount)" not in source
+    assert source.count("while (collectedCount < requestedDataCount)") >= 2
 
 
 def test_enrich_forward_details_uses_history_as_last_chance_after_get_forward_msg_failure() -> None:
