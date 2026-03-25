@@ -614,6 +614,53 @@ def test_fetch_snapshot_tail_prefers_plugin_full_bulk_route_for_large_request() 
     ]
 
 
+def test_fetch_snapshot_tail_skips_tail_forward_hydrate_when_fast_plugin_batch_detail_is_available() -> None:
+    class _FastClient:
+        def hydrate_forward_detail_batch(self, *args, **kwargs):
+            return {"messages": []}
+
+    provider = NapCatHistoryProvider(_DummyClient(), fast_client=_FastClient())
+    provider._collect_fast_history_tail_bulk = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        "messages": [_message("m1", "1"), _message("m2", "2")],
+        "seen_keys": {"m1", "m2"},
+        "next_anchor": "anchor-1",
+        "next_anchor_message_seq": "1",
+        "pages_scanned": 1,
+        "completed": True,
+        "history_source": "napcat_fast_history_bulk",
+        "bulk_duration_s": 0.25,
+        "bulk_chunks": 1,
+        "bulk_chunk_limit": 5000,
+        "partial_fallback": False,
+        "page_size": 200,
+        "messages_sorted_ascending": True,
+        "page_call_breakdown": [],
+    }
+    provider._finalize_snapshot = lambda snapshot, progress_callback=None: snapshot  # type: ignore[method-assign]
+    provider._hydrate_fast_history_tail_forwards_bulk = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tail forward hydrate should be skipped"))
+    )
+    progress: list[dict[str, object]] = []
+
+    snapshot = provider.fetch_snapshot_tail(
+        ExportRequest(chat_type="group", chat_id="922065597", chat_name="test", limit=5000),
+        data_count=5000,
+        page_size=500,
+        progress_callback=progress.append,
+    )
+
+    assert [item["message_id"] for item in snapshot.messages] == ["m1", "m2"]
+    done_event = next(
+        row
+        for row in progress
+        if row.get("phase") == "pipeline_stage"
+        and row.get("stage") == "provider.tail_forward_hydrate"
+        and row.get("status") == "done"
+    )
+    assert done_event["skip_reason"] == "fast_plugin_forward_detail_batch"
+    assert done_event["hydrated_forward_count"] == 0
+
+
 def test_fetch_full_snapshot_prefers_plugin_full_bulk_route() -> None:
     class _FastClient:
         def __init__(self) -> None:

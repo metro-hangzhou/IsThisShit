@@ -413,6 +413,7 @@ class NapCatMediaDownloader:
         seen: set[tuple[Any, ...]] = set()
         skipped_old_bucket_prefetch = 0
         prefetched_local_count = 0
+        prefetched_terminal_count = 0
         prepare_started = monotonic()
         last_prepare_emit = prepare_started
         overall_request_count = len(requests)
@@ -428,6 +429,7 @@ class NapCatMediaDownloader:
                     "scanned_request_count": scanned_request_count,
                     "context_request_count": len(batch_items),
                     "prefetched_local_count": prefetched_local_count,
+                    "prefetched_terminal_count": prefetched_terminal_count,
                     "skipped_old_bucket_count": skipped_old_bucket_prefetch,
                     "elapsed_s": round(monotonic() - prepare_started, 4),
                 }
@@ -493,6 +495,23 @@ class NapCatMediaDownloader:
                 self._prefetched_media_payloads[key] = None
                 self._remember_shared_outcome(self._shared_request_key(request), request, hinted_local)
                 prefetched_local_count += 1
+                if progress_callback is not None and (
+                    index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
+                ):
+                    _emit_prepare_progress("progress", index)
+                    last_prepare_emit = monotonic()
+                continue
+            terminal_missing = self._classify_terminal_missing_from_request_state(request)
+            if terminal_missing is not None:
+                key = self._request_key(request)
+                self._prefetched_media[key] = (None, terminal_missing)
+                self._prefetched_media_payloads[key] = None
+                self._remember_shared_outcome(
+                    self._shared_request_key(request),
+                    request,
+                    (None, terminal_missing),
+                )
+                prefetched_terminal_count += 1
                 if progress_callback is not None and (
                     index == overall_request_count or index % 250 == 0 or monotonic() - last_prepare_emit >= 0.75
                 ):
@@ -1298,6 +1317,7 @@ class NapCatMediaDownloader:
         if direct_public_token_resolved not in {None, (None, None)}:
             return self._remember_shared_outcome(shared_key, request, direct_public_token_resolved)
         if not self._has_forward_parent_hint(hint):
+            attempted_top_level_direct_file_id = False
             if asset_type == "image":
                 top_level_image_missing = self._classify_terminal_top_level_image_missing_from_request_state(
                     request,
@@ -1314,14 +1334,48 @@ class NapCatMediaDownloader:
                         request,
                         (None, top_level_image_missing),
                     )
-            context_resolved = self._resolve_via_context_only(
-                request,
-                trace_callback=trace_callback,
-            )
+                context_resolved = self._resolve_via_context_only(
+                    request,
+                    trace_callback=trace_callback,
+                )
+            elif asset_type in {"file", "video"}:
+                attempted_top_level_direct_file_id = True
+                direct_file_id_resolved = self._resolve_via_direct_file_id(
+                    request,
+                    trace_callback=trace_callback,
+                )
+                if direct_file_id_resolved not in {None, (None, None)}:
+                    return self._remember_shared_outcome(shared_key, request, direct_file_id_resolved)
+                top_level_file_like_missing = self._classify_terminal_file_like_missing_from_request_state(
+                    request,
+                )
+                if top_level_file_like_missing is not None:
+                    self._emit_missing_classification_trace(
+                        trace_callback,
+                        request,
+                        substep="top_level_missing_classification",
+                        classification=top_level_file_like_missing,
+                    )
+                    return self._remember_shared_outcome(
+                        shared_key,
+                        request,
+                        (None, top_level_file_like_missing),
+                    )
+                context_resolved = self._resolve_via_context_only(
+                    request,
+                    trace_callback=trace_callback,
+                )
+            else:
+                context_resolved = self._resolve_via_context_only(
+                    request,
+                    trace_callback=trace_callback,
+                )
         if context_resolved not in {None, (None, None)}:
             return self._remember_shared_outcome(shared_key, request, context_resolved)
         direct_file_id_resolved = None
-        if not self._has_forward_parent_hint(hint):
+        if not self._has_forward_parent_hint(hint) and not (
+            str(request.get("asset_type") or "").strip() in {"file", "video"}
+        ):
             direct_file_id_resolved = self._resolve_via_direct_file_id(
                 request,
                 trace_callback=trace_callback,
@@ -1477,15 +1531,8 @@ class NapCatMediaDownloader:
     ) -> bool:
         if not isinstance(request, dict):
             return True
-        terminal_top_level_image_missing = self._classify_terminal_top_level_image_missing_from_request_state(
-            request,
-        )
-        if terminal_top_level_image_missing is not None:
-            return False
-        terminal_file_like_missing = self._classify_terminal_file_like_missing_from_request_state(
-            request,
-        )
-        if terminal_file_like_missing is not None:
+        terminal_missing = self._classify_terminal_missing_from_request_state(request)
+        if terminal_missing is not None:
             return False
         direct_payload = self._direct_public_token_payload_for_request(request)
         if direct_payload is None:
@@ -5168,13 +5215,12 @@ class NapCatMediaDownloader:
         token = str(data.get("public_file_token") or "").strip()
         if not any([file_name, file_size, file_id, token]):
             return None
-        if (
-            old_bucket is None
-            and not (
-                isinstance(request, dict)
-                and self._is_forward_expensive_asset(request)
-            )
-        ):
+        if isinstance(request, dict):
+            hint = self._request_hint(request)
+            if self._has_forward_parent_hint(hint):
+                if old_bucket is None and not self._is_forward_expensive_asset(request):
+                    return None
+        elif old_bucket is None:
             return None
         return "qq_expired_after_napcat"
 
@@ -5215,13 +5261,12 @@ class NapCatMediaDownloader:
         token = str(data.get("public_file_token") or "").strip()
         if not any([file_name, file_size, file_id, token]):
             return None
-        if (
-            old_bucket is None
-            and not (
-                isinstance(request, dict)
-                and self._is_forward_expensive_asset(request)
-            )
-        ):
+        if isinstance(request, dict):
+            hint = self._request_hint(request)
+            if self._has_forward_parent_hint(hint):
+                if old_bucket is None and not self._is_forward_expensive_asset(request):
+                    return None
+        elif old_bucket is None:
             return None
         return "qq_expired_after_napcat"
 
@@ -6037,23 +6082,54 @@ class NapCatMediaDownloader:
     ) -> bool:
         if not isinstance(request, dict):
             return False
-        if str(request.get("asset_type") or "").strip().lower() != "image":
-            return False
+        asset_type = str(request.get("asset_type") or "").strip().lower()
         hint = self._request_hint(request)
         if self._has_forward_parent_hint(hint):
             return False
-        if self._classify_image_placeholder_missing_from_evidence(request) is not None:
-            return True
+        if asset_type == "image":
+            if self._classify_image_placeholder_missing_from_evidence(request) is not None:
+                return True
+            direct_payload = self._direct_public_token_payload_for_request(request)
+            if direct_payload is None:
+                return False
+            if not self._is_weak_relative_gchatpic_remote_hint(
+                str(hint.get("remote_url") or hint.get("url") or "").strip()
+            ):
+                return False
+            return self._has_terminal_top_level_image_missing_signal(
+                request,
+                payload=direct_payload,
+            )
+        if asset_type in {"file", "video"}:
+            return self._classify_terminal_file_like_missing_from_request_state(request) is not None
+        return False
+
+    def _classify_terminal_missing_from_request_state(
+        self,
+        request: dict[str, Any] | None,
+    ) -> str | None:
+        if not isinstance(request, dict):
+            return None
+        terminal_top_level_image_missing = self._classify_terminal_top_level_image_missing_from_request_state(
+            request,
+        )
+        if terminal_top_level_image_missing is not None:
+            return terminal_top_level_image_missing
+        terminal_file_like_missing = self._classify_terminal_file_like_missing_from_request_state(
+            request,
+        )
+        if terminal_file_like_missing is not None:
+            return terminal_file_like_missing
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type != "speech":
+            return None
         direct_payload = self._direct_public_token_payload_for_request(request)
         if direct_payload is None:
-            return False
-        if not self._is_weak_relative_gchatpic_remote_hint(
-            str(hint.get("remote_url") or hint.get("url") or "").strip()
-        ):
-            return False
-        return self._has_terminal_top_level_image_missing_signal(
-            request,
-            payload=direct_payload,
+            return None
+        return self._classify_missing_from_public_payload(
+            direct_payload,
+            old_bucket=self._old_context_bucket(asset_type, request),
+            request=request,
         )
 
     @staticmethod
@@ -6133,6 +6209,19 @@ class NapCatMediaDownloader:
         hint = self._request_hint(request)
         if self._has_forward_parent_hint(hint):
             return False
+        old_bucket = self._old_context_bucket(asset_type, request)
+        if self._classify_blank_public_get_file_missing(
+            payload,
+            old_bucket=old_bucket,
+            request=request,
+        ) is not None:
+            return True
+        if self._classify_zero_byte_public_payload_missing(
+            payload,
+            old_bucket=old_bucket,
+            request=request,
+        ) is not None:
+            return True
         if self._has_unexhausted_live_http_media_url(request, payload=payload):
             return False
         if not (
@@ -6155,19 +6244,6 @@ class NapCatMediaDownloader:
         if not (has_direct_identifier or has_public_token):
             return False
         if self._has_terminal_public_action_failure(request, payload=payload):
-            return True
-        old_bucket = self._old_context_bucket(asset_type, request)
-        if self._classify_blank_public_get_file_missing(
-            payload,
-            old_bucket=old_bucket,
-            request=request,
-        ) is not None:
-            return True
-        if self._classify_zero_byte_public_payload_missing(
-            payload,
-            old_bucket=old_bucket,
-            request=request,
-        ) is not None:
             return True
         return False
 

@@ -43,6 +43,75 @@ Primary rule:
 
 ## What The Current Perf Audit Already Shows
 
+## [2026-03-25] Post Terminal-Prefetch + Write-Bundle Split Pass
+
+Latest live small-window perf probe after this pass:
+
+- data:
+  - `exports/group_922065597_20260325_160848_899209.jsonl`
+- manifest:
+  - `exports/group_922065597_20260325_160848_899209.manifest.json`
+- trace:
+  - `state/export_perf/cli_export_group_922065597_20260325_160845_533113_11840.jsonl`
+- report:
+  - `state/export_perf/cli_export_group_922065597_20260325_160845_533113_11840.report.json`
+- result:
+  - `records=300`
+  - `elapsed=5.303s`
+  - `actionable_missing=0`
+  - `background_missing=21`
+
+Compared with the immediately previous `300`-message baseline:
+
+- total elapsed:
+  - `6.302s -> 5.303s`
+- `app.fetch_snapshot`:
+  - `1.3094s -> 1.1673s`
+- `provider.fast_tail_bulk`:
+  - `1.2609s -> 1.1422s`
+- `bundle.materialize_snapshot_media`:
+  - `1.7185s -> 1.3757s`
+- `app.write_bundle`:
+  - `1.7342s -> 1.3943s`
+- `image:copy_asset_file:status=done`:
+  - `0.2078s -> 0.1577s`
+
+This pass specifically added:
+
+- downloader-side terminal request-state preclassification during `prepare_for_export(...)`
+  - terminal top-level image/file/video/speech requests can now be marked before remote/public/context scheduling
+  - repeated background-missing assets no longer consume prefetch slots
+- stronger evidence-first terminal closeout for top-level `file/video`
+  - blank / zero-byte public payloads no longer require old-bucket heuristics on top-level assets
+- `bundle.write_data_file` is now a first-class perf stage
+  - `app.write_bundle` is no longer a pure black box
+- copy traces now include:
+  - `copy_mode`
+  - `copy_chunk_count`
+  - `copy_buffer_bytes`
+  - `copy_bytes_total`
+- report-side `copy_io_breakdown` now includes `throughput_mib_s`
+
+Current interpretation after this pass:
+
+- correctness stayed clean:
+  - `actionable_missing=0`
+- the highest-value remaining fetch/page-scan work is now clearly plugin-side:
+  - `provider.fast_tail_bulk = 1.1422s`
+  - plugin breakdown shows `2` page calls and `549ms` native/plugin elapsed inside the route
+- the highest-value remaining asset/materialize work is now concentrated in:
+  - cross-volume `image` copy clusters
+  - `bundle_future_local_identity_evidence` first-writer copies
+  - residual placeholder / expired image classification volume
+
+Next execution board:
+
+- [ ] promote bundle-local "first writer wins" earlier so `bundle_future_local_identity_evidence` becomes reuse more often and copy less often
+- [ ] memoize stale-neighbor directory probes more aggressively across repeated image families
+- [ ] re-run live benchmarks after a real NapCat restart so plugin-side sorted-output / page-call changes are actually loaded
+- [ ] compare `provider.fast_tail_bulk` pre/post restart on both `limit=300` and full-history windows
+- [ ] split any remaining `app.write_bundle` tail cost if `bundle.finalize_output_files` or `bundle.write_manifest` grows again
+
 ## [2026-03-25] Post Instrumentation + Evidence-First Trim Pass
 
 Latest live small-window perf probe after this pass:

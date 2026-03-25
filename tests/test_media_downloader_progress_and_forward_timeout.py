@@ -2927,6 +2927,31 @@ def test_resolve_via_direct_file_id_classifies_blank_top_level_payload_as_backgr
     assert resolved == (None, "qq_expired_after_napcat")
 
 
+def test_classify_blank_public_get_file_missing_marks_top_level_video_without_old_bucket_as_background() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+
+    classification = downloader._classify_blank_public_get_file_missing(
+        {
+            "asset_type": "video",
+            "public_action": "get_file",
+            "public_file_token": "top-level-video-token",
+            "file_name": "top-level-video.mp4",
+            "file": "",
+            "url": "",
+        },
+        old_bucket=None,
+        request={
+            "asset_type": "video",
+            "file_name": "top-level-video.mp4",
+            "download_hint": {
+                "file_id": "top-level-video-token",
+            },
+        },
+    )
+
+    assert classification == "qq_expired_after_napcat"
+
+
 def test_should_attempt_second_pass_public_retry_skips_terminal_top_level_image_request_state() -> None:
     downloader = NapCatMediaDownloader(_DummyClient())
     zero_byte_root = _workspace_temp_dir()
@@ -2947,6 +2972,48 @@ def test_should_attempt_second_pass_public_retry_skips_terminal_top_level_image_
         downloader._public_token_action_outcomes[("get_image", "1528803999")] = None
 
         assert downloader.should_attempt_second_pass_public_retry(request) is False
+    finally:
+        shutil.rmtree(zero_byte_root, ignore_errors=True)
+
+
+def test_prepare_for_export_prefetches_terminal_top_level_image_without_scheduling_remote_or_token() -> None:
+    class _UnusedFastClient:
+        def hydrate_media_batch(self, *args, **kwargs):
+            raise AssertionError("batch hydrate should not run for terminal image request")
+
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=_UnusedFastClient())
+    zero_byte_root = _workspace_temp_dir()
+    try:
+        zero_byte_path = zero_byte_root / "Pic" / "2025-09" / "Ori" / "prefetch-terminal-image.png"
+        zero_byte_path.parent.mkdir(parents=True, exist_ok=True)
+        zero_byte_path.write_bytes(b"")
+        request = {
+            "asset_type": "image",
+            "file_name": "prefetch-terminal-image.png",
+            "timestamp_ms": 1757142395000,
+            "source_path": str(zero_byte_path),
+            "download_hint": {
+                "file_id": "1528804777",
+                "url": "/gchatpic_new/0/0-0-terminal/0?term=2",
+                "message_id_raw": "7565810521148991491",
+                "element_id": "7565810521148991492",
+                "peer_uid": "922065597",
+                "chat_type_raw": 2,
+            },
+        }
+        downloader._public_token_action_outcomes[("get_image", "1528804777")] = None
+        downloader._schedule_request_remote_prefetch = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("remote prefetch should be skipped"))
+        )
+        downloader._schedule_request_direct_public_token_prefetch = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("token prefetch should be skipped"))
+        )
+
+        downloader.prepare_for_export([request], progress_callback=None)
+
+        key = downloader._request_key(request)
+        assert downloader._prefetched_media[key] == (None, "qq_not_downloaded_local_placeholder")
+        assert downloader.resolve_for_export(request) == (None, "qq_not_downloaded_local_placeholder")
     finally:
         shutil.rmtree(zero_byte_root, ignore_errors=True)
 

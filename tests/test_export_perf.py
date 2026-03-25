@@ -12,6 +12,16 @@ def test_export_perf_report_includes_stage_page_and_materialize_breakdown(tmp_pa
         chat_id="922065597",
         mode="test_export",
     )
+    writer.write_event(
+        "write_data_file",
+        {
+            "stage": "done",
+            "elapsed_s": 0.021,
+            "record_count": 20,
+            "bytes_written": 8192,
+            "target_path": "exports/test.jsonl",
+        },
+    )
     with writer.timed_stage("app.fetch_snapshot", payload={"limit": 20}) as stage:
         stage.add(history_source="napcat_fast_history", message_count=20)
     writer.write_event(
@@ -108,7 +118,9 @@ def test_export_perf_report_includes_stage_page_and_materialize_breakdown(tmp_pa
     assert report["record_count"] == 20
     assert report["total_elapsed_s"] >= 0
     assert report["pages_scanned"] == 4
-    assert report["stage_breakdown"][0]["name"] == "app.fetch_snapshot"
+    stage_names = {row["name"] for row in report["stage_breakdown"]}
+    assert "app.fetch_snapshot" in stage_names
+    assert "bundle.write_data_file" in stage_names
     assert report["history_page_breakdown"][0]["name"] == "tail_scan:napcat_fast_history_bulk"
     assert report["fetch_stage_breakdown"][0]["name"] == "app.fetch_snapshot"
     assert report["materialize_asset_breakdown"][0]["asset_type"] == "image"
@@ -117,6 +129,7 @@ def test_export_perf_report_includes_stage_page_and_materialize_breakdown(tmp_pa
     assert report["copy_io_breakdown"][0]["substep"] == "copy_asset_file"
     assert report["copy_io_breakdown"][0]["same_volume"] is False
     assert report["copy_io_breakdown"][0]["bytes_total"] == 2048
+    assert report["copy_io_breakdown"][0]["throughput_mib_s"] > 0
     assert report["scan_phase_breakdown"][0]["name"] == "tail_scan"
     assert report["scan_summaries"][0]["scan_phase"] == "tail_scan"
     assert report["tail_bulk_chunk_breakdown"][0]["chunk_index"] == 1

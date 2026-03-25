@@ -74,6 +74,11 @@ def _summarize_timing_bucket(name: str, bucket: dict[str, Any]) -> dict[str, Any
         result["errors"] = int(bucket.get("errors") or 0)
     if "bytes_total" in bucket:
         result["bytes_total"] = int(bucket.get("bytes_total") or 0)
+        if total_s > 0:
+            result["throughput_mib_s"] = round(
+                int(bucket.get("bytes_total") or 0) / total_s / (1024 * 1024),
+                4,
+            )
     if "same_volume_count" in bucket:
         result["same_volume_count"] = int(bucket.get("same_volume_count") or 0)
     if "cross_volume_count" in bucket:
@@ -226,6 +231,23 @@ class ExportPerfTraceWriter:
                 self._handle.flush()
 
     def _observe_event(self, kind: str, payload: dict[str, Any]) -> None:
+        if kind == "write_data_file":
+            stage = "bundle.write_data_file"
+            status = str(payload.get("stage") or "").strip() or "done"
+            bucket = self._stage_buckets.setdefault(
+                stage,
+                {"count": 0, "total_s": 0.0, "max_s": 0.0, "errors": 0},
+            )
+            if status == "error":
+                bucket["errors"] = int(bucket.get("errors") or 0) + 1
+            if status in {"done", "error"}:
+                _update_timing_bucket(
+                    bucket,
+                    elapsed_s=float(payload.get("elapsed_s") or 0.0),
+                    payload=payload,
+                    max_payload_omit={"stage", "elapsed_s"},
+                )
+            return
         if kind == "pipeline_stage":
             stage = str(payload.get("stage") or "").strip() or "unknown"
             status = str(payload.get("status") or "").strip() or "done"
