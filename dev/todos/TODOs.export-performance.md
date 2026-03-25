@@ -43,6 +43,128 @@ Primary rule:
 
 ## What The Current Perf Audit Already Shows
 
+## [2026-03-25] Post Instrumentation + Evidence-First Trim Pass
+
+Latest live small-window perf probe after this pass:
+
+- data:
+  - `exports/group_922065597_20260325_145634_228439.jsonl`
+- manifest:
+  - `exports/group_922065597_20260325_145634_228439.manifest.json`
+- trace:
+  - `state/export_perf/cli_export_group_922065597_20260325_145630_378038_1936.jsonl`
+- report:
+  - `state/export_perf/cli_export_group_922065597_20260325_145630_378038_1936.report.json`
+- result:
+  - `records=300`
+  - `elapsed=6.302s`
+  - `actionable_missing=0`
+  - `background_missing=21`
+
+This pass specifically added:
+
+- report-side `copy_io_breakdown`
+  - same-volume vs cross-volume
+  - byte totals
+  - size buckets
+- top-level image terminal classification before `context_hydration`
+- tighter `second_pass_public_retry` gating when request-state evidence is already terminal
+- `forward image` metadata-first terminal closeout before remote/public retries
+- bounded buffered cross-volume asset copy
+  - keep RAM bounded
+  - prefer sequential disk writes
+  - do not hold whole export assets in memory
+
+Current interpretation after this pass:
+
+- `actionable_missing=0` still holds on the latest live probe
+- the remaining copy cost is now better measurable, and cross-volume copy is explicitly visible
+- the remaining downloader waste is more concentrated in:
+  - top-level stale-local `image`
+  - terminal `file/video` negative chains
+  - sparse `forward image` metadata probes
+
+## [2026-03-25] Current Main Perf Snapshot After Fetch + Materialize Speedup Pass
+
+Latest live full export used for this audit:
+
+- data:
+  - `exports/group_922065597_20260325_030622_196612.jsonl`
+- manifest:
+  - `exports/group_922065597_20260325_030622_196612.manifest.json`
+- trace:
+  - `state/export_perf/cli_export_group_922065597_20260325_030608_299742_55008.jsonl`
+- report:
+  - `state/export_perf/cli_export_group_922065597_20260325_030608_299742_55008.report.json`
+- result:
+  - `records=12593`
+  - `elapsed=30.786s`
+  - `actionable_missing=1154`
+  - `background_missing=159`
+
+Current broad-stage costs:
+
+- `app.fetch_snapshot`: `11.4263s`
+- `provider.fetch_snapshot_tail`: `11.4218s`
+- `provider.fast_tail_bulk`: `8.825s`
+- `provider.tail_forward_hydrate`: `0.2074s`
+- `provider.finalize_snapshot`: `1.0127s`
+- `bundle.materialize_snapshot_media`: `15.9658s`
+- `app.write_bundle`: `16.1799s`
+
+Current materialize hotspots:
+
+- `image:copy_asset_file:status=done`
+  - `710` copies
+  - `1.9455s`
+- `image:context_hydration:status=ok`
+  - `21` calls
+  - `0.7313s`
+- `image:forward_context_metadata:status=ok`
+  - `13` calls
+  - `0.4988s`
+- `image:unknown:status=copied:resolver=direct_local_path`
+  - `477` assets
+  - `3.2869s`
+- `image:unknown:status=missing:resolver=missing_after_napcat`
+  - `1205` assets
+  - `2.4237s`
+- `image:unknown:status=copied:resolver=stale_source_neighbor`
+  - `157` assets
+  - `1.1s`
+- `image:unknown:status=copied:resolver=bundle_future_local_identity_evidence`
+  - `76` assets
+  - `0.5381s`
+
+Current interpretation:
+
+- fetch/page scanning is no longer the only dominant cost
+- the current largest remaining surface is aggregate bundle/materialize work
+- raw `copy_asset_file` is not the only issue:
+  - cross-volume copy is real
+  - stale-neighbor lookup is still repeated many times
+  - future-local identity reuse still has a "first copy, later reuse" gap
+- remaining probe cost is now concentrated in:
+  - old top-level `image`
+  - a handful of `file/video` negative terminal chains
+
+### Important report caveats from the current audit
+
+- top-level `pages_scanned` is still misleading for `history_full_bulk`
+  - top-level report currently shows `0`
+  - but `provider.fast_tail_bulk` and `history_page_breakdown` both show `65`
+- `app.write_bundle` still wraps several different costs into one stage:
+  - data-file write
+  - bundle materialize
+  - staged/final path swap
+  - manifest write
+- `provider.fast_tail_bulk` is still a plugin-side black box
+  - current report does not expose plugin internal:
+    - fetch rounds
+    - anchor chase rounds
+    - reply/reference parse counts
+    - native/history API call counts
+
 ## [2026-03-24] Full-History Scan Route Was Still On The Old Per-Page Path Until This Pass
 
 - user-side `@final_content @earliest_content` broad exports were still reporting:
@@ -165,12 +287,105 @@ The intent is:
   - asset family
   - resolver
   - missing class
+- [ ] add byte-level materialize/copy buckets by:
+  - asset family
+  - same-volume vs cross-volume
+  - size bucket
+  - source root kind
 - [ ] identify top repeated cheap-but-high-volume substeps
 - [ ] identify whether remote image resolution is now dominated by:
   - public-token remote URL probes
   - forward remote URL downloads
   - stale placeholder classification
 - [ ] optimize the dominant repeated path first, not just the slowest single asset
+
+### Track 5. Asset Copy / Bundle I/O Deep Dive
+
+- [x] add `copy_io_breakdown` to perf report
+- [x] record:
+  - `source_drive`
+  - `target_drive`
+  - `same_volume`
+  - `bytes_total`
+  - size bucket
+- [x] add bounded buffered cross-volume copy
+  - prefer sequential disk writes
+  - keep memory bounded instead of whole-file RAM caching
+- [ ] validate on full export whether cross-volume buffered copy beats plain `copyfile`
+- [ ] consider first-writer promotion for `bundle_future_local_identity_evidence`
+- [ ] consider preallocated canonical rel-paths for same-identity asset groups
+
+### Track 6. Old Image / File Probe-Cost Reduction
+
+- [x] top-level image terminal evidence now runs before `context_hydration`
+- [x] `second_pass_public_retry` now short-circuits on request-state terminal evidence
+- [x] `forward image` metadata payload now classifies terminal missing before remote/public retry
+- [ ] keep shrinking top-level stale-local image `context_hydration` count
+- [ ] revisit top-level `file/video` blank direct-file-id payload classification against live traces
+- [ ] verify the remaining `missing_after_napcat` samples are truly missing and not late-recoverable
+
+### Track 7. Plugin-Side Fetch Telemetry And Page-Scan Reduction
+
+- [ ] expose plugin route-level stats in report:
+  - call count
+  - total ms
+  - avg ms
+  - max ms
+- [ ] evaluate plugin-side double-sort removal for bulk fetch
+- [ ] evaluate slimmer full-bulk payload shape for full-history scanning
+- [ ] split `full` vs `tail` fetch strategy instead of one global bulk strategy
+
+### Track 5. Asset Copy / Bundle I/O Deep Dive
+
+- [ ] split `app.write_bundle` into independent timed stages:
+  - `bundle.write_data_file`
+  - `bundle.replace_data_file`
+  - `bundle.swap_assets_dir`
+  - `bundle.write_manifest`
+- [ ] add `write_data(...)` timing and bytes metadata:
+  - `record_count`
+  - `bytes_written`
+  - `avg_bytes_per_record`
+  - `jsonl_buffer_flush` cost
+- [ ] add `copy_asset_file` report metadata:
+  - `copied_bytes`
+  - `source_drive`
+  - `target_drive`
+  - `same_volume`
+  - `size_bucket`
+- [ ] preallocate export target paths by stable asset identity in `media_bundle.py`
+- [ ] promote same-identity first-writer reuse earlier so follower assets do not reach their own copy branch
+- [ ] evaluate whether target-exists-and-size-match can skip duplicate copy work safely for repeated identities
+
+### Track 6. Old Image / File Probe-Cost Reduction
+
+- [ ] add evidence-first terminal closeout for `file/video` assets that already have:
+  - no local path
+  - negative `context_hydration`
+  - negative `direct_file_id_get_file`
+  - no live remote URL
+- [ ] prevent those `file/video` assets from falling into `second_pass_public_retry` once terminal evidence already exists
+- [ ] tighten `context_hydration` entry conditions for top-level stale-local `image`
+  - especially `relative /gchatpic_new/...` with no live downloadable handle
+- [ ] feed `forward_context_metadata` payload into terminal missing classification instead of treating it as advisory only
+- [ ] break down `missing_after_napcat` into finer evidence families in the perf report:
+  - `top_level_stale_local_no_live_remote`
+  - `file_direct_id_negative`
+  - `forward_metadata_no_live_remote`
+
+### Track 7. Plugin-Side Fetch Telemetry And Page-Scan Reduction
+
+- [ ] add plugin debug stats for `history_full_bulk`:
+  - `plugin_fetch_rounds`
+  - `anchor_chase_rounds`
+  - `raw_message_count`
+  - `reply_lookup_count`
+  - `parse_reply_count`
+  - `parse_forward_count`
+  - `native_history_calls`
+- [ ] fix report top-level `pages_scanned` so bulk/full-bulk values are reflected consistently
+- [ ] continue reducing zero-yield `tail_forward_hydrate` windows after the current sparse-history pass
+- [ ] compare next live run against the current `30.786s` snapshot after telemetry lands
 
 ### Track 4. Baseline Comparison Guard
 
