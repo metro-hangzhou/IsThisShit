@@ -24,6 +24,15 @@ The turn-level contract is:
 5. run a full live export on group `922065597` only after the targeted retests above have converged, or when verifying that a broad-path change did not regress benchmark/runtime behavior
 6. only call the turn complete when `actionable_missing=0` and benchmark has not materially regressed
 
+New paired requirement for every future performance patch:
+
+- before shipping a fetch/materialize/prefetch acceleration, add or update simulator coverage that proves the patch cannot reintroduce `actionable_missing`
+- this is especially mandatory for:
+  - `forward`
+  - `nested_forward`
+  - mixed forward/top-level asset reuse paths
+  - prefetch vs second-pass ordering changes
+
 Targeted-first validation rule:
 
 - if a new regression narrows down to a handful of `missing_after_napcat` assets or 1-2 retry windows, do not jump straight to another full export
@@ -622,6 +631,16 @@ To support the tracks above, extend simulator coverage with:
 
 - `forward_match_recoverability_matrix`
   - multiple forward candidates with different evidence strengths -> strongest recoverable candidate wins
+
+Latest landed coverage in this pass:
+
+- `request_state_payload_state_terminal_equivalence`
+  - top-level weak `gchatpic` image no-path vs stale-local context outcomes now locked across `recent` and `old`
+- `future_local_identity_cross_topology`
+  - pair matrix now explicitly includes `nested_forward -> top_level` image recovery in addition to the earlier `top_level -> forward` and `forward -> nested_forward` paths
+- provider anti-regression guards:
+  - fast-bulk reorder when the plugin sorted flag is false
+  - history fallback when forward-detail batch says `ok` but returns empty message detail
 
 ## Suggested Execution Order
 
