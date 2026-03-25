@@ -303,6 +303,16 @@ class _UnavailableContextClient:
         }
 
 
+class _StaticContextPayloadClient:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = dict(payload)
+        self.media_calls: list[dict[str, object]] = []
+
+    def hydrate_media(self, **kwargs):
+        self.media_calls.append(kwargs)
+        return dict(self.payload)
+
+
 class _NeighborProbeDownloader(NapCatMediaDownloader):
     def __init__(self) -> None:
         super().__init__(_DummyClient())
@@ -2792,6 +2802,37 @@ def test_resolve_via_direct_file_id_classifies_top_level_stale_local_video_not_f
     assert resolved == (None, "qq_expired_after_napcat")
 
 
+def test_resolve_for_export_classifies_top_level_file_not_found_after_context_returns_no_local_path() -> None:
+    fast_client = _StaticContextPayloadClient(
+        {
+            "asset_type": "file",
+            "file_name": "old-uploaded.jpg",
+            "file_id": "/494603f2-038f-4fd0-bffa-934b4553f019",
+            "file_size": "12345",
+            "file": "",
+            "url": "",
+        }
+    )
+    downloader = NapCatMediaDownloader(_MissingDirectFileClient(), fast_client=fast_client)
+    request = {
+        "asset_type": "file",
+        "file_name": "old-uploaded.jpg",
+        "timestamp_ms": 1757268507000,
+        "download_hint": {
+            "file_id": "/494603f2-038f-4fd0-bffa-934b4553f019",
+            "message_id_raw": "7565810521225835815",
+            "element_id": "7565810521225835816",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert fast_client.media_calls
+
+
 def test_resolve_for_export_prefers_direct_hint_public_token_before_context_for_top_level_old_video() -> None:
     downloader = NapCatMediaDownloader(_DummyClient())
     request = {
@@ -2909,6 +2950,104 @@ def test_resolve_for_export_skips_context_for_terminal_top_level_image_request_s
         assert resolved == (None, "qq_not_downloaded_local_placeholder")
     finally:
         shutil.rmtree(zero_byte_root, ignore_errors=True)
+
+
+def test_resolve_for_export_classifies_top_level_weak_gchatpic_context_no_path_as_placeholder() -> None:
+    fast_client = _StaticContextPayloadClient(
+        {
+            "asset_type": "image",
+            "file_name": "{D8D6CB72-84C1-E1F5-D9A0-FB443715E86F}.jpg",
+            "file": "",
+            "url": "",
+        }
+    )
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader._resolve_via_direct_public_token_hint = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    request = {
+        "asset_type": "image",
+        "file_name": "{D8D6CB72-84C1-E1F5-D9A0-FB443715E86F}.jpg",
+        "timestamp_ms": 1767618049000,
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Emoji\emoji-recv\2026-01\Ori\d8d6cb7284c1e1f5d9a0fb443715e86f.jpg",
+        "download_hint": {
+            "file_id": "2650833282",
+            "url": "/gchatpic_new/3348513412/922065597-2650833282-D8D6CB7284C1E1F5D9A0FB443715E86F/0?term=255&is_origin=0",
+            "message_id_raw": "7616401486576431236",
+            "element_id": "7616401486576431235",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_not_downloaded_local_placeholder")
+
+
+def test_resolve_for_export_classifies_top_level_weak_gchatpic_context_stale_local_as_placeholder() -> None:
+    fast_client = _StaticContextPayloadClient(
+        {
+            "asset_type": "image",
+            "file_name": "{D8D6CB72-84C1-E1F5-D9A0-FB443715E86F}.jpg",
+            "file": r"C:\QQ\3956020260\nt_qq\nt_data\Emoji\emoji-recv\2026-01\Ori\d8d6cb7284c1e1f5d9a0fb443715e86f.jpg",
+            "url": r"C:\QQ\3956020260\nt_qq\nt_data\Emoji\emoji-recv\2026-01\Ori\d8d6cb7284c1e1f5d9a0fb443715e86f.jpg",
+        }
+    )
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader._resolve_via_direct_public_token_hint = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    request = {
+        "asset_type": "image",
+        "file_name": "{D8D6CB72-84C1-E1F5-D9A0-FB443715E86F}.jpg",
+        "timestamp_ms": 1767618049000,
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Emoji\emoji-recv\2026-01\Ori\d8d6cb7284c1e1f5d9a0fb443715e86f.jpg",
+        "download_hint": {
+            "file_id": "2650833282",
+            "url": "/gchatpic_new/3348513412/922065597-2650833282-D8D6CB7284C1E1F5D9A0FB443715E86F/0?term=255&is_origin=0",
+            "message_id_raw": "7616401486576431236",
+            "element_id": "7616401486576431235",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_not_downloaded_local_placeholder")
+
+
+def test_resolve_for_export_classifies_top_level_local_download_dead_signal_as_background() -> None:
+    fast_client = _StaticContextPayloadClient(
+        {
+            "asset_type": "image",
+            "file_name": "1B7D1B138F6F7E2AFD72F69E09DDF9C2.jpg",
+            "file": "",
+            "url": "",
+        }
+    )
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    downloader._resolve_via_direct_public_token_hint = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    downloader._classify_image_local_placeholder_missing = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
+    request = {
+        "asset_type": "image",
+        "file_name": "1B7D1B138F6F7E2AFD72F69E09DDF9C2.jpg",
+        "timestamp_ms": 1761380183000,
+        "source_path": r"C:\QQ\3956020260\nt_qq\nt_data\Emoji\emoji-recv\2025-10\Ori\1b7d1b138f6f7e2afd72f69e09ddf9c2.jpg",
+        "download_hint": {
+            "file_id": "EhS-OrZMmHkosHhfOvHDFCJt3hKtAxiUuA8g_woo9t75wPS-kAMyBHByb2RQgL2jAVoQl-pjgWoxry5GRMVA6kCK9noC-H2CAQJuag",
+            "url": "/download?appid=1407&fileid=EhS-OrZMmHkosHhfOvHDFCJt3hKtAxiUuA8g_woo9t75wPS-kAMyBHByb2RQgL2jAVoQl-pjgWoxry5GRMVA6kCK9noC-H2CAQJuag&spec=0",
+            "message_id_raw": "7565810460010638737",
+            "element_id": "7565810460010638736",
+            "peer_uid": "922065597",
+            "chat_type_raw": 2,
+        },
+    }
+    downloader._public_token_action_outcomes[(
+        "get_image",
+        "EhS-OrZMmHkosHhfOvHDFCJt3hKtAxiUuA8g_woo9t75wPS-kAMyBHByb2RQgL2jAVoQl-pjgWoxry5GRMVA6kCK9noC-H2CAQJuag",
+    )] = None
+
+    resolved = downloader.resolve_for_export(request)
+
+    assert resolved == (None, "qq_expired_after_napcat")
 
 
 def test_resolve_via_direct_file_id_classifies_blank_top_level_payload_as_background_without_stale_local_path() -> None:

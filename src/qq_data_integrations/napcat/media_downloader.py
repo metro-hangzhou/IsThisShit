@@ -1035,6 +1035,22 @@ class NapCatMediaDownloader:
                 self._note_old_bucket_success(old_bucket)
                 return self._remember_shared_outcome(shared_key, request, prefetched)
             if isinstance(payload, dict):
+                if not self._has_forward_parent_hint(hint):
+                    direct_prefetched_token_resolved = self._resolve_via_direct_public_token_hint(
+                        request,
+                        trace_callback=trace_callback,
+                    )
+                    if direct_prefetched_token_resolved not in {None, (None, None)}:
+                        resolved_path, resolver = direct_prefetched_token_resolved
+                        if resolved_path is not None:
+                            self._note_old_bucket_success(old_bucket)
+                        elif resolver == "qq_expired_after_napcat":
+                            self._note_old_bucket_expired_like(old_bucket)
+                        return self._remember_shared_outcome(
+                            shared_key,
+                            request,
+                            direct_prefetched_token_resolved,
+                        )
                 fast_resolved = self._resolve_from_fast_payload(payload)
                 if fast_resolved != (None, None):
                     self._note_old_bucket_success(old_bucket)
@@ -1852,6 +1868,9 @@ class NapCatMediaDownloader:
             _ = self._download_via_forward_context(request)
             forward_payload = self._prefetched_forward_media_payloads.get(key)
             return forward_payload if isinstance(forward_payload, dict) else None
+        cached_payload = request.get("_context_payload")
+        if isinstance(cached_payload, dict):
+            return cached_payload
         asset_type = str(request.get("asset_type") or "").strip()
         asset_role = str(request.get("asset_role") or "").strip() or None
         return self._download_via_context(hint, asset_type=asset_type, asset_role=asset_role)
@@ -1988,6 +2007,8 @@ class NapCatMediaDownloader:
             return None
         except NapCatApiError as exc:
             elapsed_s = monotonic() - started
+            if isinstance(request, dict) and "file not found" in str(exc).strip().lower():
+                request["_direct_file_id_not_found"] = True
             self._emit_asset_substep_trace(
                 trace_callback,
                 request,
@@ -2439,12 +2460,15 @@ class NapCatMediaDownloader:
         asset_role: str | None,
         request: dict[str, Any] | None = None,
         trace_callback: Callable[[dict[str, Any]], None] | None = None,
-    ) -> dict[str, Any] | None:
+        ) -> dict[str, Any] | None:
         if (
             self._fast_client is None
             or self._fast_context_route_disabled
             or not self._has_context_hint(hint)
         ):
+            if isinstance(request, dict):
+                request["_context_payload"] = None
+                request["_context_hydration_yielded_no_local_path"] = False
             return None
         timeout_s = self.CONTEXT_ROUTE_TIMEOUT_S
         if request is not None:
@@ -2486,6 +2510,9 @@ class NapCatMediaDownloader:
                 "A NapCat restart may be required. detail=%s",
                 exc,
             )
+            if isinstance(request, dict):
+                request["_context_payload"] = None
+                request["_context_hydration_yielded_no_local_path"] = False
             return None
         except NapCatFastHistoryTimeoutError as exc:
             elapsed_s = monotonic() - started
@@ -2508,6 +2535,9 @@ class NapCatMediaDownloader:
                     elapsed_s=elapsed_s,
                     detail=str(exc),
                 )
+            if isinstance(request, dict):
+                request["_context_payload"] = None
+                request["_context_hydration_yielded_no_local_path"] = False
             return None
         except (NapCatFastHistoryError, ValueError, TypeError):
             elapsed_s = monotonic() - started
@@ -2521,6 +2551,9 @@ class NapCatMediaDownloader:
                     status="error",
                     elapsed_s=elapsed_s,
                 )
+            if isinstance(request, dict):
+                request["_context_payload"] = None
+                request["_context_hydration_yielded_no_local_path"] = False
             return None
         except Exception:
             elapsed_s = monotonic() - started
@@ -2534,6 +2567,9 @@ class NapCatMediaDownloader:
                     status="error",
                     elapsed_s=elapsed_s,
                 )
+            if isinstance(request, dict):
+                request["_context_payload"] = None
+                request["_context_hydration_yielded_no_local_path"] = False
             return None
         elapsed_s = monotonic() - started
         if request is not None:
@@ -2552,6 +2588,11 @@ class NapCatMediaDownloader:
                 status="ok",
                 timeout_s=timeout_s,
                 elapsed_s=elapsed_s,
+            )
+        if isinstance(request, dict):
+            request["_context_payload"] = data if isinstance(data, dict) else None
+            request["_context_hydration_yielded_no_local_path"] = bool(
+                isinstance(data, dict) and self._resolved_path_from_payload(data) is None
             )
         return data if isinstance(data, dict) else None
 
@@ -5054,6 +5095,11 @@ class NapCatMediaDownloader:
         request: dict[str, Any] | None = None,
     ) -> str | None:
         if isinstance(request, dict) and str(request.get("asset_type") or "").strip().lower() == "image":
+            if self._has_terminal_top_level_image_local_download_dead_signal(
+                request,
+                payload=data if isinstance(data, dict) else None,
+            ):
+                return "qq_expired_after_napcat"
             local_placeholder_missing = self._classify_image_placeholder_missing_from_evidence(
                 request,
                 payload=data if isinstance(data, dict) else None,
@@ -5118,6 +5164,11 @@ class NapCatMediaDownloader:
         request: dict[str, Any] | None = None,
     ) -> str | None:
         if isinstance(request, dict) and str(request.get("asset_type") or "").strip().lower() == "image":
+            if self._has_terminal_top_level_image_local_download_dead_signal(
+                request,
+                payload=data if isinstance(data, dict) else None,
+            ):
+                return "qq_expired_after_napcat"
             local_placeholder_missing = self._classify_image_placeholder_missing_from_evidence(
                 request,
                 payload=data if isinstance(data, dict) else None,
@@ -5560,6 +5611,11 @@ class NapCatMediaDownloader:
         *,
         payload: dict[str, Any] | None = None,
     ) -> bool:
+        if self._has_terminal_top_level_image_local_download_dead_signal(
+            request,
+            payload=payload,
+        ):
+            return True
         if not isinstance(request, dict) or not isinstance(payload, dict):
             return False
         if str(request.get("asset_type") or "").strip().lower() != "image":
@@ -5599,24 +5655,32 @@ class NapCatMediaDownloader:
         payload: dict[str, Any] | None = None,
     ) -> str | None:
         local_placeholder_missing = self._classify_image_local_placeholder_missing(request)
-        if local_placeholder_missing is None:
-            return None
         if self._has_unexhausted_live_http_media_url(request, payload=payload):
             return None
         if self._has_failed_forward_remote_url(request, payload=payload):
-            return local_placeholder_missing
+            if local_placeholder_missing is not None:
+                return local_placeholder_missing
         if self._public_action_failed(
             request,
             action="get_image",
             payload=payload,
         ):
-            return local_placeholder_missing
+            if local_placeholder_missing is not None:
+                return local_placeholder_missing
         if self._public_action_remote_failed(
             request,
             action="get_image",
             payload=payload,
         ):
-            return local_placeholder_missing
+            if local_placeholder_missing is not None:
+                return local_placeholder_missing
+        if self._has_terminal_top_level_image_context_placeholder_signal(
+            request,
+            payload=payload,
+        ):
+            return local_placeholder_missing or "qq_not_downloaded_local_placeholder"
+        if local_placeholder_missing is None:
+            return None
         return None
 
     def _has_terminal_image_remote_evidence(
@@ -5634,6 +5698,47 @@ class NapCatMediaDownloader:
             "expired_remote" in reason_values
             and "unsupported_local_download" in reason_values
         )
+
+    def _has_terminal_top_level_image_local_download_dead_signal(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict):
+            return False
+        if str(request.get("asset_type") or "").strip().lower() != "image":
+            return False
+        hint = self._request_hint(request)
+        if self._has_forward_parent_hint(hint):
+            return False
+        remote_hint = str(
+            (payload or {}).get("remote_url")
+            or hint.get("remote_url")
+            or hint.get("url")
+            or ""
+        ).strip()
+        if not (
+            self._is_relative_local_download_hint(remote_hint)
+            or self._asset_location_kind(remote_hint) == "napcat_local_download"
+        ):
+            return False
+        if self._resolved_path_from_payload(payload) is not None:
+            return False
+        if not (
+            bool(request.get("_context_hydration_yielded_no_local_path"))
+            or self._has_stale_forward_local_media_hint(request, payload=payload)
+            or self._has_zero_byte_forward_local_media_hint(request, payload=payload)
+        ):
+            return False
+        direct_payload = self._direct_public_token_payload_for_request(request)
+        if not self._public_action_failed(
+            request,
+            action="get_image",
+            payload=direct_payload if isinstance(direct_payload, dict) else payload,
+        ):
+            return False
+        return True
 
     def _has_terminal_forward_image_route_signal(
         self,
@@ -6143,6 +6248,8 @@ class NapCatMediaDownloader:
     def _classify_terminal_file_like_missing_from_request_state(
         self,
         request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
     ) -> str | None:
         if not isinstance(request, dict):
             return None
@@ -6152,14 +6259,20 @@ class NapCatMediaDownloader:
                 request,
                 failure_signal_mode="terminal",
             )
+        cached_context_payload = request.get("_context_payload")
+        terminal_payload = payload if isinstance(payload, dict) else (
+            cached_context_payload if isinstance(cached_context_payload, dict) else None
+        )
         return self._classify_terminal_top_level_file_like_missing(
             request,
-            payload=self._direct_public_token_payload_for_request(request),
+            payload=terminal_payload or self._direct_public_token_payload_for_request(request),
         )
 
     def _classify_terminal_top_level_image_missing_from_request_state(
         self,
         request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
     ) -> str | None:
         if not isinstance(request, dict):
             return None
@@ -6168,7 +6281,17 @@ class NapCatMediaDownloader:
         hint = self._request_hint(request)
         if self._has_forward_parent_hint(hint):
             return None
-        direct_payload = self._direct_public_token_payload_for_request(request)
+        cached_context_payload = request.get("_context_payload")
+        direct_payload = payload if isinstance(payload, dict) else (
+            cached_context_payload if isinstance(cached_context_payload, dict) else None
+        )
+        if direct_payload is None:
+            direct_payload = self._direct_public_token_payload_for_request(request)
+        if self._has_terminal_top_level_image_local_download_dead_signal(
+            request,
+            payload=direct_payload,
+        ):
+            return "qq_expired_after_napcat"
         local_placeholder_missing = self._classify_image_placeholder_missing_from_evidence(
             request,
             payload=direct_payload,
@@ -6224,6 +6347,15 @@ class NapCatMediaDownloader:
             return True
         if self._has_unexhausted_live_http_media_url(request, payload=payload):
             return False
+        if (
+            bool(request.get("_direct_file_id_not_found"))
+            and isinstance(payload, dict)
+            and self._has_terminal_top_level_file_like_context_missing_signal(
+                request,
+                payload=payload,
+            )
+        ):
+            return True
         if not (
             self._has_stale_forward_local_media_hint(request, payload=payload)
             or self._has_zero_byte_forward_local_media_hint(request, payload=payload)
@@ -6246,6 +6378,81 @@ class NapCatMediaDownloader:
         if self._has_terminal_public_action_failure(request, payload=payload):
             return True
         return False
+
+    def _has_terminal_top_level_file_like_context_missing_signal(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict) or not isinstance(payload, dict):
+            return False
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type not in {"file", "video"}:
+            return False
+        if self._has_forward_parent_hint(self._request_hint(request)):
+            return False
+        if not bool(request.get("_direct_file_id_not_found")):
+            return False
+        if self._resolved_path_from_payload(payload) is not None:
+            return False
+        if self._has_unexhausted_live_http_media_url(request, payload=payload):
+            return False
+        direct_file_id = self._direct_forward_file_identifier(request, payload=payload)
+        if not direct_file_id.startswith("/"):
+            return False
+        remote_candidate = str(payload.get("url") or payload.get("remote_url") or "").strip()
+        if remote_candidate and self._resolve_remote_url(remote_candidate):
+            return False
+        if remote_candidate and Path(remote_candidate).exists():
+            return False
+        return bool(
+            str(payload.get("file_name") or request.get("file_name") or "").strip()
+            or str(payload.get("file_size") or "").strip()
+            or str(payload.get("file_id") or "").strip()
+            or str(payload.get("public_file_token") or "").strip()
+        )
+
+    def _has_terminal_top_level_image_context_placeholder_signal(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        if not isinstance(request, dict) or not isinstance(payload, dict):
+            return False
+        if str(request.get("asset_type") or "").strip().lower() != "image":
+            return False
+        hint = self._request_hint(request)
+        if self._has_forward_parent_hint(hint):
+            return False
+        if self._resolved_path_from_payload(payload) is not None:
+            return False
+        if self._has_unexhausted_live_http_media_url(request, payload=payload):
+            return False
+        remote_hint = str(hint.get("remote_url") or hint.get("url") or "").strip()
+        if not (
+            self._is_weak_relative_gchatpic_remote_hint(remote_hint)
+            or self._is_relative_local_download_hint(remote_hint)
+            or self._asset_location_kind(remote_hint) == "napcat_local_download"
+        ):
+            return False
+        context_local_candidate = str(payload.get("file") or payload.get("url") or "").strip()
+        context_failed_to_materialize_local = bool(request.get("_context_hydration_yielded_no_local_path"))
+        if not context_failed_to_materialize_local and context_local_candidate:
+            context_failed_to_materialize_local = (
+                self._asset_location_kind(context_local_candidate)
+                in {"missing_local", "stale_local", "zero_byte_local"}
+            )
+        if not context_failed_to_materialize_local:
+            return False
+        return self._has_stale_forward_local_media_hint(
+            request,
+            payload=payload,
+        ) or self._has_zero_byte_forward_local_media_hint(
+            request,
+            payload=payload,
+        )
 
     def _should_classify_direct_file_id_not_found_as_terminal(
         self,
@@ -7141,3 +7348,8 @@ class NapCatMediaDownloader:
         ):
             return None
         return urljoin(self._remote_base_url.rstrip("/") + "/", candidate.lstrip("/"))
+
+    @staticmethod
+    def _is_relative_local_download_hint(value: object) -> bool:
+        candidate = str(value or "").strip().lower()
+        return candidate.startswith("/download?") or candidate.startswith("download?")
