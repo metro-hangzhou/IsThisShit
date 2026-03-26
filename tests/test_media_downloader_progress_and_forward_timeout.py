@@ -71,6 +71,15 @@ class _MissingPublicFileClient:
         raise NapCatApiError("file not found")
 
 
+class _SuccessPublicFileClient:
+    def __init__(self) -> None:
+        self.get_file_calls = 0
+
+    def get_file(self, *args, **kwargs):
+        self.get_file_calls += 1
+        return {"file": str(Path(__file__).resolve()), "file_name": "success.bin"}
+
+
 class _MissingPublicRecordClient:
     def __init__(self) -> None:
         self.get_record_calls = 0
@@ -1425,6 +1434,104 @@ def test_old_forward_speech_public_not_found_is_classified_as_expired() -> None:
     assert client.get_record_calls == 1
 
 
+def test_exact_friend_top_level_speech_shape_currently_classifies_as_background_after_cached_retry_path() -> None:
+    payload = {
+        "asset_type": "speech",
+        "file_name": "exact-friend-speech.amr",
+        "public_action": "get_record",
+        "public_file_token": "EhQExactSpeechToken",
+        "file_id": "EhQExactSpeechToken",
+        "file": "",
+        "url": "",
+    }
+    fast_client = _StaticContextPayloadClient(payload)
+    client = _MissingPublicRecordClient()
+    downloader = NapCatMediaDownloader(client, fast_client=fast_client)
+    request = _mark_request_old(
+        {
+            "asset_type": "speech",
+            "file_name": "exact-friend-speech.amr",
+            "source_path": r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Ptt\2025-12\Ori\exact-friend-speech.amr",
+            "download_hint": {
+                "file_id": "EhQExactSpeechToken",
+                "message_id_raw": "7615594950568855051",
+                "element_id": "7615594950568855050",
+                "peer_uid": "922065597",
+                "chat_type_raw": 2,
+            },
+        },
+        days=100,
+    )
+    events: list[dict[str, object]] = []
+
+    resolved = downloader.resolve_for_export(request, trace_callback=events.append)
+
+    assert resolved == (None, "qq_expired_after_napcat")
+    assert client.get_record_calls == 2
+    assert len(fast_client.media_calls) == 1
+    speech_events = [event for event in events if event.get("asset_type") == "speech"]
+    assert any(
+        event.get("substep") == "public_token_get_record" and event.get("status") == "error"
+        for event in speech_events
+    )
+    assert any(
+        event.get("substep") == "public_token_get_record_fallback" and event.get("status") == "error"
+        for event in speech_events
+    )
+    assert any(
+        event.get("substep") == "context_hydration" and event.get("status") == "ok"
+        for event in speech_events
+    )
+    assert any(
+        event.get("substep") == "public_token_get_record" and event.get("status") == "cached_skip"
+        for event in speech_events
+    )
+    assert any(
+        event.get("substep") == "context_missing_classification"
+        and event.get("status") == "classified_missing"
+        and event.get("detail") == "qq_expired_after_napcat"
+        for event in speech_events
+    )
+
+
+def test_exact_friend_top_level_speech_shape_second_resolve_reuses_cached_background_outcome() -> None:
+    payload = {
+        "asset_type": "speech",
+        "file_name": "exact-friend-speech.amr",
+        "public_action": "get_record",
+        "public_file_token": "EhQExactSpeechToken",
+        "file_id": "EhQExactSpeechToken",
+        "file": "",
+        "url": "",
+    }
+    fast_client = _StaticContextPayloadClient(payload)
+    client = _MissingPublicRecordClient()
+    downloader = NapCatMediaDownloader(client, fast_client=fast_client)
+    request = _mark_request_old(
+        {
+            "asset_type": "speech",
+            "file_name": "exact-friend-speech.amr",
+            "source_path": r"D:\QQHOT\Tencent Files\2141129832\nt_qq\nt_data\Ptt\2025-12\Ori\exact-friend-speech.amr",
+            "download_hint": {
+                "file_id": "EhQExactSpeechToken",
+                "message_id_raw": "7615594950568855051",
+                "element_id": "7615594950568855050",
+                "peer_uid": "922065597",
+                "chat_type_raw": 2,
+            },
+        },
+        days=100,
+    )
+
+    first = downloader.resolve_for_export(request)
+    second = downloader.resolve_for_export(request)
+
+    assert first == (None, "qq_expired_after_napcat")
+    assert second == (None, "qq_expired_after_napcat")
+    assert client.get_record_calls == 2
+    assert len(fast_client.media_calls) == 1
+
+
 def test_old_forward_video_route_unavailable_is_classified_as_expired() -> None:
     fast_client = _UnavailableForwardClient()
     downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
@@ -1947,6 +2054,19 @@ def test_classify_forward_missing_keeps_forward_image_with_dead_remote_but_no_te
     assert classification is None
 
 
+def test_classify_forward_missing_keeps_forward_image_without_remote_or_public_handle_actionable_even_after_metadata_timeout() -> None:
+    fast_client = _TimeoutForwardClient()
+    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
+    request = _mark_request_old(_build_forward_request("forward-timeout-no-remote.jpg"), days=7)
+
+    assert downloader._download_via_forward_context(request, materialize=False) is None
+
+    classification = downloader._classify_forward_missing(request)
+
+    assert classification is None
+    assert len(fast_client.calls) == 1
+
+
 def test_resolve_for_export_classifies_prefetched_forward_image_with_dead_remote_and_metadata_timeout_as_background() -> None:
     downloader = NapCatMediaDownloader(_DummyClient(), remote_base_url="http://127.0.0.1:3000")
     request = _mark_request_old(_build_forward_request("forward-prefetched-dead.jpg"), days=7)
@@ -1976,19 +2096,6 @@ def test_resolve_for_export_classifies_prefetched_forward_image_with_dead_remote
     resolved = downloader.resolve_for_export(request)
 
     assert resolved == (None, "qq_expired_after_napcat")
-
-
-def test_classify_forward_missing_keeps_forward_image_without_remote_or_public_handle_actionable_even_after_metadata_timeout() -> None:
-    fast_client = _TimeoutForwardClient()
-    downloader = NapCatMediaDownloader(_DummyClient(), fast_client=fast_client)
-    request = _mark_request_old(_build_forward_request("forward-timeout-no-remote.jpg"), days=7)
-
-    assert downloader._download_via_forward_context(request, materialize=False) is None
-
-    classification = downloader._classify_forward_missing(request)
-
-    assert classification is None
-    assert len(fast_client.calls) == 1
 
 
 def _build_forward_image_terminal_remote_transport() -> httpx.MockTransport:
@@ -2399,6 +2506,230 @@ def test_forward_image_public_timeout_key_is_parent_scoped() -> None:
     assert key_a == key_b
 
 
+def test_forward_video_public_timeout_key_remains_request_scoped_for_same_parent_new_token() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request_a = _set_forward_parent_identity(
+        _build_forward_video_request("candidate-a.mp4"),
+        message_id_raw="parent-1",
+        element_id="element-1",
+    )
+    request_b = _set_forward_parent_identity(
+        _build_forward_video_request("candidate-a.mp4"),
+        message_id_raw="parent-1",
+        element_id="element-1",
+    )
+
+    key_a = downloader._request_scoped_public_action_timeout_key(
+        request_a,
+        action="get_file",
+        token="token-a",
+    )
+    key_b = downloader._request_scoped_public_action_timeout_key(
+        request_b,
+        action="get_file",
+        token="token-b",
+    )
+
+    assert key_a is not None
+    assert key_b is not None
+    assert key_a != key_b
+
+
+def test_forward_video_public_timeout_key_remains_request_scoped_for_same_parent_new_file() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request_a = _set_forward_parent_identity(
+        _build_forward_video_request("candidate-a.mp4"),
+        message_id_raw="parent-1",
+        element_id="element-1",
+    )
+    request_b = _set_forward_parent_identity(
+        _build_forward_video_request("candidate-b.mp4"),
+        message_id_raw="parent-1",
+        element_id="element-1",
+    )
+    request_b["md5"] = "different-md5"
+    request_b["download_hint"]["file_id"] = "/scope/video/b"  # type: ignore[index]
+
+    key_a = downloader._request_scoped_public_action_timeout_key(
+        request_a,
+        action="get_file",
+        token="token-a",
+    )
+    key_b = downloader._request_scoped_public_action_timeout_key(
+        request_b,
+        action="get_file",
+        token="token-a",
+    )
+
+    assert key_a is not None
+    assert key_b is not None
+    assert key_a != key_b
+
+
+def test_forward_file_public_timeout_key_remains_request_scoped_for_same_parent_new_token() -> None:
+    downloader = NapCatMediaDownloader(_DummyClient())
+    request_a = _set_forward_parent_identity(
+        _build_forward_video_request("candidate-a.bin"),
+        message_id_raw="parent-1",
+        element_id="element-1",
+    )
+    request_a["asset_type"] = "file"
+    request_b = _set_forward_parent_identity(
+        _build_forward_video_request("candidate-a.bin"),
+        message_id_raw="parent-1",
+        element_id="element-1",
+    )
+    request_b["asset_type"] = "file"
+
+    key_a = downloader._request_scoped_public_action_timeout_key(
+        request_a,
+        action="get_file",
+        token="token-a",
+    )
+    key_b = downloader._request_scoped_public_action_timeout_key(
+        request_b,
+        action="get_file",
+        token="token-b",
+    )
+
+    assert key_a is not None
+    assert key_b is not None
+    assert key_a != key_b
+
+
+def test_forward_video_parent_scoped_timeout_skips_same_parent_new_token_for_aged_forward() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request_a = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-a.mp4"), days=90),
+        message_id_raw="parent-aged-1",
+        element_id="element-aged-1",
+    )
+    request_b = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-b.mp4"), days=90),
+        message_id_raw="parent-aged-1",
+        element_id="element-aged-1",
+    )
+
+    assert downloader._call_public_action_with_token("get_file", "token-a", request=request_a) is None
+    assert downloader._call_public_action_with_token("get_file", "token-b", request=request_b) is None
+
+    assert client.get_file_calls == 1
+
+
+def test_forward_video_parent_scoped_timeout_skips_same_parent_new_file_for_aged_forward() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request_a = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-a.mp4"), days=90),
+        message_id_raw="parent-aged-2",
+        element_id="element-aged-2",
+    )
+    request_b = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-b.mp4"), days=90),
+        message_id_raw="parent-aged-2",
+        element_id="element-aged-2",
+    )
+    request_b["md5"] = "aged-b-md5"
+    request_b["download_hint"]["file_id"] = "/scope/video/b"  # type: ignore[index]
+
+    assert downloader._call_public_action_with_token("get_file", "token-a", request=request_a) is None
+    assert downloader._call_public_action_with_token("get_file", "token-a", request=request_b) is None
+
+    assert client.get_file_calls == 1
+
+
+def test_forward_file_parent_scoped_timeout_skips_same_parent_new_token_for_aged_forward() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request_a = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-a.bin"), days=90),
+        message_id_raw="parent-aged-3",
+        element_id="element-aged-3",
+    )
+    request_a["asset_type"] = "file"
+    request_b = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-a.bin"), days=90),
+        message_id_raw="parent-aged-3",
+        element_id="element-aged-3",
+    )
+    request_b["asset_type"] = "file"
+
+    assert downloader._call_public_action_with_token("get_file", "token-a", request=request_a) is None
+    assert downloader._call_public_action_with_token("get_file", "token-b", request=request_b) is None
+
+    assert client.get_file_calls == 1
+
+
+def test_forward_video_parent_scoped_timeout_does_not_leak_across_parents() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request_a = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-a.mp4"), days=90),
+        message_id_raw="parent-aged-4a",
+        element_id="element-aged-4a",
+    )
+    request_b = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-b.mp4"), days=90),
+        message_id_raw="parent-aged-4b",
+        element_id="element-aged-4b",
+    )
+
+    assert downloader._call_public_action_with_token("get_file", "token-a", request=request_a) is None
+    assert downloader._call_public_action_with_token("get_file", "token-b", request=request_b) is None
+
+    assert client.get_file_calls == 2
+
+
+def test_forward_video_parent_scoped_timeout_is_not_enabled_for_recent_forward() -> None:
+    client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(client)
+    request_a = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("recent-a.mp4"), days=7),
+        message_id_raw="parent-recent-1",
+        element_id="element-recent-1",
+    )
+    request_b = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("recent-b.mp4"), days=7),
+        message_id_raw="parent-recent-1",
+        element_id="element-recent-1",
+    )
+
+    assert downloader._call_public_action_with_token("get_file", "token-a", request=request_a) is None
+    assert downloader._call_public_action_with_token("get_file", "token-b", request=request_b) is None
+
+    assert client.get_file_calls == 2
+
+
+def test_forward_video_parent_scoped_timeout_does_not_block_direct_file_id_recovery_for_same_parent() -> None:
+    timeout_client = _TimeoutPublicFileClient()
+    downloader = NapCatMediaDownloader(timeout_client)
+    timed_out_request = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-a.mp4"), days=90),
+        message_id_raw="parent-aged-5",
+        element_id="element-aged-5",
+    )
+
+    assert downloader._call_public_action_with_token("get_file", "token-a", request=timed_out_request) is None
+    assert timeout_client.get_file_calls == 1
+
+    success_client = _SuccessPublicFileClient()
+    downloader._client = success_client  # type: ignore[assignment]
+    recover_request = _set_forward_parent_identity(
+        _mark_request_old(_build_forward_video_request("aged-b.mp4"), days=90),
+        message_id_raw="parent-aged-5",
+        element_id="element-aged-5",
+    )
+    recover_request["download_hint"]["file_id"] = "/scope/video/recover"  # type: ignore[index]
+
+    resolved = downloader._resolve_via_direct_file_id(recover_request)
+
+    assert resolved is not None
+    assert resolved[0] is not None
+    assert resolved[1] == "napcat_segment_file_id_get_file"
+    assert success_client.get_file_calls == 1
+
+
 def test_forward_image_public_timeout_skips_sibling_public_retry_after_first_timeout() -> None:
     client = _TimeoutPublicImageClient()
     payload_a = {
@@ -2703,6 +3034,46 @@ def test_classify_missing_from_payload_uses_public_payload_remote_failure_for_pl
         shutil.rmtree(temp_root, ignore_errors=True)
 
 
+def test_resolve_for_export_prefers_top_level_https_remote_over_direct_public_token_round_trip() -> None:
+    class _ExplodingImageClient:
+        def __init__(self) -> None:
+            self.get_image_calls = 0
+
+        def get_image(self, *args, **kwargs):
+            self.get_image_calls += 1
+            raise AssertionError("direct get_image should not run when a direct https media URL is already available")
+
+    temp_root = _workspace_temp_dir()
+    remote_target = temp_root / "remote_media" / "top-level-https-first.jpg"
+    remote_target.parent.mkdir(parents=True, exist_ok=True)
+    remote_target.write_bytes(b"remote")
+    client = _ExplodingImageClient()
+    downloader = NapCatMediaDownloader(client)
+    request = {
+        "asset_type": "image",
+        "file_name": remote_target.name,
+        "download_hint": {
+            "file_id": "token-direct-https",
+            "url": "https://gchat.qpic.cn/gchatpic_new/0/0-0-directhttps/0",
+        },
+    }
+    remote_calls: list[str] = []
+
+    def _download_remote_media(*, asset_type: str, file_name: str | None, hint: dict[str, object]) -> str | None:
+        remote_calls.append(str(hint.get("url") or ""))
+        return str(remote_target)
+
+    downloader._download_remote_media = _download_remote_media  # type: ignore[method-assign]
+
+    try:
+        resolved = downloader.resolve_for_export(request)
+        assert resolved == (remote_target.resolve(), "napcat_public_token_get_image_remote_url")
+        assert client.get_image_calls == 0
+        assert remote_calls == ["https://gchat.qpic.cn/gchatpic_new/0/0-0-directhttps/0"]
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 def test_resolve_for_export_prefers_existing_source_path_for_non_image_assets() -> None:
     temp_root = _workspace_temp_dir()
     downloader = NapCatMediaDownloader(_DummyClient())
@@ -2772,46 +3143,6 @@ def test_stale_image_neighbor_lookup_is_cached_per_source_path() -> None:
         assert second[0] == sibling_path.resolve()
         assert first_probe_count > 0
         assert downloader.base_dir_index_builds == first_probe_count
-    finally:
-        shutil.rmtree(temp_root, ignore_errors=True)
-
-
-def test_resolve_for_export_prefers_top_level_https_remote_over_direct_public_token_round_trip() -> None:
-    class _ExplodingImageClient:
-        def __init__(self) -> None:
-            self.get_image_calls = 0
-
-        def get_image(self, *args, **kwargs):
-            self.get_image_calls += 1
-            raise AssertionError("direct get_image should not run when a direct https media URL is already available")
-
-    temp_root = _workspace_temp_dir()
-    remote_target = temp_root / "remote_media" / "top-level-https-first.jpg"
-    remote_target.parent.mkdir(parents=True, exist_ok=True)
-    remote_target.write_bytes(b"remote")
-    client = _ExplodingImageClient()
-    downloader = NapCatMediaDownloader(client)
-    request = {
-        "asset_type": "image",
-        "file_name": remote_target.name,
-        "download_hint": {
-            "file_id": "token-direct-https",
-            "url": "https://gchat.qpic.cn/gchatpic_new/0/0-0-directhttps/0",
-        },
-    }
-    remote_calls: list[str] = []
-
-    def _download_remote_media(*, asset_type: str, file_name: str | None, hint: dict[str, object]) -> str | None:
-        remote_calls.append(str(hint.get("url") or ""))
-        return str(remote_target)
-
-    downloader._download_remote_media = _download_remote_media  # type: ignore[method-assign]
-
-    try:
-        resolved = downloader.resolve_for_export(request)
-        assert resolved == (remote_target.resolve(), "napcat_public_token_get_image_remote_url")
-        assert client.get_image_calls == 0
-        assert remote_calls == ["https://gchat.qpic.cn/gchatpic_new/0/0-0-directhttps/0"]
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
