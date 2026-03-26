@@ -94,6 +94,7 @@ class NapCatMediaDownloader:
         self._forward_context_unavailable_cache: set[tuple[str, ...]] = set()
         self._forward_context_payload_cache: dict[tuple[str, ...], dict[str, Any]] = {}
         self._request_scoped_public_action_timeout_cache: set[tuple[str, ...]] = set()
+        self._forward_parent_public_action_timeout_cache: set[tuple[str, ...]] = set()
         self._direct_file_id_timeout_cache: set[tuple[Any, ...]] = set()
         self._forward_timeout_storm_counts: dict[tuple[str, ...], int] = {}
         self._forward_timeout_storm_open: set[tuple[str, ...]] = set()
@@ -260,6 +261,7 @@ class NapCatMediaDownloader:
             self._forward_context_unavailable_cache.clear()
             self._forward_context_payload_cache.clear()
             self._request_scoped_public_action_timeout_cache.clear()
+            self._forward_parent_public_action_timeout_cache.clear()
             self._direct_file_id_timeout_cache.clear()
             self._forward_timeout_storm_counts.clear()
             self._forward_timeout_storm_open.clear()
@@ -2780,6 +2782,10 @@ class NapCatMediaDownloader:
             action=normalized_action,
             token=token,
         )
+        parent_timeout_scope_key = self._forward_parent_scoped_public_action_timeout_key(
+            request,
+            action=normalized_action,
+        )
         if (
             request_timeout_scope_key is not None
             and request_timeout_scope_key in self._request_scoped_public_action_timeout_cache
@@ -2794,6 +2800,22 @@ class NapCatMediaDownloader:
                     status="cached_skip",
                     elapsed_s=0.0,
                     detail="skipped repeated forward public token retry after prior timeout",
+                )
+            return None
+        if (
+            parent_timeout_scope_key is not None
+            and parent_timeout_scope_key in self._forward_parent_public_action_timeout_cache
+        ):
+            if request is not None:
+                self._emit_asset_substep_trace(
+                    trace_callback,
+                    request,
+                    stage="done",
+                    substep=f"public_token_{normalized_action}",
+                    timeout_s=self.PUBLIC_TOKEN_ACTION_TIMEOUT_S,
+                    status="cached_skip",
+                    elapsed_s=0.0,
+                    detail="skipped repeated forward public token retry after prior same-parent timeout",
                 )
             return None
         known_bad_token = self._known_bad_public_tokens.get((normalized_action, token))
@@ -2894,6 +2916,8 @@ class NapCatMediaDownloader:
                 )
             if request_timeout_scope_key is not None:
                 self._request_scoped_public_action_timeout_cache.add(request_timeout_scope_key)
+            if parent_timeout_scope_key is not None:
+                self._forward_parent_public_action_timeout_cache.add(parent_timeout_scope_key)
             self._public_token_action_outcomes[cache_key] = None
             self._note_forward_timeout_storm(
                 request,
@@ -2933,6 +2957,8 @@ class NapCatMediaDownloader:
                     request=request,
                 )
                 self._public_token_action_outcomes[cache_key] = payload
+                if parent_timeout_scope_key is not None:
+                    self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
                 return payload
             payload = None
         else:
@@ -2962,6 +2988,8 @@ class NapCatMediaDownloader:
                 request=request,
             )
             self._public_token_action_outcomes[cache_key] = payload
+            if parent_timeout_scope_key is not None:
+                self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
             return payload
 
         # Compatibility fallback for runtimes that still expect `file_id`.
@@ -3007,6 +3035,8 @@ class NapCatMediaDownloader:
                 )
             if request_timeout_scope_key is not None:
                 self._request_scoped_public_action_timeout_cache.add(request_timeout_scope_key)
+            if parent_timeout_scope_key is not None:
+                self._forward_parent_public_action_timeout_cache.add(parent_timeout_scope_key)
             self._public_token_action_outcomes[cache_key] = None
             return None
         except NapCatApiError as exc:
@@ -3042,12 +3072,16 @@ class NapCatMediaDownloader:
                     request=request,
                 )
                 self._public_token_action_outcomes[cache_key] = payload
+                if parent_timeout_scope_key is not None:
+                    self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
                 self._note_forward_timeout_storm_success(
                     request,
                     route=primary_substep,
                 )
                 return payload
             self._public_token_action_outcomes[cache_key] = None
+            if parent_timeout_scope_key is not None:
+                self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
             self._note_forward_timeout_storm_success(
                 request,
                 route=primary_substep,
@@ -3079,6 +3113,8 @@ class NapCatMediaDownloader:
             request=request,
         )
         self._public_token_action_outcomes[cache_key] = payload
+        if parent_timeout_scope_key is not None:
+            self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
         self._note_forward_timeout_storm_success(
             request,
             route=primary_substep,
@@ -5334,14 +5370,18 @@ class NapCatMediaDownloader:
         if not isinstance(data, dict):
             return None
         action = str(data.get("public_action") or "").strip().lower()
-        if action != "get_file":
-            return None
         request_asset_type = str(
             (request or {}).get("asset_type") if isinstance(request, dict) else ""
         ).strip().lower()
         payload_asset_type = str(data.get("asset_type") or "").strip().lower()
         effective_asset_type = request_asset_type or payload_asset_type
-        if effective_asset_type not in {"file", "video"}:
+        if effective_asset_type == "speech":
+            if action != "get_record":
+                return None
+        elif effective_asset_type in {"file", "video"}:
+            if action != "get_file":
+                return None
+        else:
             return None
         payload_file = str(data.get("file") or "").strip()
         remote_url = str(data.get("url") or data.get("remote_url") or "").strip()
@@ -6441,7 +6481,7 @@ class NapCatMediaDownloader:
         if not isinstance(request, dict):
             return False
         asset_type = str(request.get("asset_type") or "").strip().lower()
-        if asset_type not in {"file", "video"}:
+        if asset_type not in {"file", "video", "speech"}:
             return False
         hint = self._request_hint(request)
         if self._has_forward_parent_hint(hint):
@@ -6490,6 +6530,12 @@ class NapCatMediaDownloader:
         if not (has_direct_identifier or has_public_token):
             return False
         if self._has_terminal_public_action_failure(request, payload=payload):
+            return True
+        if asset_type == "speech" and self._public_action_failed(
+            request,
+            action="get_record",
+            payload=payload,
+        ):
             return True
         return False
 
@@ -7388,6 +7434,46 @@ class NapCatMediaDownloader:
             asset_type,
             str(request.get("asset_role") or "").strip(),
             *discriminator,
+        )
+
+    @staticmethod
+    def _forward_parent_scoped_public_action_timeout_key(
+        request: dict[str, Any] | None,
+        *,
+        action: str,
+    ) -> tuple[str, ...] | None:
+        if not isinstance(request, dict):
+            return None
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type not in {"video", "file"}:
+            return None
+        if str(action or "").strip().lower() != "get_file":
+            return None
+        hint = NapCatMediaDownloader._request_hint(request)
+        if not NapCatMediaDownloader._has_forward_parent_hint(hint):
+            return None
+        raw_timestamp = request.get("timestamp_ms")
+        if not isinstance(raw_timestamp, (int, float)):
+            return None
+        try:
+            asset_dt = datetime.fromtimestamp(float(raw_timestamp) / 1000.0, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        if datetime.now(timezone.utc) - asset_dt < timedelta(
+            days=NapCatMediaDownloader.FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS
+        ):
+            return None
+        parent = hint.get("_forward_parent")
+        assert isinstance(parent, dict)
+        return (
+            "forward_parent_public_timeout",
+            str(action or "").strip().lower(),
+            str(parent.get("message_id_raw") or "").strip(),
+            str(parent.get("element_id") or "").strip(),
+            str(parent.get("peer_uid") or "").strip(),
+            str(parent.get("chat_type_raw") or "").strip(),
+            asset_type,
+            str(request.get("asset_role") or "").strip().lower(),
         )
 
     @staticmethod
