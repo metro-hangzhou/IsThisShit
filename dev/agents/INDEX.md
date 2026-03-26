@@ -9,3 +9,8 @@ Specialized AGENT handbooks live here.
   - release sync discipline
   - staging hygiene
   - branch incident response
+
+## Subagent orchestration
+
+- [subagents/INDEX.md](subagents/INDEX.md)
+  - file-system handbooks for evidence-space subagents and the first-principles reviewer
