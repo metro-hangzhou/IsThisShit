@@ -4,3 +4,6 @@
 [submodule "subrepos/review-editor"]
 	path = subrepos/review-editor
 	url = https://github.com/metro-hangzhou/isthisshit-review-editor.git
+[submodule "NapCatQQ"]
+	path = NapCatQQ
+	url = https://github.com/NapNeko/NapCatQQ.git
