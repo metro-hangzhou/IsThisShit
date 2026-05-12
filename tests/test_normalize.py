@@ -322,7 +322,12 @@ def test_normalize_onebot_forward_preserves_parent_context() -> None:
     assert forward_segment.extra["element_id"] == "forward-element-77"
     assert forward_segment.extra["peer_uid"] == "u_123456"
     assert forward_segment.extra["chat_type_raw"] == 2
-    nested_image = forward_segment.extra["forward_messages"][0]["segments"][0]
+    child = forward_segment.extra["forward_messages"][0]
+    assert child["sender_id"] == "111"
+    assert child["raw_sender_id"] == "111"
+    assert child["raw_sender_name"] == "甲"
+    assert child["avatar_url"] == "https://q.qlogo.cn/headimg_dl?dst_uin=111&spec=0&img_type=jpg"
+    nested_image = child["segments"][0]
     assert "file_id" in nested_image["extra"]
     assert nested_image["extra"]["file_id"] is None
 

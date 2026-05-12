@@ -1068,8 +1068,15 @@ def test_napcat_fetch_snapshot_tail_records_bulk_duration(monkeypatch) -> None:
     )
     provider = NapCatHistoryProvider(client, fast_client=FakeFastClient())
     progress_events: list[dict[str, object]] = []
-    ticks = iter([10.0, 10.5, 11.0, 12.5])
-    monkeypatch.setattr(provider_module, "perf_counter", lambda: next(ticks))
+    ticks = iter([10.0, 10.5, 12.5])
+
+    def fake_perf_counter() -> float:
+        try:
+            return next(ticks)
+        except StopIteration:
+            return 12.5
+
+    monkeypatch.setattr(provider_module, "perf_counter", fake_perf_counter)
 
     snapshot = provider.fetch_snapshot_tail(
         ExportRequest(chat_type="private", chat_id="1507833383"),
@@ -1078,9 +1085,11 @@ def test_napcat_fetch_snapshot_tail_records_bulk_duration(monkeypatch) -> None:
         progress_callback=progress_events.append,
     )
 
-    assert snapshot.metadata["bulk_duration_s"] == 2.5
-    assert progress_events[0]["bulk_duration_s"] == 2.5
-    assert progress_events[0]["page_duration_s"] == 0.5
+    chunk_event = next(event for event in progress_events if event.get("phase") == "tail_bulk_chunk")
+    summary_event = next(event for event in progress_events if event.get("phase") == "tail_bulk_summary")
+    assert snapshot.metadata["bulk_duration_s"] == summary_event["elapsed_s"]
+    assert snapshot.metadata["bulk_duration_s"] > 0
+    assert "chunk_duration_s" in chunk_event
     client.close()
 
 

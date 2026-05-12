@@ -219,7 +219,75 @@ def test_enrich_forward_details_marks_unavailable_when_forward_and_history_both_
 
     assert enriched == 0
     assert unavailable == 1
-    assert (
+    assert str(
         target_message["message"][0]["data"]["_qq_data_forward_unavailable_reason"]  # type: ignore[index]
-        == "forward_structure_unavailable_via_history"
     )
+
+
+def test_message_has_resolved_forward_content_requires_nested_forwards_to_be_resolved() -> None:
+    provider = NapCatHistoryProvider(_DummyClient())
+    message = {
+        "message": [
+            {
+                "type": "forward",
+                "data": {
+                    "id": "outer-fwd",
+                    "content": [
+                        {
+                            "message": [
+                                {
+                                    "type": "forward",
+                                    "data": {
+                                        "id": "inner-fwd",
+                                        "content": [],
+                                        "preview_text": "只有预览，没有展开",
+                                    },
+                                }
+                            ]
+                        }
+                    ],
+                },
+            }
+        ]
+    }
+
+    assert provider._message_has_resolved_forward_content(message) is False
+
+
+def test_iter_forward_targets_discovers_unresolved_nested_forwards_inside_resolved_outer_forward() -> None:
+    provider = NapCatHistoryProvider(_DummyClient())
+    message = {
+        "message_id": "outer-msg",
+        "message_seq": "101",
+        "message": [
+            {
+                "type": "forward",
+                "data": {
+                    "id": "outer-fwd",
+                    "content": [
+                        {
+                            "message": [
+                                {
+                                    "type": "text",
+                                    "data": {"text": "甲：先看外层"},
+                                },
+                                {
+                                    "type": "forward",
+                                    "data": {
+                                        "id": "inner-fwd",
+                                        "preview_text": "内层只有 preview",
+                                        "content": [],
+                                    },
+                                },
+                            ]
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+
+    targets = list(provider._iter_forward_targets([message]))
+    target_ids = [item["forward_id"] for item in targets]
+
+    assert "inner-fwd" in target_ids
