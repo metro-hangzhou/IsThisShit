@@ -12,7 +12,9 @@
 - `subrepos/orch-agent` -> `https://github.com/metro-hangzhou/isthisshit-orch-agent.git`
 - `subrepos/review-editor` -> `https://github.com/metro-hangzhou/isthisshit-review-editor.git`
 
-当前没有删除、移动或替换主仓内原有源码目录。主仓里的 `src/qq_data_analysis`、`src/qq_data_process`、`apps/review-editor` 仍保留，后续迁移应在单独步骤中做依赖切换和目录瘦身。
+当前没有物理删除、移动或替换主仓内原有源码目录。主仓里的 `src/qq_data_analysis`、`src/qq_data_process` 仍由父仓跟踪并保留，后续迁移应在单独步骤中做依赖切换和目录瘦身。
+
+`apps/review-editor/` 已作为本地旧工作副本写入父仓 `.gitignore`。正式 review-editor 源码入口是 `subrepos/review-editor`，后续 UI 修改应优先进入该子仓，避免父仓重复显示未跟踪 app 文件。
 
 ## Local commits
 
