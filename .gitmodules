@@ -7,3 +7,4 @@
 [submodule "NapCatQQ"]
 	path = NapCatQQ
 	url = https://github.com/NapNeko/NapCatQQ.git
+	ignore = dirty

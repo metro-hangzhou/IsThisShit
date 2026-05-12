@@ -30,6 +30,7 @@
 /review_editor_human_feedback_list/
 /runtime_site_packages/
 /python_runtime/
+/dev/archive/
 # Local NapCat runtime worktree. The parent repository references upstream
 # runtime through the NapCatQQ submodule and keeps our fast plugin under
 # /plugins/napcat-plugin-qq-data-fast instead of tracking runtime binaries.
