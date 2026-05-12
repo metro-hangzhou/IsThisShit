@@ -1,0 +1,6 @@
+[submodule "subrepos/orch-agent"]
+	path = subrepos/orch-agent
+	url = https://github.com/metro-hangzhou/isthisshit-orch-agent.git
+[submodule "subrepos/review-editor"]
+	path = subrepos/review-editor
+	url = https://github.com/metro-hangzhou/isthisshit-review-editor.git
