@@ -266,20 +266,15 @@ def login(
                 typer.echo(f"login_status={status.login_error}")
 
         initial_status = service.check_status()
-        desired_quick_uin = None
-        if not refresh and not no_quick:
-            try:
-                desired_quick_uin = service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
-            except Exception:
-                desired_quick_uin = None
+        expected_quick_uin = quick_uin or str(settings.quick_login_uin or "").strip() or None
         if initial_status.effectively_logged_in():
             info = service.get_ready_login_info()
             if info is not None:
-                if desired_quick_uin and info.uin and info.uin != desired_quick_uin:
+                if expected_quick_uin and info.uin and info.uin != expected_quick_uin:
                     typer.echo(
                         build_session_mismatch_message(
                             current_uin=info.uin,
-                            requested_uin=desired_quick_uin,
+                            requested_uin=expected_quick_uin,
                         )
                     )
                     return
@@ -290,7 +285,13 @@ def login(
                 return
 
         quick_candidate_label: str | None = None
+        desired_quick_uin = None
         if not refresh and not no_quick:
+            typer.echo("login_status=QQ not logged in; attempting quick login...")
+            try:
+                desired_quick_uin = service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
+            except Exception:
+                desired_quick_uin = expected_quick_uin
             try:
                 candidates = service.get_quick_login_candidates()
             except Exception:
@@ -318,6 +319,7 @@ def login(
                     typer.echo(f"nick={quick_info.nick or ''}")
                     typer.echo(f"online={quick_info.online}")
                     return
+            typer.echo("login_status=quick login unavailable; preparing QR login...")
 
         info = service.login_until_success(
             timeout_seconds=timeout,
@@ -453,12 +455,26 @@ def export_history(
     trace = None
     forensics = None
     try:
+        target_resolution_started = monotonic()
         target = _resolve_target(gateway, normalized_chat_type, chat_ref, chat_name=chat_name, refresh=refresh)
         trace = ExportPerfTraceWriter(
             settings.state_dir,
             chat_type=normalized_chat_type,
             chat_id=target.chat_id,
             mode="cli_export",
+        )
+        trace.write_event(
+            "pipeline_stage",
+            {
+                "stage": "app.target_resolve",
+                "status": "done",
+                "elapsed_s": round(monotonic() - target_resolution_started, 4),
+                "chat_type": normalized_chat_type,
+                "query": chat_ref,
+                "resolved_chat_id": target.chat_id,
+                "resolved_chat_name": target.display_name,
+                "refresh": refresh,
+            },
         )
         progress_callback = _build_cli_export_progress_callback(trace)
         forensics = ExportForensicsCollector(
@@ -502,45 +518,89 @@ def export_history(
             limit=limit,
         )
         history_page_size = max(100, min(limit, 500))
-        if limit > CLI_HISTORY_SINGLE_PAGE_LIMIT:
-            source_snapshot = gateway.fetch_snapshot_tail(
-                request,
-                data_count=limit,
-                page_size=history_page_size,
-                progress_callback=progress_callback,
+        with trace.timed_stage(
+            "app.fetch_snapshot",
+            payload={
+                "chat_type": normalized_chat_type,
+                "chat_id": target.chat_id,
+                "limit": limit,
+                "history_page_size": history_page_size,
+            },
+        ) as fetch_stage:
+            if limit > CLI_HISTORY_SINGLE_PAGE_LIMIT:
+                source_snapshot = gateway.fetch_snapshot_tail(
+                    request,
+                    data_count=limit,
+                    page_size=history_page_size,
+                    progress_callback=progress_callback,
+                )
+                fetch_stage.add(fetch_mode="tail")
+            else:
+                source_snapshot = gateway.fetch_snapshot(request, progress_callback=progress_callback)
+                fetch_stage.add(fetch_mode="single_page")
+            fetch_stage.add(
+                source_history_source=str(source_snapshot.metadata.get("source") or ""),
+                source_message_count=len(source_snapshot.messages),
             )
-        else:
-            source_snapshot = gateway.fetch_snapshot(request)
         service = ChatExportService()
-        normalized = service.build_snapshot(source_snapshot)
+        with trace.timed_stage(
+            "app.normalize_snapshot",
+            payload={"source_message_count": len(source_snapshot.messages)},
+        ) as normalize_stage:
+            normalized = service.build_snapshot(source_snapshot)
+            normalize_stage.add(normalized_message_count=len(normalized.messages))
         target_path = out_path or build_default_output_path(
             settings.export_dir,
             chat_type=normalized_chat_type,
             chat_id=target.chat_id,
             fmt=normalized_fmt,
         )
-        bundle = service.write_bundle(
-            normalized,
-            target_path,
-            fmt=normalized_fmt,
-            media_resolution_mode="napcat_only",
-            media_download_manager=(
-                gateway.build_media_download_manager()
-                if hasattr(gateway, "build_media_download_manager")
-                else None
-            ),
-            progress_callback=progress_callback,
-            forensics_collector=forensics,
-        )
-        cleanup_stats = cleanup_gateway_media_cache(gateway, trace=trace, logger=logger)
-        content_summary = build_export_content_summary(
-            normalized,
-            bundle,
-            profile="all",
-            fmt=normalized_fmt,
-            strict_missing=strict_missing,
-        )
-        summary = trace.build_summary(record_count=len(normalized.messages))
+        with trace.timed_stage(
+            "app.write_bundle",
+            payload={
+                "target_path": str(target_path),
+                "format": normalized_fmt,
+                "normalized_message_count": len(normalized.messages),
+            },
+        ) as bundle_stage:
+            bundle = service.write_bundle(
+                normalized,
+                target_path,
+                fmt=normalized_fmt,
+                media_resolution_mode="napcat_only",
+                media_download_manager=(
+                    gateway.build_media_download_manager()
+                    if hasattr(gateway, "build_media_download_manager")
+                    else None
+                ),
+                progress_callback=progress_callback,
+                forensics_collector=forensics,
+            )
+            bundle_stage.add(
+                copied_asset_count=bundle.copied_asset_count,
+                reused_asset_count=bundle.reused_asset_count,
+                missing_asset_count=bundle.missing_asset_count,
+                error_asset_count=bundle.error_asset_count,
+            )
+        with trace.timed_stage("app.cleanup_remote_cache") as cleanup_stage:
+            cleanup_stats = cleanup_gateway_media_cache(gateway, trace=trace, logger=logger)
+            cleanup_stage.add(**cleanup_stats)
+        with trace.timed_stage(
+            "app.build_export_content_summary",
+            payload={"record_count": len(normalized.messages)},
+        ):
+            content_summary = build_export_content_summary(
+                normalized,
+                bundle,
+                profile="all",
+                fmt=normalized_fmt,
+                strict_missing=strict_missing,
+            )
+        with trace.timed_stage(
+            "app.build_perf_summary",
+            payload={"record_count": len(normalized.messages)},
+        ):
+            summary = trace.build_summary(record_count=len(normalized.messages))
         trace.write_event(
             "export_complete",
             {
@@ -554,23 +614,27 @@ def export_history(
                 **summary,
             },
         )
-        forensic_summary_path = (
-            forensics.finalize(
-                export_completed=True,
-                aborted=False,
-                data_path=bundle.data_path,
-                manifest_path=bundle.manifest_path,
-                trace_path=trace.path,
-                log_path=get_cli_log_path(),
-            )
-            if forensics is not None and forensics.enabled
-            else None
-        )
+        forensic_summary_path = None
+        if forensics is not None and forensics.enabled:
+            with trace.timed_stage(
+                "app.forensics_finalize",
+                payload={"incident_count": forensics.incident_count},
+            ) as forensic_stage:
+                forensic_summary_path = forensics.finalize(
+                    export_completed=True,
+                    aborted=False,
+                    data_path=bundle.data_path,
+                    manifest_path=bundle.manifest_path,
+                    trace_path=trace.path,
+                    log_path=get_cli_log_path(),
+                )
+                forensic_stage.add(summary_path=str(forensic_summary_path) if forensic_summary_path else None)
         if forensic_summary_path is not None:
             bundle.forensic_summary_path = forensic_summary_path
             bundle.forensic_run_dir = forensic_summary_path.parent
             bundle.forensic_incident_count = forensics.incident_count
         trace.close()
+        report_path = trace.persist_report(record_count=len(normalized.messages))
         zero_result_hint = _build_zero_result_hint(gateway, target=target, record_count=len(normalized.messages))
         if zero_result_hint:
             typer.echo(zero_result_hint, err=True)
@@ -584,6 +648,7 @@ def export_history(
             trace_path=trace.path,
         ):
             typer.echo(colorize_status_fields_for_ansi(line), err=True)
+        typer.echo(f"perf_report={report_path}", err=True)
         for retry_hint in format_missing_retry_hints_compact(content_summary, shell="cli"):
             typer.echo(colorize_status_fields_for_ansi(retry_hint), err=True)
         if int(getattr(bundle, "forensic_incident_count", 0) or 0):
@@ -611,13 +676,17 @@ def export_history(
                 },
             )
             if forensics is not None and forensics.enabled:
-                forensics.finalize(
-                    export_completed=False,
-                    aborted="strict missing aborted export" in str(exc).casefold(),
-                    trace_path=trace.path,
-                    log_path=get_cli_log_path(),
-                    error=str(exc),
-                )
+                with trace.timed_stage(
+                    "app.forensics_finalize",
+                    payload={"incident_count": forensics.incident_count, "failure": True},
+                ):
+                    forensics.finalize(
+                        export_completed=False,
+                        aborted="strict missing aborted export" in str(exc).casefold(),
+                        trace_path=trace.path,
+                        log_path=get_cli_log_path(),
+                        error=str(exc),
+                    )
             trace.close()
         raise
     finally:
@@ -826,6 +895,8 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
         forward_context_timeouts = int(update.get("forward_context_timeout_count") or 0)
         forward_context_empty = int(update.get("forward_context_empty_count") or 0)
         forward_context_errors = int(update.get("forward_context_error_count") or 0)
+        forward_context_unavailable = int(update.get("forward_context_unavailable_count") or 0)
+        forward_timeout_storm_skips = int(update.get("forward_timeout_storm_skip_count") or 0)
         last_asset_type = str(update.get("last_asset_type") or "").strip()
         last_file_name = str(update.get("last_file_name") or "").strip()
         last_status = str(update.get("last_status") or "").strip()
@@ -860,6 +931,10 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
             diag_parts.append(f"forward_meta_empty={forward_context_empty}")
         if forward_context_errors > 0:
             diag_parts.append(f"forward_meta_error={forward_context_errors}")
+        if forward_context_unavailable > 0:
+            diag_parts.append(f"forward_meta_unavailable={forward_context_unavailable}")
+        if forward_timeout_storm_skips > 0:
+            diag_parts.append(f"forward_timeout_breaker={forward_timeout_storm_skips}")
         if diag_parts:
             parts.append("diag=" + ",".join(diag_parts))
         return " ".join(parts)
@@ -882,7 +957,7 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
 
     if phase == "materialize_asset_substep" and str(update.get("stage") or "") == "done":
         status = str(update.get("status") or "")
-        if status not in {"timeout", "unavailable"}:
+        if status not in {"timeout", "unavailable", "storm_skip"}:
             return None
         substep = str(update.get("substep") or "-")
         asset_type = str(update.get("asset_type") or "-")
@@ -890,13 +965,14 @@ def _format_cli_export_progress(update: dict[str, object]) -> str | None:
         timeout_s = float(update.get("timeout_s") or 0.0)
         elapsed = float(update.get("elapsed_s") or 0.0)
         detail = (
-            f"status=failed export_progress: asset substep {status} substep={substep} "
+            f"status=in progress export_progress: asset substep {status} substep={substep} "
             f"asset={asset_type}:{file_name}"
         )
         if timeout_s > 0:
             detail += f" timeout={timeout_s:.1f}s"
         if elapsed > 0:
             detail += f" elapsed={elapsed:.1f}s"
+        detail += " continuing=1"
         return detail
     return None
 

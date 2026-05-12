@@ -5,10 +5,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import re
 import shlex
+from typing import TYPE_CHECKING
 
 from qq_data_core import ExportProfile
 from qq_data_core import TimeExpressionError, parse_time_expression, resolve_time_expression
-from qq_data_integrations.napcat import ChatHistoryBounds
+from qq_data_core import normalize_export_format
+
+if TYPE_CHECKING:
+    from qq_data_integrations.napcat.models import ChatHistoryBounds
 
 FORMAT_MARKERS = {
     "astxt": "txt",
@@ -74,7 +78,7 @@ def parse_root_export_command(
         target_query=target_query,
         batch_target_queries=batch_target_queries,
         interval=interval,
-        fmt=alias_fmt or str(options.get("format") or "").lower() or "jsonl",
+        fmt=normalize_export_format(alias_fmt or str(options.get("format") or "").lower() or "jsonl"),
         out_path=Path(str(options["out"])) if options.get("out") else None,
         limit=_parse_limit(options.get("limit"), default_limit=default_limit),
         data_count=_parse_optional_int(options.get("data-count"), inline_data_count),
@@ -100,7 +104,7 @@ def parse_watch_export_command(
         target_query=None,
         batch_target_queries=(),
         interval=interval,
-        fmt=alias_fmt or str(options.get("format") or "").lower() or "jsonl",
+        fmt=normalize_export_format(alias_fmt or str(options.get("format") or "").lower() or "jsonl"),
         out_path=Path(str(options["out"])) if options.get("out") else None,
         limit=_parse_limit(options.get("limit"), default_limit=default_limit),
         data_count=_parse_optional_int(options.get("data-count"), inline_data_count),

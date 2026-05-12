@@ -3,27 +3,34 @@ from __future__ import annotations
 import logging
 import sys
 import threading
-from datetime import datetime
 from pathlib import Path
 from types import TracebackType
+
+from qq_data_core.paths import atomic_write_text, build_timestamp_token
 
 
 _LOGGER_ROOT = "qq_data_cli"
 _SESSION_LOG_PATH: Path | None = None
-_LATEST_LOG_PATH: Path | None = None
+_SESSION_LOG_STATE_DIR: Path | None = None
 _INITIALIZED = False
 
 
 def setup_cli_logging(state_dir: Path) -> Path:
-    global _SESSION_LOG_PATH, _LATEST_LOG_PATH, _INITIALIZED
-    if _INITIALIZED and _SESSION_LOG_PATH is not None:
+    global _SESSION_LOG_PATH, _SESSION_LOG_STATE_DIR, _INITIALIZED
+    resolved_state_dir = state_dir.resolve()
+    if (
+        _INITIALIZED
+        and _SESSION_LOG_PATH is not None
+        and _SESSION_LOG_STATE_DIR == resolved_state_dir
+        and _SESSION_LOG_PATH.exists()
+    ):
         return _SESSION_LOG_PATH
 
-    logs_dir = state_dir / "logs"
+    logs_dir = resolved_state_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = build_timestamp_token(include_pid=True)
     session_path = logs_dir / f"cli_{stamp}.log"
-    latest_path = logs_dir / "cli_latest.log"
+    latest_pointer_path = logs_dir / "latest.path"
 
     logger = logging.getLogger(_LOGGER_ROOT)
     _clear_handlers(logger)
@@ -34,17 +41,17 @@ def setup_cli_logging(state_dir: Path) -> Path:
         fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    for path, mode in [(session_path, "a"), (latest_path, "w")]:
-        handler = logging.FileHandler(path, mode=mode, encoding="utf-8")
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+    handler = logging.FileHandler(session_path, mode="a", encoding="utf-8")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    atomic_write_text(latest_pointer_path, str(session_path), encoding="utf-8")
 
     _SESSION_LOG_PATH = session_path
-    _LATEST_LOG_PATH = latest_path
+    _SESSION_LOG_STATE_DIR = resolved_state_dir
     _INITIALIZED = True
 
     _install_exception_hooks()
-    logger.info("cli_logging_ready session_log=%s latest_log=%s", session_path, latest_path)
+    logger.info("cli_logging_ready session_log=%s latest_log_path=%s", session_path, latest_pointer_path)
     return session_path
 
 
@@ -56,6 +63,40 @@ def get_cli_logger(name: str | None = None) -> logging.Logger:
 
 def get_cli_log_path() -> Path | None:
     return _SESSION_LOG_PATH
+
+
+def get_latest_cli_log_path(state_dir: Path) -> Path | None:
+    resolved_state_dir = state_dir.resolve()
+    session_path = _SESSION_LOG_PATH
+    if (
+        session_path is not None
+        and session_path.exists()
+        and _SESSION_LOG_STATE_DIR == resolved_state_dir
+    ):
+        return session_path
+    latest_pointer_path = resolved_state_dir / "logs" / "latest.path"
+    if not latest_pointer_path.exists():
+        return None
+    try:
+        raw_value = latest_pointer_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw_value:
+        return None
+    candidate = Path(raw_value)
+    if not candidate.is_absolute():
+        candidate = (latest_pointer_path.parent / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    try:
+        allowed_dir = (resolved_state_dir / "logs").resolve()
+    except OSError:
+        allowed_dir = resolved_state_dir / "logs"
+    if candidate.suffix.casefold() != ".log":
+        return None
+    if allowed_dir not in candidate.parents:
+        return None
+    return candidate if candidate.exists() else None
 
 
 def _install_exception_hooks() -> None:
@@ -84,11 +125,11 @@ def _install_exception_hooks() -> None:
 
 
 def reset_cli_logging_for_tests() -> None:
-    global _SESSION_LOG_PATH, _LATEST_LOG_PATH, _INITIALIZED
+    global _SESSION_LOG_PATH, _SESSION_LOG_STATE_DIR, _INITIALIZED
     logger = logging.getLogger(_LOGGER_ROOT)
     _clear_handlers(logger)
     _SESSION_LOG_PATH = None
-    _LATEST_LOG_PATH = None
+    _SESSION_LOG_STATE_DIR = None
     _INITIALIZED = False
 
 

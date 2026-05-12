@@ -1,6 +1,24 @@
 from __future__ import annotations
 
+from io import BytesIO
+from pathlib import Path
+
 import qrcode
+
+from qq_data_core.paths import atomic_write_bytes
+
+
+def build_login_qr_image_path(project_root: Path) -> Path:
+    return project_root / "qq_login_qr.png"
+
+
+def write_qr_png(data: str, out_path: Path) -> Path:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    image = qrcode.make(data)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    atomic_write_bytes(out_path, buffer.getvalue())
+    return out_path
 
 
 def render_qr_text(data: str) -> str:

@@ -146,6 +146,13 @@ def _wrap_terminal_text(text: str, *, width: int) -> list[str]:
     return wrapped_lines or [""]
 
 
+def _watch_content_width(*, terminal_columns: int, reserve_scrollbar: bool) -> int:
+    width = max(20, int(terminal_columns))
+    if reserve_scrollbar:
+        width = max(4, width - 1)
+    return width
+
+
 class WatchConversationView:
     def __init__(
         self,
@@ -159,6 +166,8 @@ class WatchConversationView:
         ui_profile: CliUiProfile | None = None,
         application_input: Input | None = None,
         application_output: Output | None = None,
+        live_events_enabled: bool = True,
+        initial_notice_text: str = "",
     ) -> None:
         self._settings = settings
         self._gateway = gateway
@@ -170,14 +179,17 @@ class WatchConversationView:
         self._entries: list[WatchTimelineEntry] = []
         self._seen_keys: set[str] = set()
         self._status_text = "Loading history..."
-        self._notice_text = ""
+        self._notice_text = str(initial_notice_text or "")
         self._help_text = _default_watch_help_text()
+        self._live_events_enabled = bool(live_events_enabled)
         self._follow_tail = True
         self._scroll_top = 0
         self._history_page_size = max(20, self._history_limit)
         self._oldest_history_anchor: str | None = None
         self._history_exhausted = False
         self._download_notice_text = ""
+        self._reserve_timeline_scrollbar_column = True
+        self._last_timeline_content_width: int | None = None
         self._message_area = TextArea(
             text="",
             read_only=True,
@@ -248,6 +260,7 @@ class WatchConversationView:
             style=app_style,
             input=application_input,
             output=application_output,
+            before_render=self._before_render,
         )
         self._pump_task: asyncio.Task[None] | None = None
         self._export_task: asyncio.Task[None] | None = None
@@ -299,6 +312,9 @@ class WatchConversationView:
         self._history_exhausted = not snapshot.messages or not self._oldest_history_anchor
 
     def _start_background_tasks(self) -> None:
+        if not self._live_events_enabled:
+            self._pump_task = None
+            return
         self._pump_task = self._app.create_background_task(self._pump_live_events())
 
     async def _stop_background_tasks(self) -> None:
@@ -379,6 +395,7 @@ class WatchConversationView:
         self._sync_cursor_to_view()
 
     def _refresh_message_area(self) -> None:
+        self._last_timeline_content_width = self._timeline_content_width()
         transcript = self._get_timeline_text()
         self._message_area.buffer.set_document(
             Document(text=transcript, cursor_position=0),
@@ -386,6 +403,23 @@ class WatchConversationView:
         )
         self._clamp_scroll_top()
         self._sync_cursor_to_view()
+
+    def _refresh_message_area_for_resize(self) -> None:
+        width = self._timeline_content_width()
+        if self._last_timeline_content_width == width:
+            return
+
+        previous_follow_tail = self._follow_tail
+        previous_scroll_top = self._scroll_top
+        self._refresh_message_area()
+        if not previous_follow_tail:
+            self._follow_tail = False
+            self._scroll_top = previous_scroll_top
+            self._clamp_scroll_top()
+            self._sync_cursor_to_view()
+
+    def _before_render(self, _app: Application[Any]) -> None:
+        self._refresh_message_area_for_resize()
 
     def _scroll_to_end(self) -> None:
         line_count = max(1, self._message_area.buffer.document.line_count)
@@ -657,16 +691,20 @@ class WatchConversationView:
                 },
             )
             self._export_perf_trace.close()
+            report_path = self._export_perf_trace.persist_report(record_count=record_count)
             trace_path = self._export_perf_trace.path
             self._export_perf_trace = None
         else:
             trace_path = None
+            report_path = None
         elapsed_s = float(summary.get("elapsed_s") or 0.0)
         pages_scanned = int(summary.get("pages_scanned") or 0)
         retry_events = int(summary.get("retry_events") or 0)
         suffix = f" in {elapsed_s:.1f}s pages={pages_scanned} retries={retry_events}"
         if trace_path is not None:
             suffix += f" trace={trace_path}"
+        if report_path is not None:
+            suffix += f" report={report_path}"
         path_name = bundle.data_path.name
         perf_parts = [f"{elapsed_s:.1f}s"]
         if pages_scanned > 0:
@@ -693,6 +731,26 @@ class WatchConversationView:
             self._download_notice_text = self._format_watch_download_progress(update)
             self._invalidate()
             return
+        if phase == "materialize_asset_substep" and str(update.get("stage") or "") == "done":
+            status = str(update.get("status") or "")
+            if status in {"timeout", "unavailable", "storm_skip"}:
+                substep = str(update.get("substep") or "-")
+                asset_type = str(update.get("asset_type") or "-")
+                file_name = str(update.get("file_name") or "").strip() or "-"
+                timeout_s = float(update.get("timeout_s") or 0.0)
+                elapsed = float(update.get("elapsed_s") or 0.0)
+                detail = (
+                    f"Export asset substep {status}... substep={substep} "
+                    f"asset={asset_type}:{file_name}"
+                )
+                if timeout_s > 0:
+                    detail += f" timeout={timeout_s:.1f}s"
+                if elapsed > 0:
+                    detail += f" elapsed={elapsed:.1f}s"
+                detail += " continuing=1"
+                self._notice_text = detail
+                self._invalidate()
+                return
         if phase == "materialize_assets":
             current = int(update.get("current") or 0)
             total = int(update.get("total") or 0)
@@ -889,12 +947,34 @@ class WatchConversationView:
         )
         cleanup_done = False
         try:
+            def emit_stage(stage: str, status: str, *, elapsed_s: float | None = None, **payload: Any) -> None:
+                if progress_callback is None:
+                    return
+                update: dict[str, Any] = {
+                    "phase": "pipeline_stage",
+                    "stage": stage,
+                    "status": status,
+                    **payload,
+                }
+                if elapsed_s is not None:
+                    update["elapsed_s"] = round(elapsed_s, 4)
+                    update["elapsed_ms"] = int(round(elapsed_s * 1000))
+                progress_callback(update)
+
             request = ExportRequest(
                 chat_type=self._request.chat_type,
                 chat_id=self._request.chat_id,
                 chat_name=self._request.chat_name,
                 limit=parsed.data_count or parsed.limit,
                 include_raw=parsed.include_raw,
+            )
+            fetch_started = time.monotonic()
+            emit_stage(
+                "watch.fetch_snapshot",
+                "start",
+                history_page_size=history_page_size,
+                data_count=parsed.data_count,
+                interval=parsed.interval,
             )
             if parsed.interval is None:
                 if parsed.data_count:
@@ -905,7 +985,7 @@ class WatchConversationView:
                         progress_callback=progress_callback,
                     )
                 else:
-                    snapshot = export_gateway.fetch_snapshot(request)
+                    snapshot = export_gateway.fetch_snapshot(request, progress_callback=progress_callback)
             else:
                 if interval_is_full_history(parsed.interval):
                     snapshot = export_gateway.fetch_full_snapshot(
@@ -952,9 +1032,42 @@ class WatchConversationView:
                     snapshot.metadata["resolved_since"] = format_export_datetime(min(interval_start, interval_end))
                     snapshot.metadata["resolved_until"] = format_export_datetime(max(interval_start, interval_end))
                     snapshot.metadata["interval_mode"] = "closed"
+            emit_stage(
+                "watch.fetch_snapshot",
+                "done",
+                elapsed_s=time.monotonic() - fetch_started,
+                source_history_source=str(snapshot.metadata.get("source") or ""),
+                source_message_count=len(snapshot.messages),
+            )
+            normalize_started = time.monotonic()
+            emit_stage("watch.normalize_snapshot", "start", source_message_count=len(snapshot.messages))
             normalized = self._service.build_snapshot(snapshot, include_raw=parsed.include_raw)
+            emit_stage(
+                "watch.normalize_snapshot",
+                "done",
+                elapsed_s=time.monotonic() - normalize_started,
+                normalized_message_count=len(normalized.messages),
+            )
+            trim_started = time.monotonic()
+            emit_stage("watch.trim_snapshot", "start", normalized_message_count=len(normalized.messages), data_count=parsed.data_count)
             normalized = trim_snapshot_to_last_messages(normalized, data_count=parsed.data_count)
+            emit_stage(
+                "watch.trim_snapshot",
+                "done",
+                elapsed_s=time.monotonic() - trim_started,
+                trimmed_message_count=len(normalized.messages),
+            )
+            profile_started = time.monotonic()
+            emit_stage("watch.apply_export_profile", "start", message_count=len(normalized.messages), profile=parsed.profile)
             normalized = apply_export_profile(normalized, parsed.profile)
+            emit_stage(
+                "watch.apply_export_profile",
+                "done",
+                elapsed_s=time.monotonic() - profile_started,
+                profiled_message_count=len(normalized.messages),
+            )
+            bundle_started = time.monotonic()
+            emit_stage("watch.write_bundle", "start", normalized_message_count=len(normalized.messages))
             bundle = self._service.write_bundle(
                 normalized,
                 out_path,
@@ -967,17 +1080,37 @@ class WatchConversationView:
                 ),
                 progress_callback=progress_callback,
             )
+            emit_stage(
+                "watch.write_bundle",
+                "done",
+                elapsed_s=time.monotonic() - bundle_started,
+                copied_asset_count=bundle.copied_asset_count,
+                reused_asset_count=bundle.reused_asset_count,
+                missing_asset_count=bundle.missing_asset_count,
+                error_asset_count=bundle.error_asset_count,
+            )
+            cleanup_started = time.monotonic()
+            emit_stage("watch.cleanup_remote_cache", "start")
             cleanup_stats = cleanup_gateway_media_cache(
                 export_gateway,
                 logger=self._logger,
             )
+            emit_stage("watch.cleanup_remote_cache", "done", elapsed_s=time.monotonic() - cleanup_started, **cleanup_stats)
             cleanup_done = True
+            summary_started = time.monotonic()
+            emit_stage("watch.build_export_content_summary", "start", record_count=len(normalized.messages))
             content_summary = build_export_content_summary(
                 normalized,
                 bundle,
                 profile=parsed.profile,
                 fmt=parsed.fmt,
                 strict_missing=parsed.strict_missing,
+            )
+            emit_stage(
+                "watch.build_export_content_summary",
+                "done",
+                elapsed_s=time.monotonic() - summary_started,
+                record_count=len(normalized.messages),
             )
             return bundle, len(normalized.messages), content_summary, cleanup_stats
         finally:
@@ -1166,7 +1299,11 @@ class WatchConversationView:
     def _get_timeline_text(self) -> str:
         if not self._entries:
             return "No messages yet."
-        return "\n".join(entry.text for entry in self._entries)
+        width = self._timeline_content_width()
+        wrapped: list[str] = []
+        for entry in self._entries:
+            wrapped.extend(_wrap_terminal_text(entry.text, width=width))
+        return "\n".join(wrapped)
 
     def _build_status_text(self) -> str:
         total = len(self._entries)
@@ -1181,6 +1318,12 @@ class WatchConversationView:
             return max(20, int(self._app.output.get_size().columns))
         except Exception:
             return 120
+
+    def _timeline_content_width(self) -> int:
+        return _watch_content_width(
+            terminal_columns=self._terminal_width(),
+            reserve_scrollbar=self._reserve_timeline_scrollbar_column,
+        )
 
     def _wrap_lines(self, lines: list[str]) -> list[str]:
         width = self._terminal_width()

@@ -89,12 +89,20 @@ class SlashRepl:
         self._logger = get_cli_logger("repl")
         self._runtime_starter = None
         self._bootstrapper = None
+        self._gateway_init_lock = threading.Lock()
+        self._target_completion_runtime_warm_lock = threading.Lock()
+        self._target_completion_runtime_warm_thread: threading.Thread | None = None
         self._gateway: NapCatGateway | None = None
         self._webui_client: NapCatWebUiClient | None = None
         self._login_service: NapCatQrLoginService | None = None
         self._last_qr_url: str | None = None
         self._completion_primed_at: dict[str, float] = {}
         self._completion_prime_failed_at: dict[str, float] = {}
+        self._target_cache_prime_lock = threading.Lock()
+        self._target_cache_prime_threads: dict[str, threading.Thread | None] = {
+            "group": None,
+            "private": None,
+        }
         self._quick_login_candidates_cache: list[tuple[str, str | None]] = []
         self._quick_login_candidates_cached_at: float | None = None
         self._quick_login_candidates_prime_failed_at: float | None = None
@@ -135,6 +143,7 @@ class SlashRepl:
         self._kickoff_startup_capture_if_needed()
         self._warm_napcat_service_for_startup()
         self._kickoff_quick_login_candidates_prime_if_needed(announce=True)
+        self._kickoff_target_completion_runtime_warm()
         self._wait_briefly_for_quick_login_candidates_prime()
         self._console.print("Slash REPL ready. 输入 /help 查看命令；常用有 /friends、/watch、/export。")
         ui_notice = render_cli_ui_mode_notice(self._ui_decision)
@@ -276,24 +285,19 @@ class SlashRepl:
             or (positionals[0].strip() if positionals else "")
             or None
         )
+        expected_quick_uin = quick_uin or str(self._settings.quick_login_uin or "").strip() or None
 
         self._ensure_endpoint_ready("webui", quick_login_uin=quick_uin)
         self._refresh_settings()
         login_service = self._require_login_service()
         initial_status = login_service.check_status()
-        desired_quick_uin = None
-        if not refresh and use_quick_login:
-            try:
-                desired_quick_uin = login_service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
-            except Exception:
-                desired_quick_uin = None
         if initial_status.effectively_logged_in():
             ready_info = login_service.get_ready_login_info()
             if ready_info is not None:
-                if desired_quick_uin and ready_info.uin and ready_info.uin != desired_quick_uin:
+                if expected_quick_uin and ready_info.uin and ready_info.uin != expected_quick_uin:
                     self._console.print(
                         "QQ session mismatch. "
-                        f"current_uin={ready_info.uin} requested_uin={desired_quick_uin}. "
+                        f"current_uin={ready_info.uin} requested_uin={expected_quick_uin}. "
                         "Close the current NapCat/QQ session or switch the QQ account, then retry /login."
                     )
                     return
@@ -303,8 +307,8 @@ class SlashRepl:
                 try:
                     self._ensure_endpoint_ready("onebot_http")
                     self._ensure_endpoint_ready("onebot_ws")
-                    self._prime_target_cache("group", quiet=True)
-                    self._prime_target_cache("private", quiet=True)
+                    self._prime_target_cache("group", quiet=True, endpoint_ready=True)
+                    self._prime_target_cache("private", quiet=True, endpoint_ready=True)
                 except Exception as exc:
                     log_path = get_cli_log_path()
                     self._console.print(
@@ -317,7 +321,13 @@ class SlashRepl:
                         )
                     )
                 return
+        desired_quick_uin = None
         if use_quick_login and not refresh:
+            self._console.print("login_status=QQ not logged in; attempting quick login...")
+            try:
+                desired_quick_uin = login_service.resolve_desired_quick_login_uin(preferred_uin=quick_uin)
+            except Exception:
+                desired_quick_uin = expected_quick_uin
             try:
                 quick_candidates = login_service.get_quick_login_candidates()
             except Exception:
@@ -350,8 +360,8 @@ class SlashRepl:
                     try:
                         self._ensure_endpoint_ready("onebot_http")
                         self._ensure_endpoint_ready("onebot_ws")
-                        self._prime_target_cache("group", quiet=True)
-                        self._prime_target_cache("private", quiet=True)
+                        self._prime_target_cache("group", quiet=True, endpoint_ready=True)
+                        self._prime_target_cache("private", quiet=True, endpoint_ready=True)
                     except Exception as exc:
                         log_path = get_cli_log_path()
                         self._console.print(
@@ -361,9 +371,10 @@ class SlashRepl:
                                     "note: 群/好友补全依赖 onebot_http；当前不可用时，像 /export group ssj 这样的目标补全不会弹出。",
                                     f"note: 如需排查，请把 CLI 日志发回来：{log_path or ''}",
                                 ]
-                            )
                         )
+                    )
                     return
+            self._console.print("login_status=quick login unavailable; preparing QR login...")
         info = login_service.login_until_success(
             timeout_seconds=timeout_seconds,
             poll_interval=poll_interval,
@@ -379,8 +390,8 @@ class SlashRepl:
         try:
             self._ensure_endpoint_ready("onebot_http")
             self._ensure_endpoint_ready("onebot_ws")
-            self._prime_target_cache("group", quiet=True)
-            self._prime_target_cache("private", quiet=True)
+            self._prime_target_cache("group", quiet=True, endpoint_ready=True)
+            self._prime_target_cache("private", quiet=True, endpoint_ready=True)
         except Exception as exc:
             log_path = get_cli_log_path()
             self._console.print(
@@ -567,7 +578,7 @@ class SlashRepl:
         self._ensure_endpoint_ready("onebot_http")
         assert parsed.chat_type is not None
         chat_type = _normalize_chat_type(parsed.chat_type)
-        self._prime_target_cache(chat_type, quiet=False)
+        self._prime_target_cache(chat_type, quiet=False, endpoint_ready=True)
         if parsed.batch_target_queries:
             self._handle_batch_export(parsed, chat_type=chat_type)
             return
@@ -577,7 +588,7 @@ class SlashRepl:
         self._run_single_export(parsed, target=target, batch_prefix=None)
 
     def _handle_watch(self, argv: list[str]) -> None:
-        from qq_data_cli.watch_view import WatchConversationView
+        from qq_data_cli.watch_view import WatchConversationView, _friendly_watch_runtime_notice
         from qq_data_core import WatchRequest
 
         positionals, options = _parse_options(
@@ -589,9 +600,25 @@ class SlashRepl:
             raise ValueError("Usage: /watch group|friend <name-or-id> [--refresh] [--limit N]")
 
         self._ensure_endpoint_ready("onebot_http")
-        self._ensure_endpoint_ready("onebot_ws")
+        live_events_enabled = True
+        initial_notice_text = ""
+        try:
+            self._ensure_endpoint_ready("onebot_ws")
+        except RuntimeError as exc:
+            live_events_enabled = False
+            initial_notice_text = _friendly_watch_runtime_notice(
+                "实时监听当前不可用",
+                exc,
+                suffix="当前窗口仍可继续查看历史并执行导出。",
+            )
+            self._logger.warning(
+                "watch_live_events_disabled chat_type=%s query=%s reason=%s",
+                positionals[0],
+                positionals[1],
+                exc,
+            )
         chat_type = _normalize_chat_type(positionals[0])
-        self._prime_target_cache(chat_type, quiet=False)
+        self._prime_target_cache(chat_type, quiet=False, endpoint_ready=True)
         target = self._resolve_target(chat_type, positionals[1], refresh=bool(options.get("refresh")))
         request = WatchRequest(
             chat_type=chat_type,
@@ -607,13 +634,16 @@ class SlashRepl:
             request=request,
             history_limit=history_limit,
             ui_profile=self._ui_profile,
+            live_events_enabled=live_events_enabled,
+            initial_notice_text=initial_notice_text,
         )
         self._logger.info(
-            "watch_open chat_type=%s chat_id=%s chat_name=%s history_limit=%s",
+            "watch_open chat_type=%s chat_id=%s chat_name=%s history_limit=%s live_events_enabled=%s",
             chat_type,
             target.chat_id,
             target.display_name,
             history_limit,
+            live_events_enabled,
         )
         try:
             asyncio.run(view.run())
@@ -823,37 +853,92 @@ class SlashRepl:
             },
         )
         progress_display.start()
+        report_path = None
         try:
-            snapshot = self._build_export_snapshot(
-                parsed,
-                target=target,
-                progress_callback=progress_callback,
-            )
-            normalized = service.build_snapshot(snapshot, include_raw=parsed.include_raw)
-            normalized = trim_snapshot_to_last_messages(normalized, data_count=parsed.data_count)
-            normalized = apply_export_profile(normalized, parsed.profile)
-            bundle = service.write_bundle(
-                normalized,
-                out_path,
-                fmt=parsed.fmt,
-                media_resolution_mode="napcat_only",
-                media_download_manager=(
-                    gateway.build_media_download_manager()
-                    if hasattr(gateway, "build_media_download_manager")
-                    else None
-                ),
-                progress_callback=progress_callback,
-                forensics_collector=forensics,
-            )
-            cleanup_stats = cleanup_gateway_media_cache(gateway, trace=trace, logger=self._logger)
-            content_summary = build_export_content_summary(
-                normalized,
-                bundle,
-                profile=parsed.profile,
-                fmt=parsed.fmt,
-                strict_missing=parsed.strict_missing,
-            )
-            summary = trace.build_summary(record_count=len(normalized.messages))
+            with trace.timed_stage(
+                "repl.build_export_snapshot",
+                payload={
+                    "chat_type": target.chat_type,
+                    "chat_id": target.chat_id,
+                    "limit": parsed.limit,
+                    "data_count": parsed.data_count,
+                    "interval": parsed.interval,
+                },
+            ) as snapshot_stage:
+                snapshot = self._build_export_snapshot(
+                    parsed,
+                    target=target,
+                    progress_callback=progress_callback,
+                )
+                snapshot_stage.add(
+                    source_history_source=str(snapshot.metadata.get("source") or ""),
+                    source_message_count=len(snapshot.messages),
+                )
+            with trace.timed_stage(
+                "repl.normalize_snapshot",
+                payload={"source_message_count": len(snapshot.messages)},
+            ) as normalize_stage:
+                normalized = service.build_snapshot(snapshot, include_raw=parsed.include_raw)
+                normalize_stage.add(normalized_message_count=len(normalized.messages))
+            with trace.timed_stage(
+                "repl.trim_snapshot",
+                payload={"normalized_message_count": len(normalized.messages), "data_count": parsed.data_count},
+            ) as trim_stage:
+                normalized = trim_snapshot_to_last_messages(normalized, data_count=parsed.data_count)
+                trim_stage.add(trimmed_message_count=len(normalized.messages))
+            with trace.timed_stage(
+                "repl.apply_export_profile",
+                payload={"message_count": len(normalized.messages), "profile": parsed.profile},
+            ) as profile_stage:
+                normalized = apply_export_profile(normalized, parsed.profile)
+                profile_stage.add(profiled_message_count=len(normalized.messages))
+            with trace.timed_stage(
+                "repl.write_bundle",
+                payload={
+                    "target_path": str(out_path),
+                    "format": parsed.fmt,
+                    "normalized_message_count": len(normalized.messages),
+                    "profile": parsed.profile,
+                },
+            ) as bundle_stage:
+                bundle = service.write_bundle(
+                    normalized,
+                    out_path,
+                    fmt=parsed.fmt,
+                    media_resolution_mode="napcat_only",
+                    media_download_manager=(
+                        gateway.build_media_download_manager()
+                        if hasattr(gateway, "build_media_download_manager")
+                        else None
+                    ),
+                    progress_callback=progress_callback,
+                    forensics_collector=forensics,
+                )
+                bundle_stage.add(
+                    copied_asset_count=bundle.copied_asset_count,
+                    reused_asset_count=bundle.reused_asset_count,
+                    missing_asset_count=bundle.missing_asset_count,
+                    error_asset_count=bundle.error_asset_count,
+                )
+            with trace.timed_stage("repl.cleanup_remote_cache") as cleanup_stage:
+                cleanup_stats = cleanup_gateway_media_cache(gateway, trace=trace, logger=self._logger)
+                cleanup_stage.add(**cleanup_stats)
+            with trace.timed_stage(
+                "repl.build_export_content_summary",
+                payload={"record_count": len(normalized.messages), "profile": parsed.profile},
+            ):
+                content_summary = build_export_content_summary(
+                    normalized,
+                    bundle,
+                    profile=parsed.profile,
+                    fmt=parsed.fmt,
+                    strict_missing=parsed.strict_missing,
+                )
+            with trace.timed_stage(
+                "repl.build_perf_summary",
+                payload={"record_count": len(normalized.messages)},
+            ):
+                summary = trace.build_summary(record_count=len(normalized.messages))
             trace.write_event(
                 "export_complete",
                 {
@@ -867,18 +952,21 @@ class SlashRepl:
                     **summary,
                 },
             )
-            forensic_summary_path = (
-                forensics.finalize(
-                    export_completed=True,
-                    aborted=False,
-                    data_path=bundle.data_path,
-                    manifest_path=bundle.manifest_path,
-                    trace_path=trace.path,
-                    log_path=get_cli_log_path(),
-                )
-                if forensics.enabled
-                else None
-            )
+            forensic_summary_path = None
+            if forensics.enabled:
+                with trace.timed_stage(
+                    "repl.forensics_finalize",
+                    payload={"incident_count": forensics.incident_count},
+                ) as forensic_stage:
+                    forensic_summary_path = forensics.finalize(
+                        export_completed=True,
+                        aborted=False,
+                        data_path=bundle.data_path,
+                        manifest_path=bundle.manifest_path,
+                        trace_path=trace.path,
+                        log_path=get_cli_log_path(),
+                    )
+                    forensic_stage.add(summary_path=str(forensic_summary_path) if forensic_summary_path else None)
             if forensic_summary_path is not None:
                 bundle.forensic_summary_path = forensic_summary_path
                 bundle.forensic_run_dir = forensic_summary_path.parent
@@ -890,6 +978,7 @@ class SlashRepl:
             )
             if zero_result_hint:
                 self._console.print(zero_result_hint)
+            report_path = trace.persist_report(record_count=len(normalized.messages))
             for line in format_export_result_lines(
                 session_line=session_line,
                 content_summary=content_summary,
@@ -898,6 +987,8 @@ class SlashRepl:
                 trace_path=trace.path,
             ):
                 self._console.print(build_rich_status_text(line))
+            if report_path is not None:
+                self._console.print(f"perf_report={report_path}")
             if int(getattr(bundle, "forensic_incident_count", 0) or 0):
                 self._console.print(
                     f"forensics: incidents={getattr(bundle, 'forensic_incident_count', 0)} "
@@ -920,17 +1011,23 @@ class SlashRepl:
                 },
             )
             if forensics.enabled:
-                forensics.finalize(
-                    export_completed=False,
-                    aborted="strict missing aborted export" in str(exc).casefold(),
-                    trace_path=trace.path,
-                    log_path=get_cli_log_path(),
-                    error=str(exc),
-                )
+                with trace.timed_stage(
+                    "repl.forensics_finalize",
+                    payload={"incident_count": forensics.incident_count, "failure": True},
+                ):
+                    forensics.finalize(
+                        export_completed=False,
+                        aborted="strict missing aborted export" in str(exc).casefold(),
+                        trace_path=trace.path,
+                        log_path=get_cli_log_path(),
+                        error=str(exc),
+                    )
             raise
         finally:
             progress_display.stop()
             trace.close()
+            if report_path is None:
+                trace.persist_report(record_count=len(normalized.messages) if 'normalized' in locals() else None)
 
     def _resolve_export_output_path(
         self,
@@ -1136,7 +1233,7 @@ class SlashRepl:
 
         if phase == "materialize_asset_substep" and str(update.get("stage") or "") == "done":
             status = str(update.get("status") or "")
-            if status not in {"timeout", "unavailable"}:
+            if status not in {"timeout", "unavailable", "storm_skip"}:
                 return None
             substep = str(update.get("substep") or "-")
             asset_type = str(update.get("asset_type") or "-")
@@ -1144,13 +1241,14 @@ class SlashRepl:
             timeout_s = float(update.get("timeout_s") or 0.0)
             elapsed = float(update.get("elapsed_s") or 0.0)
             detail = (
-                f"status=failed {prefix}export_progress: asset substep {status} substep={substep} "
+                f"status=in progress {prefix}export_progress: asset substep {status} substep={substep} "
                 f"asset={asset_type}:{file_name}"
             )
             if timeout_s > 0:
                 detail += f" timeout={timeout_s:.1f}s"
             if elapsed > 0:
                 detail += f" elapsed={elapsed:.1f}s"
+            detail += " continuing=1"
             return detail
         return None
 
@@ -1174,6 +1272,8 @@ class SlashRepl:
         forward_context_timeouts = int(update.get("forward_context_timeout_count") or 0)
         forward_context_empty = int(update.get("forward_context_empty_count") or 0)
         forward_context_errors = int(update.get("forward_context_error_count") or 0)
+        forward_context_unavailable = int(update.get("forward_context_unavailable_count") or 0)
+        forward_timeout_storm_skips = int(update.get("forward_timeout_storm_skip_count") or 0)
         last_asset_type = str(update.get("last_asset_type") or "").strip()
         last_file_name = str(update.get("last_file_name") or "").strip()
         last_status = str(update.get("last_status") or "").strip()
@@ -1208,6 +1308,10 @@ class SlashRepl:
             diag_parts.append(f"forward_meta_empty={forward_context_empty}")
         if forward_context_errors > 0:
             diag_parts.append(f"forward_meta_error={forward_context_errors}")
+        if forward_context_unavailable > 0:
+            diag_parts.append(f"forward_meta_unavailable={forward_context_unavailable}")
+        if forward_timeout_storm_skips > 0:
+            diag_parts.append(f"forward_timeout_breaker={forward_timeout_storm_skips}")
         if diag_parts:
             parts.append("diag=" + ",".join(diag_parts))
         return " ".join(parts)
@@ -1233,7 +1337,7 @@ class SlashRepl:
                     page_size=history_page_size,
                     progress_callback=progress_callback,
                 )
-            return gateway.fetch_snapshot(request)
+            return gateway.fetch_snapshot(request, progress_callback=progress_callback)
 
         if interval_is_full_history(parsed.interval):
             snapshot = gateway.fetch_full_snapshot(
@@ -1294,15 +1398,69 @@ class SlashRepl:
         keyword: str | None,
         limit: int,
     ) -> list[ChatTarget]:
-        self._prime_target_cache(chat_type, quiet=True)
+        lookup_started = monotonic()
+        gateway_started = monotonic()
         gateway = self._require_gateway()
-        return gateway.list_targets(chat_type, keyword, limit=limit)
+        gateway_elapsed_ms = (monotonic() - gateway_started) * 1000.0
+        cached_count_started = monotonic()
+        cached_target_count = gateway.count_cached_targets(chat_type)
+        cached_count_elapsed_ms = (monotonic() - cached_count_started) * 1000.0
+        if cached_target_count > 0:
+            cached_search_started = monotonic()
+            targets = gateway.list_cached_targets(chat_type, keyword, limit=limit)
+            cached_search_elapsed_ms = (monotonic() - cached_search_started) * 1000.0
+            self._kickoff_target_cache_prime_if_needed(chat_type)
+            total_elapsed_ms = (monotonic() - lookup_started) * 1000.0
+            self._logger.info(
+                "completion_target_lookup chat_type=%s keyword=%r mode=cached cached_targets=%s "
+                "gateway_ms=%.1f cached_count_ms=%.1f cached_search_ms=%.1f total_ms=%.1f result_count=%s",
+                chat_type,
+                keyword,
+                cached_target_count,
+                gateway_elapsed_ms,
+                cached_count_elapsed_ms,
+                cached_search_elapsed_ms,
+                total_elapsed_ms,
+                len(targets),
+            )
+            return targets
+
+        prime_started = monotonic()
+        self._prime_target_cache(chat_type, quiet=True)
+        prime_elapsed_ms = (monotonic() - prime_started) * 1000.0
+        gateway = self._require_gateway()
+        lookup_search_started = monotonic()
+        targets = gateway.list_targets(chat_type, keyword, limit=limit)
+        lookup_search_elapsed_ms = (monotonic() - lookup_search_started) * 1000.0
+        total_elapsed_ms = (monotonic() - lookup_started) * 1000.0
+        self._logger.info(
+            "completion_target_lookup chat_type=%s keyword=%r mode=sync_prime cached_targets=0 "
+            "gateway_ms=%.1f cached_count_ms=%.1f prime_ms=%.1f lookup_ms=%.1f total_ms=%.1f result_count=%s",
+            chat_type,
+            keyword,
+            gateway_elapsed_ms,
+            cached_count_elapsed_ms,
+            prime_elapsed_ms,
+            lookup_search_elapsed_ms,
+            total_elapsed_ms,
+            len(targets),
+        )
+        return targets
 
     def _require_gateway(self) -> NapCatGateway:
         from qq_data_integrations.napcat.gateway import NapCatGateway
 
         if self._gateway is None:
-            self._gateway = NapCatGateway(self._settings)
+            with self._gateway_init_lock:
+                if self._gateway is None:
+                    started = monotonic()
+                    self._gateway = NapCatGateway(self._settings)
+                    self._logger.info(
+                        "gateway_initialized duration_ms=%.1f http_url=%s fast_history_mode=%s",
+                        (monotonic() - started) * 1000.0,
+                        self._settings.http_url,
+                        self._settings.fast_history_mode,
+                    )
         return self._gateway
 
     def _require_service(self) -> "ChatExportService":
@@ -1385,6 +1543,13 @@ class SlashRepl:
         self._login_service = None
         self._completion_primed_at.clear()
         self._completion_prime_failed_at.clear()
+        with self._target_completion_runtime_warm_lock:
+            self._target_completion_runtime_warm_thread = None
+        with self._target_cache_prime_lock:
+            self._target_cache_prime_threads = {
+                "group": None,
+                "private": None,
+            }
         with self._quick_login_candidates_lock:
             self._quick_login_candidates_cache.clear()
             self._quick_login_candidates_cached_at = None
@@ -1431,33 +1596,60 @@ class SlashRepl:
         if mismatch_message:
             raise RuntimeError(mismatch_message)
 
-    def _prime_target_cache(self, chat_type: str, *, quiet: bool) -> None:
+    def _prime_target_cache(self, chat_type: str, *, quiet: bool, endpoint_ready: bool = False) -> None:
+        total_started = monotonic()
         if self._completion_cache_is_fresh(
             self._completion_primed_at,
             chat_type,
             ttl_s=self.COMPLETION_PRIMED_TTL_S,
         ):
+            self._logger.info(
+                "completion_prime_skipped chat_type=%s reason=fresh_cache quiet=%s total_ms=%.1f",
+                chat_type,
+                quiet,
+                (monotonic() - total_started) * 1000.0,
+            )
             return
         if quiet and self._completion_cache_is_fresh(
             self._completion_prime_failed_at,
             chat_type,
             ttl_s=self.COMPLETION_PRIME_RETRY_COOLDOWN_S,
         ):
+            self._logger.info(
+                "completion_prime_skipped chat_type=%s reason=retry_cooldown quiet=%s total_ms=%.1f",
+                chat_type,
+                quiet,
+                (monotonic() - total_started) * 1000.0,
+            )
             return
 
         gateway = self._require_gateway()
-        has_cached_targets = gateway.count_targets(chat_type) > 0
+        count_started = monotonic()
+        has_cached_targets = gateway.count_cached_targets(chat_type) > 0
+        cached_count_elapsed_ms = (monotonic() - count_started) * 1000.0
 
         try:
-            self._ensure_endpoint_ready("onebot_http")
+            ensure_elapsed_ms = 0.0
+            if not endpoint_ready:
+                ensure_started = monotonic()
+                self._ensure_endpoint_ready("onebot_http")
+                ensure_elapsed_ms = (monotonic() - ensure_started) * 1000.0
             gateway = self._require_gateway()
-            gateway.list_targets(chat_type, refresh=True, limit=32)
+            if not quiet and not has_cached_targets:
+                label = "群聊" if chat_type == "group" else "好友"
+                self._console.print(f"runtime_note: 正在从 NapCat 预加载{label}缓存...")
+            list_started = monotonic()
+            targets = gateway.list_targets(chat_type, refresh=not has_cached_targets, limit=32)
+            list_elapsed_ms = (monotonic() - list_started) * 1000.0
         except Exception as exc:
             self._logger.warning(
-                "completion_prime_failed chat_type=%s quiet=%s has_cached_targets=%s error=%s",
+                "completion_prime_failed chat_type=%s quiet=%s has_cached_targets=%s cached_count_ms=%.1f "
+                "total_ms=%.1f error=%s",
                 chat_type,
                 quiet,
                 has_cached_targets,
+                cached_count_elapsed_ms,
+                (monotonic() - total_started) * 1000.0,
                 str(exc or "").strip() or exc.__class__.__name__,
             )
             if has_cached_targets:
@@ -1469,10 +1661,98 @@ class SlashRepl:
             return
 
         self._mark_completion_primed(chat_type)
+        self._logger.info(
+            "completion_prime_ready chat_type=%s quiet=%s has_cached_targets=%s cached_count_ms=%.1f "
+            "ensure_ms=%.1f list_ms=%.1f total_ms=%.1f result_count=%s",
+            chat_type,
+            quiet,
+            has_cached_targets,
+            cached_count_elapsed_ms,
+            ensure_elapsed_ms,
+            list_elapsed_ms,
+            (monotonic() - total_started) * 1000.0,
+            len(targets),
+        )
 
     def _mark_completion_primed(self, chat_type: str) -> None:
         self._completion_primed_at[chat_type] = monotonic()
         self._completion_prime_failed_at.pop(chat_type, None)
+
+    def _kickoff_target_cache_prime_if_needed(self, chat_type: str) -> None:
+        if self._completion_cache_is_fresh(
+            self._completion_primed_at,
+            chat_type,
+            ttl_s=self.COMPLETION_PRIMED_TTL_S,
+        ):
+            return
+        if self._completion_cache_is_fresh(
+            self._completion_prime_failed_at,
+            chat_type,
+            ttl_s=self.COMPLETION_PRIME_RETRY_COOLDOWN_S,
+        ):
+            return
+        with self._target_cache_prime_lock:
+            thread = self._target_cache_prime_threads.get(chat_type)
+            if thread is not None and thread.is_alive():
+                return
+
+            def _worker() -> None:
+                started = monotonic()
+                try:
+                    self._prime_target_cache(chat_type, quiet=True)
+                except Exception:
+                    self._logger.exception(
+                        "completion_prime_background_failed chat_type=%s",
+                        chat_type,
+                    )
+                finally:
+                    self._logger.info(
+                        "completion_prime_background_done chat_type=%s total_ms=%.1f",
+                        chat_type,
+                        (monotonic() - started) * 1000.0,
+                    )
+                    with self._target_cache_prime_lock:
+                        self._target_cache_prime_threads[chat_type] = None
+
+            thread = threading.Thread(
+                target=_worker,
+                name=f"target-prime-{chat_type}",
+                daemon=True,
+            )
+            self._target_cache_prime_threads[chat_type] = thread
+            thread.start()
+
+    def _kickoff_target_completion_runtime_warm(self) -> None:
+        with self._target_completion_runtime_warm_lock:
+            thread = self._target_completion_runtime_warm_thread
+            if thread is not None and thread.is_alive():
+                return
+
+            def _worker() -> None:
+                started = monotonic()
+                try:
+                    gateway = self._require_gateway()
+                    group_cached = gateway.count_cached_targets("group")
+                    private_cached = gateway.count_cached_targets("private")
+                    self._logger.info(
+                        "completion_runtime_warm_ready total_ms=%.1f cached_groups=%s cached_friends=%s",
+                        (monotonic() - started) * 1000.0,
+                        group_cached,
+                        private_cached,
+                    )
+                except Exception:
+                    self._logger.exception("completion_runtime_warm_failed")
+                finally:
+                    with self._target_completion_runtime_warm_lock:
+                        self._target_completion_runtime_warm_thread = None
+
+            thread = threading.Thread(
+                target=_worker,
+                name="completion-runtime-warm",
+                daemon=True,
+            )
+            self._target_completion_runtime_warm_thread = thread
+            thread.start()
 
     @staticmethod
     def _completion_cache_is_fresh(

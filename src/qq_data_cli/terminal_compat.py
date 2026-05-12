@@ -193,8 +193,8 @@ def build_cli_ui_profile(decision: TerminalUiDecision) -> CliUiProfile:
     if decision.resolved_mode == "compat":
         return CliUiProfile(
             mode="compat",
-            show_completion_menu=False,
-            complete_while_typing=False,
+            show_completion_menu=True,
+            complete_while_typing=True,
             watch_full_screen=False,
             use_custom_scrollbar=False,
             use_highlight_style=False,
