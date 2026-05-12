@@ -1,0 +1,37 @@
+你是 Claude Code，本项目中你的身份是 review-editor / LLM Sessions / ORCH Observer 的前端 UI/UX 实现工程师。Codex 负责产品契约、后端语义和验收；这次由 Codex 继续领导你做 UI 改动。
+
+请不要 fork 新会话，不要重新定义产品目标，不要改 Python 后端。你需要先读：
+
+1. dev/reports/handoffs/claude_code_orch_observer_alignment_task_2026-04-26.zh-CN.md
+2. dev/reports/handoffs/orch_observer_functional_ux_audit_2026-04-26.zh-CN.md
+3. dev/reports/handoffs/cc_orch_observer_ui_density_task_2026-04-26.zh-CN.md
+
+然后直接实现第三个文件里的 UI 修复。重点：
+
+- Tool result 的 QQ 原文卡必须变成高密度 inline preview，不要像大 forward 卡那样占空间。保留 PCQQ/QQ 来源感，但主线默认最多显示 1-2 条预览，点击再打开已有 forward/PCQQ 窗口。
+- 审阅材料/模型输入包的语义标题应在外层，下面挂 QQ preview 卡，不要把“审阅材料”塞成卡片内部小字。
+- Prompt 块必须可展开查看 system/user 指令预览和 Raw/Inspect，不要只有不可点的标题。
+- “模型审阅开始”这种低信息量节点不要渲染成可展开详情块，默认隐藏或弱化成阶段分隔。
+- Final report 的直接证据组只在组级显示一次“QQ 原文”来源，不要每条 evidence item 都重复显示“QQ 原文/来源 QQ 原文”。
+- 修正标题字体、基线、折叠按钮错位问题。
+
+允许改动范围：
+
+- apps/review-editor/src/components/LlmSessionPage.vue
+- apps/review-editor/src/components/LlmSessionChatPacketCard.vue
+- apps/review-editor/src/components/LlmFinalReportBlock.vue
+- 必要时新增一个小的前端组件
+- 对应测试
+
+不要改：
+
+- src/qq_data_analysis/*.py
+- NapCat/exporter
+- 与 LLM Sessions 无关的大范围页面结构
+
+验收命令：
+
+- cd apps/review-editor && npx vitest run
+- cd apps/review-editor && npx vue-tsc --noEmit
+
+完成后在最终回复里列出：读了哪些文档、改了哪些文件、每个问题如何解决、测试结果、仍需 Codex/用户人工验收的风险点。

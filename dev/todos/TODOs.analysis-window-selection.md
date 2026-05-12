@@ -74,6 +74,41 @@ Example for `史数据统计群`:
 Without task-aware rerank, the selector may still choose a window that is
 "important" in general, but not the most useful for the current analysis goal.
 
+Important 2026-04-07 clarification:
+
+- window selection is only one layer of the current problem
+- the present sparse-corpus review weirdness is also caused by review-card anchor ordering
+- current `build_benshi_review_packets.py` still front-loads:
+  - `captioned_asset`
+  - `missing_media`
+  - then `forward`
+- so even a better `shi_focus` rerank can still feed an obviously suboptimal first human-review surface
+
+Therefore the next method round must treat:
+
+- candidate-window selection
+- review-card anchor selection
+- review-editor presentation
+
+as separate design problems, not one blended “selector” problem.
+
+Additional live evidence from `2026-04-07`:
+
+- `scripts/run_benshi_group_full_analysis.py` on `amd_guanren_group_712742342` selected:
+  - `candidate_001`
+  - `candidate_003`
+  - `candidate_008`
+- resulting window reports were materially on-target for sparse-corpus `搬shi` analysis:
+  - `二手史`
+  - `多图串搬运`
+  - `反应史`
+  - `套娃forward包浆 / 视频壳缺本体`
+- this is important because it narrows the problem:
+  - sparse-corpus analyzer selection is imperfect but already usable
+  - old “front few review items feel wrong” feedback is more strongly explained by downstream review-point surfacing than by candidate-window selection alone
+- evidence root:
+  - `state/program_runs/shi_analyzer/round_018/review_resolution.md`
+
 ## Design Principle
 
 Do not hard-switch from raw selection to preprocess selection.
@@ -445,3 +480,13 @@ Implement the rerank as a narrow enhancement, not a substrate rewrite:
 3. add `_candidate_window_bias_score(...)`
 4. add rationale output with raw + bias notes
 5. run local smoke on `group_751365230`
+
+## 2026-04-08 live note
+
+- `state/group_analysis_runs/amd_guanren_group_712742342/run_20260408_020228/` confirms that the corrected sparse-fix prompt can now survive a full live run with:
+  - `group_profile_prior_layer`
+  - `review_surface_guidance`
+  - `llm_contract_valid=true`
+- therefore the next selection-layer question is no longer “did the new prompt fields survive?”
+- it is now the real method question:
+  - did front review points improve enough to justify broader human labeling?

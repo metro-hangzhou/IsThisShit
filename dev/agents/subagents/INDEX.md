@@ -1,13 +1,19 @@
 # Subagent Agents Index
 
-This directory contains file-system handbooks for the evidence-first exporter program.
+This directory contains the shared reviewer / explorer / worker contract layer.
 
 Primary shared files:
 
 - `CONTRACT.md`
 - `SHARED_CONTEXT.md`
 
-Track handbooks:
+Program roots:
+
+- `dev/agents/programs/exporter_evidence/`
+- `dev/agents/programs/shi_analyzer/`
+- `dev/agents/programs/common_track_workflow/`
+
+Legacy exporter track handbooks:
 
 - `AGENTs.downloader_decision_surface.md`
 - `AGENTs.provider_history_surface.md`
@@ -17,4 +23,3 @@ Track handbooks:
 - `AGENTs.coverage_reachability_surface.md`
 - `AGENTs.napcat_truth_map_surface.md`
 - `AGENTs.first-principles-reviewer.md`
-

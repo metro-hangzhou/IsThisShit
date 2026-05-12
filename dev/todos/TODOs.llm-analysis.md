@@ -70,9 +70,52 @@ Current phase principle:
   - small real samples
   - human manual assessment
   - iterative prompt adjustment
+- [ ] Before the next sparse-corpus prompt iteration wave, lock the review-point method first.
+  - do not keep tuning prompts against the current `712` review entry surface as if it were already the right human-supervision target
+  - current method-redesign input: `state/program_runs/shi_analyzer/round_017/METHOD_REDESIGN_INPUT_20260407.md`
+  - fresh live evidence: `state/group_analysis_runs/amd_guanren_group_712742342/run_20260407_174750/`
+  - this live run selected semantically on-target sparse windows; the bigger remaining mismatch is review-entry design, not analyzer impossibility on `amd_712`
+- [x] Add a first explicit sparse-review prompt correction branch before the next live retest.
+  - new version:
+    - `benshi_master_v1_sparse_review_fix1`
+  - current correction round:
+    - `state/program_runs/shi_analyzer/round_020/review_resolution.md`
+  - purpose:
+    - stop leaking whole-window verdict into weak local anchors
+    - reduce over-prioritization of isolated asset-only and plain missing-media cards
+    - make review-surface guidance explicit in model output before the next live sparse-corpus run
+- [x] Insert a neutral human-review event layer before benshi-specific posterior/policy artifacts.
+  - landed in:
+    - `src/qq_data_analysis/models.py`
+    - `src/qq_data_analysis/review_projection.py`
+    - `src/qq_data_analysis/review_service.py`
+    - `scripts/parse_benshi_review_packets.py`
+  - current human review persistence is now:
+    - `ReviewPointProposal`
+    - `HumanReviewTaskDecision`
+    - `HumanReviewEvent`
+  - benshi outputs are now projections, not the direct saved-review truth layer
 - [x] Record first reviewed real-sample findings in a reusable note.
-  - current note: `../documents/benshi_report_review_20260312.md`
+  - current note: `../reports/analysis/reviews/benshi_report_review_20260312.md`
   - current stable direction: free report plus soft role/dimension convergence, not final taxonomy
+- [x] Add cross-window aggregation output for group-level calibration.
+  - current output now includes:
+    - `cross_window_group_profile_prior`
+    - `cross_window_component_distribution`
+    - `cross_window_interaction_summary`
+  - landed in:
+    - `scripts/run_benshi_group_full_analysis.py`
+    - `src/qq_data_analysis/models.py`
+  - purpose:
+    - move from single-window reviewed loop to group-level analyzer baseline
+    - keep `shi core` and `carrier/provenance` separated at cross-window summary level too
+- [x] Harden OpenAI-compatible live runs against transport timeouts beyond streaming fallback.
+  - `responses` non-stream path now retries/falls back on retryable `httpx` transport errors too
+  - `chat/completions` paths now also retry retryable transport errors
+  - current live lesson from `2026-04-14`:
+    - cross-window aggregation landed cleanly
+    - one live retest still timed out on candidate_008 after candidate_001/003 completed
+    - analyzer baseline should therefore be treated as ready for broader controlled testing, but long runs still need timeout-aware operational expectations
 - [x] Add a first text-only missing-media inference stage to the pack/prompt flow.
   - keep inferred gap semantics separate from direct observed evidence
   - keep unknown gaps explicit when context is too weak
@@ -164,6 +207,21 @@ Current phase principle:
   - person-level analysis
   - later `BenshiAgent`
 - [ ] Keep this as a second-stage milestone, not a first-stage assumption.
+- [ ] Reconcile report-first LLM outputs with sparse-corpus review-point generation.
+  - dense baseline and sparse real-group corpora should not share the exact same first-card / first-review-entry policy
+  - current repo-wide knowledge map: `state/program_runs/shi_analyzer/round_017/KNOWLEDGE_MAP_20260407.md`
+  - current live sparse-corpus check: `state/program_runs/shi_analyzer/round_018/review_resolution.md`
+  - `2026-04-08` live sparse-fix retest now passed on the real Windows host `.venv`
+  - current lock: `state/program_runs/shi_analyzer/round_021/review_resolution.md`
+  - chain lesson:
+    - do not trust new prompt fields until `llm_contract_valid=true`
+    - truncated sparse-fix JSON previously caused fake-success fallback
+    - that path is now fail-fast in the live runner
+  - `2026-04-08` scheduling-layer repair:
+    - primary review queue is now built from current model-positive evidence anchors
+    - prior human `non_shi_window/high` reviews affect scheduling suppression only
+    - prior reviewed events remain forbidden as prompt answer-key leakage
+    - see: `state/program_runs/shi_analyzer/round_022/review_resolution.md`
 
 ## P8. Tests And Acceptance
 
@@ -178,6 +236,9 @@ Current phase principle:
   - token usage is recorded
   - prompt/config is replayable
   - outputs are stable enough for manual comparison across prompt revisions
+- [x] Add a script-level regression test for live sparse-run progress emission.
+  - current lock: `tests/test_benshi_group_full_analysis_script.py`
+  - bug caught by real run on `2026-04-07`: `WindowsPath` failed JSON serialization inside `ProgressEmitter.emit(...)`
 
 ## Deferred
 

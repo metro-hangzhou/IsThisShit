@@ -1,138 +1,19 @@
-# Git Branching Plan
+# Redirect Note
 
-This repository now treats Git layout as a first-class maintenance concern.
+Legacy path:
 
-## Parent Repository Branch Roles
+- `dev/documents/git_branching_plan.md`
 
-### `full-dev`
+Canonical path:
 
-Tracks the main exporter repository for development work:
+- [dev/reports/branching/git_branching_plan.md](/d:/Coding_Project/IsThisShit/dev/reports/branching/git_branching_plan.md)
+- [dev/reports/branching/git_branching_plan.zh-CN.md](/d:/Coding_Project/IsThisShit/dev/reports/branching/git_branching_plan.zh-CN.md)
 
-- source code under `src/`
-- tests under `tests/`
-- developer-facing planning/docs under `dev/`
-- helper scripts under `scripts/`
-- vendored NapCat runtime under `NapCat/`
+Archive snapshot:
 
-Default daily development must happen on `full-dev`.
+- [documents branching slice archive](/d:/Coding_Project/IsThisShit/dev/archive/system_refactor_20260327/documents_branching_slice_20260327/README.md)
 
-`full-dev` is a local-first development branch:
+Migration note:
 
-- commit locally and frequently
-- do not treat remote push as the default action
-- only use it as the active working lane, not the archival lane
-
-This branch is the normal working branch for:
-
-- new feature development
-- analysis / preprocess / LLM substrate work
-- refactors
-- experimental or iterative implementation
-- developer-facing planning and design notes
-
-It must not track generated or machine-local output such as:
-
-- `dist/`
-- `exports/`
-- `state/`
-- `.tmp/`
-- `.venv/`
-- `.idea/`
-
-### `runtime`
-
-Tracks the minimal runtime/update surface for operators:
-
-- runtime entrypoints
-- `src/`
-- start scripts
-- vendored `NapCat/`
-- user-facing runtime docs such as `CLI_USAGE.md`
-
-It must not track developer-facing materials such as:
-
-- `dev/`
-- `tests/`
-- most helper scripts
-
-### `main`
-
-Acts as the primary release/archive branch for the generally usable project state.
-
-`main` should be used for:
-
-- release-shaped snapshots
-- operator-facing updates
-- shareable or testable runtime states
-- remote archival checkpoints
-
-It should not be treated as the default day-to-day development branch.
-
-## Branch Workflow Rule
-
-Normal development workflow:
-
-1. Work on `full-dev` by default.
-2. Commit locally on `full-dev` as work accumulates.
-3. Do not push `full-dev` to remote as part of the normal workflow.
-4. Treat `main` and `runtime` as release / validation / archival branches.
-5. Use `main` and `runtime` for:
-   - publishable checkpoints
-   - local validation against a cleaner runtime surface
-   - behavior comparison against development state
-
-## Execution Workflow Rule
-
-Default execution workflow for ongoing development:
-
-1. First analyze the next-stage direction and identify the main non-conflicting work lanes.
-2. Then implement a parallel bundle of tasks that do not conflict in ownership or architecture.
-3. Only switch to fine-grained step-by-step confirmation when:
-   - the user explicitly asks for it
-   - a destructive action is under consideration
-   - or the available implementation paths conflict in a way that needs a decision first
-
-This keeps the project moving in larger coherent chunks instead of stalling on unnecessary micro-confirmation.
-
-## Sync / Archive Rule
-
-When a change set is large, important, or meaningfully changes behavior:
-
-- commit the relevant state on `full-dev`
-- prepare corresponding `main` and `runtime` snapshots as needed
-- push `main` and `runtime` to the remote repository for archival / rollback reference
-- do not push `full-dev` unless the workflow rule is deliberately changed later
-
-This keeps remote history useful as a deployment and validation record, while preserving `full-dev` as the main ongoing local development lane.
-
-## NapCatQQ Rule
-
-`NapCatQQ/` is intentionally **not** tracked by the parent repository branches.
-
-Reason:
-
-- it is a separate upstream-tracking checkout
-- it carries a custom local branch
-- it must retain the ability to merge future upstream `NapCatQQ` updates when QQ changes
-
-Therefore:
-
-- do not flatten `NapCatQQ/` into ordinary parent-repo files
-- do not treat it as disposable local clutter
-- do not rely on parent-branch Git history to preserve its merge relationship
-
-Current maintenance expectation:
-
-- keep `NapCatQQ/` as an independent nested repository
-- update it separately from the parent repo
-- when upstream QQ/NapCat changes require it, merge upstream `NapCatQQ` into the custom local branch there
-
-## NapCat Runtime Local State Rule
-
-The parent repository should also avoid tracking machine-local NapCat runtime state, including:
-
-- `NapCat/config.json`
-- `NapCat/napcat/cache/`
-- `NapCat/napcat/config/*.json`
-
-Those files are operator-local runtime state and are expected to vary across machines.
+- This file is now a compatibility entry.
+- The canonical branching plan now lives under `dev/reports/branching/`.

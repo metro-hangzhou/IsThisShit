@@ -124,10 +124,11 @@ Important calibration rule from those reviews:
 
 - when `InferredItems = 0`, the LLM must not invent causal stories about missing media
 - time adjacency may be reported as observation, but not upgraded into an explanation for topic shift or user intent
+- hostile / motive hypotheses are allowed only when they are explicitly labeled as hypotheses, grounded in sufficient text and second-order evidence, and kept separate from direct observed facts
 
 Reference review note:
 
-- `../documents/benshi_report_review_20260312.md`
+- `../reports/analysis/reviews/benshi_report_review_20260312.md`
 
 Current prompt-convergence step:
 
@@ -188,6 +189,7 @@ But every LLM run must also emit minimal machine artifacts:
 - `llm_run_meta.json`
 - `report.txt` or `report.md`
 - `usage.json`
+- Any LLM-run artifact that derives from a placeholder, heuristic, sample, or work-in-progress field must include an `implementation_status` section describing: current status label (candidate/stable/placeholder), unresolved gaps, and the fact that downstream conclusions are provisional. This section must be explicitly visible in the human report, compact metadata, and any preview/summary delivered to reviewers.
 
 Current script-level entrypoint:
 

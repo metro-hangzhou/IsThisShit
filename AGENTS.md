@@ -92,7 +92,7 @@ Therefore:
 - treat `main` / `runtime` sync as **bundle sync**, not file-by-file opportunistic cherry-pick
 - when shipping CLI/repl/login/export/runtime fixes, sync the whole feature family together
 - if a release-line incident happens, record it in:
-  - [dev/documents/branch-sync-incidents.md](/d:/Coding_Project/IsThisShit/dev/documents/branch-sync-incidents.md)
+  - [branch_sync_incidents.md](/d:/Coding_Project/IsThisShit/dev/reports/branching/branch_sync_incidents.md)
 - branch governance itself now has a dedicated handbook:
   - [dev/agents/GitBranch_AGENTs.md](/d:/Coding_Project/IsThisShit/dev/agents/GitBranch_AGENTs.md)
 

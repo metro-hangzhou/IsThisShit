@@ -30,4 +30,4 @@ Reduce "runtime bug that later turns out to be branch skew" incidents by making 
   - `/export private 1507833383 ...`
 - [ ] Keep incident log current
   - every release skew incident must be recorded in:
-    - [branch-sync-incidents.md](../documents/branch-sync-incidents.md)
+    - [branch_sync_incidents.md](../reports/branching/branch_sync_incidents.md)

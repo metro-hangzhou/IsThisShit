@@ -195,7 +195,7 @@ Before pushing `main` or `runtime`, verify:
 
 If a release-line issue turns out to be branch skew, record it immediately in:
 
-- [branch-sync-incidents.md](/d:/Coding_Project/IsThisShit/dev/documents/branch-sync-incidents.md)
+- [branch_sync_incidents.md](/d:/Coding_Project/IsThisShit/dev/reports/branching/branch_sync_incidents.md)
 
 Do not rely on memory.
 
@@ -205,9 +205,9 @@ When a branch-related incident happens, update all relevant places together:
 
 - this handbook
 - [AGENTS.md](/d:/Coding_Project/IsThisShit/AGENTS.md) if the top-level routing changed
-- [technical-roadmap.md](/d:/Coding_Project/IsThisShit/dev/documents/technical-roadmap.md)
+- [technical_roadmap.md](/d:/Coding_Project/IsThisShit/dev/reports/repo/technical_roadmap.md)
 - [TODOs.release-runtime-stability.md](/d:/Coding_Project/IsThisShit/dev/todos/TODOs.release-runtime-stability.md)
-- [branch-sync-incidents.md](/d:/Coding_Project/IsThisShit/dev/documents/branch-sync-incidents.md)
+- [branch_sync_incidents.md](/d:/Coding_Project/IsThisShit/dev/reports/branching/branch_sync_incidents.md)
 
 ## Operational Heuristic
 

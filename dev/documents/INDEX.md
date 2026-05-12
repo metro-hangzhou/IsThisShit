@@ -1,31 +1,27 @@
 # Documents Index
 
-Longer reference materials, exported reports, branch/runtime notes, and review logs live here.
+`dev/documents/` is now treated as a legacy entry surface for older report-style paths.
 
-## Benshi review materials
+Canonical report-style materials are being rebuilt under:
 
-- [benshi_local_ontology.md](benshi_local_ontology.md)
+- [dev/reports/README.md](/d:/Coding_Project/IsThisShit/dev/reports/README.md)
+- [analysis reports index](/d:/Coding_Project/IsThisShit/dev/reports/analysis/INDEX.md)
 
-## Route / orchestration
+This legacy index remains as a compatibility entry so older references do not go dark during cleanup.
+
+## Redirected remaining slices
 
 - [technical-roadmap.md](technical-roadmap.md)
-
-## Repository maintenance
-
 - [git_branching_plan.md](git_branching_plan.md)
 - [branch-sync-incidents.md](branch-sync-incidents.md)
-- [GitBranch_AGENTs.md](../agents/GitBranch_AGENTs.md)
 
-## Current runtime / branch stability notes
+## Redirected analysis/benshi report slice
 
-See:
+- [analysis_context_refresh_20260327.md](analysis_context_refresh_20260327.md)
+- [shi_analyzer_readiness_report_20260327.md](shi_analyzer_readiness_report_20260327.md)
+- [benshi_local_ontology.md](benshi_local_ontology.md)
+- [benshi_report_review_20260312.md](benshi_report_review_20260312.md)
+- [benshi_calibration_rubric.md](benshi_calibration_rubric.md)
+- [benshi_review_checklist.md](benshi_review_checklist.md)
 
-- [technical-roadmap.md](technical-roadmap.md)
-- [git_branching_plan.md](git_branching_plan.md)
-- [TODOs.release-runtime-stability.md](../todos/TODOs.release-runtime-stability.md)
-
-## Archived exported documents
-
-- `Q群群友史.docx`
-- `开源项目《QQ群搬史(屎)分析仪》AI 设计与实现深度技术报告.docx`
-- `开源项目《QQ群搬史(屎)分析仪》深度调研与方案报告.pdf`
+Each of the paths above is now a redirect-style compatibility note pointing to canonical locations under `dev/reports/` and to archive snapshots under `dev/archive/system_refactor_20260327/`.

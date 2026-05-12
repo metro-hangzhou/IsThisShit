@@ -1,0 +1,182 @@
+# Shi Analyzer Program TODOs
+
+Canonical overview:
+
+- [README.md](README.md)
+
+Current focus:
+
+- local corpus ingest
+- preprocess + deterministic analysis smoke
+- message-first analyzer redesign
+- Claude-Code-derived unified orchestrator runtime design docs
+- common-track retro-review of the restored analyzer baseline
+- ORCH relation-graph v1.5 and evidence-acquisition planner calibration
+
+Status:
+
+- [x] restored `src/qq_data_process/**`
+- [x] restored `src/qq_data_analysis/**`
+- [x] copied 3 new corpora into `dev/testdata/local/`
+- [x] restored key analyzer/preprocess docs
+- [x] restored and ran baseline preprocess / analysis / benshi / llm smoke
+- [x] added corpus-directory input support for preprocess
+
+Next actions:
+
+- [x] build a stable corpus-directory ingest facade above the restored preprocess baseline
+  - shared `resolve_local_corpus(...)` now covers both exporter bundles and canonical local baseline corpora
+  - current smoke / full-group analysis / full-group pipeline / cross-group review paths now consume the shared facade instead of hand-rolled corpus resolution
+- [x] run preprocess smoke on all 4 local corpora
+- [x] run deterministic analysis smoke on all 4 local corpora
+  - persisted summaries now exist under `.tmp/corpus_smoke/*/summary.json`
+- [x] decide actual roles of the 3 large-group corpora from first-pass results
+  - `712`: sparse reviewed-calibration anchor corpus
+  - `x3c`: sparse daily-interaction diversity corpus
+  - `763`: sparse high-volume calibration corpus
+- [x] add a stable corpus-directory batch suite facade above the local-corpus ingest layer
+  - new entrypoint:
+    - `scripts/run_corpus_batch_suite.py`
+  - supports:
+    - role-filtered corpus selection
+    - large-group-only corpus selection
+    - smoke batch mode
+    - full-group-analysis batch mode
+    - stable `batch_manifest.json` output
+  - purpose:
+    - move from one-off per-corpus scripts to repeatable calibration-scale runs
+- [x] make batch runs incremental and auditable instead of all-or-nothing
+  - batch suite now writes:
+    - `batch_manifest.json` incrementally while corpora are still running
+    - per-corpus `stdout.log` / `stderr.log`
+    - `batch_report.md` for human review
+  - full-analysis mode can now also build review packets automatically per corpus
+- [x] create a Claude Code reference workbench before analyzer retro-review
+  - new program workbench:
+    - `dev/agents/programs/claude_code_reference/`
+  - long-form reusable reference set:
+    - `dev/reports/analysis/reference/claude_code/`
+  - purpose:
+    - support message-first analyzer redesign with explicit reference material on:
+      - context management
+      - prompt-based compaction
+      - planning/execution separation
+      - permissions/safety pipelines
+      - subagent orchestration
+- [x] land the first message-first analyzer redesign spec
+  - spec:
+    - `dev/reports/analysis/reference/methods/shi_message_first_analyzer_method.zh-CN.md`
+  - first scaffolding:
+    - `src/qq_data_analysis/benshi_message_first.py`
+    - `BenshiAnalysisPack.message_first_context`
+    - prompt payload / contract hooks for `message_first_context`
+- [x] land the first unified chat orchestrator implementation-doc set before runtime coding
+  - implementation docs:
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_runtime_overview.zh-CN.md`
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_context_runtime.zh-CN.md`
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_lifecycle_engine.zh-CN.md`
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_mode_runtime.zh-CN.md`
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_tool_runtime.zh-CN.md`
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_analytics_runtime.zh-CN.md`
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_mission_profiles.zh-CN.md`
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_future_extension_surface.zh-CN.md`
+  - design rule:
+    - runtime code follows these docs
+    - docs themselves must stay explicitly grounded in local `claude-code/` source and local CC analysis notes
+- [ ] finish common-track retro-review of the old analyzer family
+  - classify which pieces remain:
+    - stable contract
+    - transitional compatibility layer
+    - obsolete window-first heuristic
+- [x] implement `ChatOrchestratorEngine` after the new implementation-doc set is reviewed as the active technical baseline
+  - initial target:
+    - lifecycle spine
+    - context runtime shell
+    - mission profile registry
+    - tool request / observation schema
+    - budget + stop policy
+    - `shi_analysis` mission wrapping the current message-first chain
+  - current extension landed:
+    - local sender/topic evidence acquisition is now wired into the shi mission tool planner
+    - orchestrator no longer only plans shallow `expand_window/reply/assets`, and can request sender-history/topic-cluster context for text-native anchors
+    - canonical observer event boundary is now used by review-editor LLM Session integration; worker-private event aliases should not leak as public UI events
+- [ ] replace the transitional selected-message-based message probes with true message-level probing
+  - current scaffold now probes raw window messages when available, but still keeps selected-message compatibility for older pack callers
+  - target state is:
+    - message-first probing over raw message candidates
+    - relation-bound packet assembly
+    - window construction as a downstream aggregate, not the starting unit
+- [x] deepen relation-graph assembly beyond reply-only / local continuation heuristics
+  - v1.5 edge families now implemented:
+    - reply
+    - @ binding
+    - nested-forward parent/child
+    - shared-object asset continuation
+    - explicit uptake / reaction linkage
+    - same-sender continuation
+  - worker planner now consults these relation edges before requesting sender/topic/forward tools, so relation-covered anchors do not trigger redundant evidence acquisition
+- [ ] calibrate relation-graph v1.5 on real windows
+  - first pass recorded:
+    - `dev/reports/analysis/reference/methods/chat_orchestrator_small_sample_calibration_2026-04-30.zh-CN.md`
+  - current fixes from first pass:
+    - same-sender relation now ignores off-target/off-target noise
+    - no-core windows now stop as `insufficient_evidence`
+    - `fetch_shared_object_context` observation crash fixed
+  - verify edge precision on:
+    - text-native direct shi anchors
+    - media-boundary anchors
+    - nested-forward carriers
+    - same-sender continuation
+    - group uptake / reaction echoes
+  - decide whether relation scores remain heuristic or need a learned / ruleset-backed calibration layer
+- [x] formalize analyzer token-budget / compact contracts before renewed live testing
+  - separate:
+    - stable analyzer prefix
+    - message packet budget
+    - relation summary budget
+    - cross-window recap budget
+  - compact must preserve:
+    - shi core
+    - relation skeleton
+    - uncertainty
+    - dropped-noise statement
+  - 2026-05-02 progress:
+    - `SourceTranscriptPacket` now carries explicit `budget_contract` and `compact_contract`
+    - model-led source packet construction now consumes `MissionProfile.context_budget`
+    - QQ source messages are capped by `packet_budget` instead of a hidden fixed message count
+    - `CompactSnapshot` now exposes `shi_core`, `relation_skeleton`, `uncertainty`, and `dropped_noise_statement`
+    - details: `dev/reports/analysis/reference/methods/chat_orchestrator_budget_compact_contract_2026-05-02.zh-CN.md`
+- [ ] after the above, run small-sample qualitative validation only
+  - verify the new analyzer is no longer primarily forward-biased
+  - verify direct text / direct image / direct video shi can surface as first-class anchors
+  - only after qualitative direction is correct, resume large-sample quantitative runs
+  - validation plan:
+    - `dev/reports/analysis/reference/methods/shi_message_first_small_sample_validation.zh-CN.md`
+	- [ ] converge ORCH public contract and qq_data_analysis worker internals
+	  - ORCH public observer / review surfaces should receive human-readable report contract fields, not raw worker-private debug payloads
+	  - worker-private fields may remain in raw artifacts for inspection, but must not become default UI/observer semantics
+	  - 2026-05-02 progress:
+	    - `ToolObservation` now carries public `request_reason`, `anchor_message`, and message roles for tool evidence rendering
+	    - model-facing tool responses omit `coverage_scope` / `derived_hints`
+	    - model-led final JSON now fail-closes when `final_review`, `adjudicated_relation_graph`, or `evidence_acquisition_summary` is missing or malformed
+	    - `scripts/run_chat_orchestrator.py --candidate-id` can now run unselected candidates from `candidate_windows.json` for broader ORCH validation
+	    - review-editor live sessions can now resolve candidates from `candidate_windows.json` when no `review_seed.json` has been materialized yet
+	    - live validation:
+	      - `live_ebd1f754e974b8` completed against selected candidate 001 with final review, adjudicated graph, and evidence-acquisition summary
+	      - `codex_orch_contract_tool_path_20260502` completed against candidate 002 and naturally triggered `fetch_shared_object_context`
+	      - `live_0c0846c0bf5ea8` completed from review-editor against unselected candidate 002 via `candidate_windows.json`; this validated live-session candidate fallback, but the model did not trigger a tool in that run, so session-page tool rendering still needs a separate tool-event validation run
+	    - implementation record: `dev/reports/analysis/reference/methods/chat_orchestrator_public_contract_hardening_2026-05-02.zh-CN.md`
+- [x] add ORCH relation graph observer contract for review-editor
+  - backend exposes human-readable relation summaries grouped by anchor through `relation_graph_summary`
+  - review-editor renders relation graph inspection for reply / @ / same-sender / shared-asset / forward-parent-child / explicit-uptake / local-context
+  - raw edge internals remain Inspect/Raw-only by default
+  - remaining follow-up: every visible relation should link to PCQQ-style QQ original evidence / source-target jump cards
+- [ ] overhaul ORCH relation graph UI after mainline ORCH behavior stabilizes
+  - 2026-05-02 note: current relation graph UI is only temporarily acceptable for seeing that model-adjudicated relation data exists
+  - it is not yet a good audit surface for judging ORCH behavior
+  - future pass should be delegated to Claude Code after Codex provides the product semantics, sample session payloads, and acceptance criteria
+  - target behavior:
+    - show source and target QQ messages as compact PCQQ-style evidence cards
+    - make relation direction, relation type, confidence/boundary state, and model reason visually obvious
+    - avoid list-only "relation summary" cards that do not look like a graph or evidence map
+    - keep raw relation ids and internal edge fields only in Inspect/Raw

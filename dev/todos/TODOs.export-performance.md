@@ -1,316 +1,487 @@
-# Export Performance TODOs
-
-Spec baseline: 2026-03-07
-
-This file is dedicated to export-speed analysis and fixes. It is separate from the main `TODOs.md` so performance work does not get buried under feature tasks.
-
-## Problem Statement
-
-Observed user-facing symptom:
-
-- Full-history export for `group 922065597` completed, but `11999` records and roughly `1400 KB` of TXT output still took several minutes.
-- The current throughput is not acceptable for developer use.
-- The CLI now shows progress, but the export is still too slow.
-- A deeper NapCat-side path is now under active evaluation instead of only tweaking public OneBot action flags.
-
-## What We Know Now
-
-### Live measurements from the current codebase
-
-- Latest-page fetch, `count=200`:
-  - NapCat fetch: about `0.81s`
-  - local normalize: about `0.005s`
-  - local TXT write: about `0.003s`
-- Sequential page fetch timings, `count=200`:
-  - page 1: `0.715s`
-  - page 2: `0.404s`
-  - page 3: `0.617s`
-  - page 4: `0.332s`
-  - page 5: `3.29s`
-- Full-history progress sample:
-  - page 1 -> `199` records, earliest around `2025-10-02`
-  - page 2 -> `397` records, earliest around `2025-09-28`
-  - page 3 -> `595` records, earliest around `2025-09-25`
-- Real full-history export in watch mode:
-  - `11999` unique records
-  - `221.6s`
-  - `127` pages
-  - `0` timeout retries
-- Fixed-size benchmark, public API only, `count=200` without adaptive backoff:
-  - `12060` raw page records
-  - `232.9s`
-  - `62` pages
-- Public-API micro-benchmark over the first 10 pages:
-  - default profile: `26.48s`
-  - `quick_reply=true`: `25.11s`
-  - gain is only about `5%`
-- Throughput by adaptive page size from the real perf trace:
-  - `200/page`: about `106.7 msgs/s`
-  - `150/page`: about `113.2 msgs/s`
-  - `100/page`: about `57.1 msgs/s`
-  - `50/page`: about `26.0 msgs/s`
-- Live benchmark after adding the raw-history plugin:
-  - public OneBot, first 10 pages at `200/page`: `1990 msgs / 17.56s`, about `113.33 msg/s`
-  - fast plugin, first 10 pages at `200/page`: `1991 msgs / 1.39s`, about `1429.39 msg/s`
-  - fast plugin full export, same group: `12000 msgs / 8.33s` end-to-end including normalize + TXT write
-  - benchmark artifact: [deep_history_benchmark_20260307_161612.json](../../state/export_perf/deep_history_benchmark_20260307_161612.json)
-  - fast export artifact: [benchmark_fast_group_922065597.txt](../../exports/benchmark_fast_group_922065597.txt)
-
-Conclusion:
-
-- Python-side normalization and TXT writing are negligible.
-- The main bottleneck is NapCat history paging itself.
-- The cost is page-dependent and spikes on some pages.
-- Adaptive backoff is not the dominant cause of slowness. It is slightly faster than fixed `200/page`, but the total wall time is still dominated by NapCat page fetch cost.
-- `quick_reply=true` does not appear large enough to deliver an order-of-magnitude improvement by itself.
-- The first change that actually produces an order-of-magnitude improvement is skipping public `parseMessage(...)` entirely through a NapCat-side slim raw-history plugin.
-
-### NapCat source-level evidence
-
-In NapCat's public history actions, each history page does all of the following before returning:
-
-- raw history fetch via `MsgApi.getMsgHistory` / `getAioFirstViewLatestMsgs`
-- message ID conversion
-- `parseMessage(...)` for every message in the page
-
-That means exporter speed is bounded mostly by NapCat's per-message parse cost, not by local file output.
-
-Relevant public action parameters confirmed from NapCat source:
-
-- `disable_get_url`
-- `parse_mult_msg`
-- `quick_reply`
-
-The current exporter already uses:
-
-- `disable_get_url=true`
-- `parse_mult_msg=false`
-
-These reduce avoidable URL resolution and merged-forward expansion, but do not remove reply-resolution cost.
-
-### Likely remaining heavy path
-
-NapCat still performs reply parsing for history messages.
-
-For old-client reply messages, NapCat source shows multiple fallback lookups and warning/error logs such as:
-
-- `似乎是旧版客户端，尝试仅通过序号获取引用消息`
-- `所有查找方法均失败，获取不到旧客户端的引用消息`
-
-These lookups are server-side work inside NapCat's history action and are very likely a major contributor to slow pages.
-
-## Current Mitigations Already Implemented
-
-- [x] Explicit datetime intervals no longer scan full history for bounds first.
-- [x] `@final_content @earliest_content` full-history export now uses a single history pass instead of two.
-- [x] Watch-mode export now reports progress instead of staying at `Export started...`.
-- [x] History paging now guards against anchor cycles instead of only checking the immediately previous anchor.
-- [x] History requests now default to `disable_get_url=true`.
-- [x] History requests now default to `parse_mult_msg=false`.
-- [x] Added a NapCat-side raw-history plugin path that skips public OneBot `parseMessage(...)` for bulk export.
-
-These were necessary, but they are not sufficient.
-
-## Root-Cause Assessment
-
-Priority-ordered causes:
-
-1. NapCat history export is inherently serial.
-   Each page depends on the previous page's oldest `message_seq`, so page fetches cannot simply be parallelized.
-
-2. NapCat parses every message into OneBot format before returning the page.
-   This is much slower than local normalization and file writing.
-
-3. Some pages contain reply/voice-heavy messages that trigger much slower server-side paths.
-   The page-latency spread already proves this.
-
-4. Full-history TXT export currently waits for the whole snapshot before writing the final file.
-   This hurts time-to-first-output and makes the export feel slower than it is.
-
-5. The current system has almost no durable performance telemetry.
-   We can see progress in the UI, but we are not yet recording which pages are slow and why.
-
-Updated assessment:
-
-- For bulk export, the real bottleneck is specifically the public OneBot history action path.
-- Once that path is bypassed with a NapCat-side slim raw-history plugin, end-to-end export drops from minutes to single-digit seconds on the tested group.
-
-## Fix Plan
-
-### P0. Instrumentation First
-
-- [x] Add structured per-page timing capture for export runs.
-- [x] Persist a small perf trace in `state/export_perf/`:
-  - target chat ID
-  - requested mode
-  - page index
-  - page size
-  - page fetch duration
-  - oldest/newest timestamps in that page
-  - collected message count so far
-- [x] Show live throughput in watch export:
-  - `pages`
-  - `records`
-  - `records/sec`
-  - elapsed seconds
-- [x] Add final trace path and perf summary to export completion output.
-- [x] Surface timeout-driven page-size retries to the user instead of hiding them.
-- [ ] Show a slow-page warning when a single page exceeds a threshold such as `3s`, `5s`, `10s`.
-- [x] Distinguish QQ-expired old-image misses from generic `missing_after_napcat` in manifests and compact summaries.
-  - live probe after this change:
-    - [debug_probe_group_922065597_20260314_195933_pagesize500_full.json](../../state/export_perf/debug_probe_group_922065597_20260314_195933_pagesize500_full.json)
-    - `229` total missing assets
-    - `134` are now `qq_expired_after_napcat`
-    - `95` remain generic `missing_after_napcat`
-  - timing moved only slightly:
-    - `materialize_progress_window_s`: `63.43s -> 62.27s`
-  - current interpretation:
-    - semantic visibility improved a lot
-    - raw wall-clock improvement is limited because the remaining `95` misses are concentrated in other residual buckets (`2026-01 emoji-recv`, `2025-12`, `2026-02`) that still pay full NapCat miss cost
-  - latest post-fix large-tail CLI rerun:
-    - [group_922065597_20260314_215230.manifest.json](../../exports/group_922065597_20260314_215230.manifest.json)
-    - `record_count = 2000`
-    - `missing = 172`
-    - `qq_expired_after_napcat = 169`
-    - `missing_after_napcat = 3`
-  - latest stale-forward follow-up rerun:
-    - [group_922065597_20260314_220705.manifest.json](../../exports/group_922065597_20260314_220705.manifest.json)
-    - `record_count = 2000`
-    - `missing = 172`
-    - `qq_expired_after_napcat = 172`
-    - `missing_after_napcat = 0`
-  - practical implication:
-    - perf work on this slice should no longer focus on unresolved recovery for old images
-    - the next worthwhile investigations are UX/reporting improvements and faster early-stop behavior for very large expired tails
-  - later root-REPL trace evidence refined the actual stall source:
-    - [root_export_group_922065597_20260314_223522.jsonl](../../state/export_perf/root_export_group_922065597_20260314_223522.jsonl) showed a `60.1251s` stall on step `401`, file `3BE10FA97950F66D11876F8E815A763C.gif`
-    - after skipping plugin `/hydrate-forward-media` for stale blank-source forwarded images already known to be expired-like, rerun [root_export_group_922065597_20260314_224143.jsonl](../../state/export_perf/root_export_group_922065597_20260314_224143.jsonl) reduced:
-      - total export elapsed from `86.75s` to `27.266s`
-      - slowest materialization step from `60.1251s` to `1.6836s`
-    - interpretation: that large perceived stall was a stale forward-route timeout, not broad local-cache search
-
-### P1. Adaptive Paging
-
-- [x] Stop treating page size as fixed.
-- [x] Add adaptive page sizing:
-  - start with `200`
-  - increase when pages are consistently fast
-  - decrease when a page becomes slow or times out
-- [x] On timeout, retry the same anchor with a smaller page size before failing the whole export.
-- [x] Record the chosen page-size transitions in perf traces.
-- [x] Ensure root CLI `app.py export-history --limit N` also uses cross-page tail fetch when `N > 200`.
-- [x] Persist per-asset materialization timing in root export perf traces so a "stuck at 399/564" report can be mapped to a concrete asset and resolver.
-
-Why:
-
-- Some pages are clearly pathological.
-- A smaller retry page may isolate one expensive message cluster without stalling the whole export.
-- Current evidence says adaptive paging helps a little, but does not solve the dominant bottleneck.
-
-### P2. Reply Parsing Fast Path Evaluation
-
-- [ ] Benchmark `quick_reply=true` on history export pages.
-- [ ] Compare:
-  - latency
-  - remaining NapCat warnings
-  - reply fidelity
-- [ ] If the reply fidelity drop is acceptable for export, introduce a `fast_history` profile that enables `quick_reply=true`.
-
-Important note:
-
-- This probably will not remove all old-client reply warnings.
-- It still may reduce the work NapCat performs when resolving replies.
-- Current early sample suggests the benefit is real but small, roughly `5%` over the first 10 pages.
-
-### P3. Deeper NapCat Path
-
-- [x] Prototype a NapCat-side plugin that exposes a slim raw-history endpoint.
-- [x] Add Python-side fast-history client and fallback logic.
-- [x] Benchmark the plugin against the public OneBot history action on the same live group.
-- [ ] Productize plugin lifecycle management:
-  - auto-detect plugin availability
-  - optionally auto-enable / reload if runtime permits
-  - surface active history source in CLI export summaries
-
-### P4. Streaming Output
-
-- [ ] Add streaming JSONL export so records are flushed page-by-page instead of after the full snapshot is collected.
-- [ ] For TXT export, switch to a two-stage pipeline:
-  - stage 1: export or cache normalized records incrementally
-  - stage 2: render TXT from the normalized store
-- [ ] Show the path of the partial output immediately when export begins.
-
-Why:
-
-- Even if total wall time is unchanged, time-to-first-artifact becomes much better.
-- Resume support becomes simpler.
-
-### P5. Separate Fast Mode From Rich Mode
-
-- [ ] Define two export profiles:
-  - `fast`
-  - `rich`
-- [ ] `fast` profile should prefer lower server-side cost:
-  - `disable_get_url=true`
-  - `parse_mult_msg=false`
-  - evaluate `quick_reply=true`
-  - no raw payload export
-- [ ] `rich` profile can keep slower metadata paths when explicitly requested.
-- [ ] Make watch-mode `/export` default to `fast`.
-
-### P6. Cancellation, Resume, and Checkpoints
-
-- [ ] Add `/export --resume`.
-- [ ] Persist last successful page anchor and accumulated output metadata.
-- [ ] Allow cancellation from watch mode without losing completed pages.
-- [ ] Resume from the last known oldest anchor instead of restarting the entire export.
-
-### P7. Richer UX For Long Exports
-
-- [ ] Add a progress line that includes ETA estimation.
-- [ ] Add a final perf summary:
-  - total pages
-  - total records
-  - total wall time
-  - average page time
-  - slowest page time
-- [ ] Surface timeout-retry events to the user instead of silently waiting.
-
-## Non-Default Escalation Path
-
-Only if the current plugin-assisted path hits a hard ceiling:
-
-- [ ] Evaluate a NapCat-side helper path that exposes cheaper history payloads without full OB11 parse costs.
-- [ ] Evaluate direct local message-store reading if a stable QQNT local storage source exists and the project is willing to relax the "NapCat public interface only" rule for bulk export.
-
-This is intentionally not the default plan because it weakens the current "public interface only" architecture rule.
-
-## Acceptance Targets
-
-Targets for the current user workload:
-
-- [ ] Full-history export of the `922065597` group should sustain a clearly visible progress cadence.
-- [ ] No long silent period should exceed `5s` without a progress update.
-- [ ] Full-history TXT export should feel materially faster than manual scrolling and copy.
-- [ ] Single-page `count=200` fetch should stay near the current sub-second baseline on healthy pages.
-- [ ] Slow pages should degrade gracefully by shrinking page size instead of stalling the whole export.
-
-## Remember This
-
-- The decisive speedup came from inserting a NapCat runtime plugin, not from Python-side micro-optimization.
-- Plugin location:
-  - [NapCat/napcat/plugins/napcat-plugin-qq-data-fast](../../NapCat/napcat/plugins/napcat-plugin-qq-data-fast)
-- Enable file:
-  - [NapCat/napcat/config/plugins.json](../../NapCat/napcat/config/plugins.json)
-- Python-side entry points:
-  - [fast_history_client.py](../../src/qq_data_integrations/napcat/fast_history_client.py)
-  - [provider.py](../../src/qq_data_integrations/napcat/provider.py)
-  - [gateway.py](../../src/qq_data_integrations/napcat/gateway.py)
-- If future exports become slow again, first verify whether the runtime plugin is still loaded before tuning Python code.
-
-## Recommended Next Implementation Order
-
-1. Productize the fast plugin path in CLI summaries and runtime checks.
-2. Add streaming JSONL and staged TXT rendering.
-3. Add resume and checkpoint support.
-4. Re-evaluate `quick_reply=true` only for fallback public-history mode.
+# Export Performance Audit TODOs
+
+Spec baseline: 2026-03-24
+
+This panel tracks exporter performance work separately from evidence-first correctness.
+
+Primary rule:
+
+- correctness gates still win first
+- but once `actionable_missing=0` is back, performance work must be driven by measured stage cost, not guesswork
+
+## Current Baselines
+
+### Last known actionable-zero full-export baseline
+
+- data:
+  - `exports/group_922065597_20260324_011430_476759.jsonl`
+- manifest:
+  - `exports/group_922065597_20260324_011430_476759.manifest.json`
+- trace:
+  - `state/export_perf/cli_export_group_922065597_20260324_011320_022564_119740.jsonl`
+- result:
+  - `records=12593`
+  - `actionable_missing=0`
+  - `background_missing=1240`
+  - `missing_breakdown=[qq_expired_after_napcat:1154, qq_not_downloaded_local_placeholder:86]`
+
+### Regression/perf-audit full export used for stage breakdown
+
+- data:
+  - `exports/group_922065597_20260324_175228_915207.jsonl`
+- manifest:
+  - `exports/group_922065597_20260324_175228_915207.manifest.json`
+- trace:
+  - `state/export_perf/cli_export_group_922065597_20260324_175137_771039_36128.jsonl`
+- report:
+  - `state/export_perf/cli_export_group_922065597_20260324_175137_771039_36128.report.json`
+- result:
+  - `records=12593`
+  - `elapsed=113.238s`
+  - `actionable_missing=6`
+  - `background_missing=1234`
+
+## What The Current Perf Audit Already Shows
+
+## [2026-03-25] Post Terminal-Prefetch + Write-Bundle Split Pass
+
+Latest live small-window perf probe after this pass:
+
+- data:
+  - `exports/group_922065597_20260325_160848_899209.jsonl`
+- manifest:
+  - `exports/group_922065597_20260325_160848_899209.manifest.json`
+- trace:
+  - `state/export_perf/cli_export_group_922065597_20260325_160845_533113_11840.jsonl`
+- report:
+  - `state/export_perf/cli_export_group_922065597_20260325_160845_533113_11840.report.json`
+- result:
+  - `records=300`
+  - `elapsed=5.303s`
+  - `actionable_missing=0`
+  - `background_missing=21`
+
+Compared with the immediately previous `300`-message baseline:
+
+- total elapsed:
+  - `6.302s -> 5.303s`
+- `app.fetch_snapshot`:
+  - `1.3094s -> 1.1673s`
+- `provider.fast_tail_bulk`:
+  - `1.2609s -> 1.1422s`
+- `bundle.materialize_snapshot_media`:
+  - `1.7185s -> 1.3757s`
+- `app.write_bundle`:
+  - `1.7342s -> 1.3943s`
+- `image:copy_asset_file:status=done`:
+  - `0.2078s -> 0.1577s`
+
+This pass specifically added:
+
+- downloader-side terminal request-state preclassification during `prepare_for_export(...)`
+  - terminal top-level image/file/video/speech requests can now be marked before remote/public/context scheduling
+  - repeated background-missing assets no longer consume prefetch slots
+- stronger evidence-first terminal closeout for top-level `file/video`
+  - blank / zero-byte public payloads no longer require old-bucket heuristics on top-level assets
+- `bundle.write_data_file` is now a first-class perf stage
+  - `app.write_bundle` is no longer a pure black box
+- copy traces now include:
+  - `copy_mode`
+  - `copy_chunk_count`
+  - `copy_buffer_bytes`
+  - `copy_bytes_total`
+- report-side `copy_io_breakdown` now includes `throughput_mib_s`
+
+Current interpretation after this pass:
+
+- correctness stayed clean:
+  - `actionable_missing=0`
+- the highest-value remaining fetch/page-scan work is now clearly plugin-side:
+  - `provider.fast_tail_bulk = 1.1422s`
+  - plugin breakdown shows `2` page calls and `549ms` native/plugin elapsed inside the route
+- the highest-value remaining asset/materialize work is now concentrated in:
+  - cross-volume `image` copy clusters
+  - `bundle_future_local_identity_evidence` first-writer copies
+  - residual placeholder / expired image classification volume
+
+Next execution board:
+
+- [ ] promote bundle-local "first writer wins" earlier so `bundle_future_local_identity_evidence` becomes reuse more often and copy less often
+- [ ] memoize stale-neighbor directory probes more aggressively across repeated image families
+- [ ] re-run live benchmarks after a real NapCat restart so plugin-side sorted-output / page-call changes are actually loaded
+- [ ] compare `provider.fast_tail_bulk` pre/post restart on both `limit=300` and full-history windows
+- [ ] split any remaining `app.write_bundle` tail cost if `bundle.finalize_output_files` or `bundle.write_manifest` grows again
+
+## [2026-03-25] Post Instrumentation + Evidence-First Trim Pass
+
+Latest live small-window perf probe after this pass:
+
+- data:
+  - `exports/group_922065597_20260325_145634_228439.jsonl`
+- manifest:
+  - `exports/group_922065597_20260325_145634_228439.manifest.json`
+- trace:
+  - `state/export_perf/cli_export_group_922065597_20260325_145630_378038_1936.jsonl`
+- report:
+  - `state/export_perf/cli_export_group_922065597_20260325_145630_378038_1936.report.json`
+- result:
+  - `records=300`
+  - `elapsed=6.302s`
+  - `actionable_missing=0`
+  - `background_missing=21`
+
+This pass specifically added:
+
+- report-side `copy_io_breakdown`
+  - same-volume vs cross-volume
+  - byte totals
+  - size buckets
+- top-level image terminal classification before `context_hydration`
+- tighter `second_pass_public_retry` gating when request-state evidence is already terminal
+- `forward image` metadata-first terminal closeout before remote/public retries
+- bounded buffered cross-volume asset copy
+  - keep RAM bounded
+  - prefer sequential disk writes
+  - do not hold whole export assets in memory
+
+Current interpretation after this pass:
+
+- `actionable_missing=0` still holds on the latest live probe
+- the remaining copy cost is now better measurable, and cross-volume copy is explicitly visible
+- the remaining downloader waste is more concentrated in:
+  - top-level stale-local `image`
+  - terminal `file/video` negative chains
+  - sparse `forward image` metadata probes
+
+## [2026-03-25] Current Main Perf Snapshot After Fetch + Materialize Speedup Pass
+
+Latest live full export used for this audit:
+
+- data:
+  - `exports/group_922065597_20260325_030622_196612.jsonl`
+- manifest:
+  - `exports/group_922065597_20260325_030622_196612.manifest.json`
+- trace:
+  - `state/export_perf/cli_export_group_922065597_20260325_030608_299742_55008.jsonl`
+- report:
+  - `state/export_perf/cli_export_group_922065597_20260325_030608_299742_55008.report.json`
+- result:
+  - `records=12593`
+  - `elapsed=30.786s`
+  - `actionable_missing=1154`
+  - `background_missing=159`
+
+Current broad-stage costs:
+
+- `app.fetch_snapshot`: `11.4263s`
+- `provider.fetch_snapshot_tail`: `11.4218s`
+- `provider.fast_tail_bulk`: `8.825s`
+- `provider.tail_forward_hydrate`: `0.2074s`
+- `provider.finalize_snapshot`: `1.0127s`
+- `bundle.materialize_snapshot_media`: `15.9658s`
+- `app.write_bundle`: `16.1799s`
+
+Current materialize hotspots:
+
+- `image:copy_asset_file:status=done`
+  - `710` copies
+  - `1.9455s`
+- `image:context_hydration:status=ok`
+  - `21` calls
+  - `0.7313s`
+- `image:forward_context_metadata:status=ok`
+  - `13` calls
+  - `0.4988s`
+- `image:unknown:status=copied:resolver=direct_local_path`
+  - `477` assets
+  - `3.2869s`
+- `image:unknown:status=missing:resolver=missing_after_napcat`
+  - `1205` assets
+  - `2.4237s`
+- `image:unknown:status=copied:resolver=stale_source_neighbor`
+  - `157` assets
+  - `1.1s`
+- `image:unknown:status=copied:resolver=bundle_future_local_identity_evidence`
+  - `76` assets
+  - `0.5381s`
+
+Current interpretation:
+
+- fetch/page scanning is no longer the only dominant cost
+- the current largest remaining surface is aggregate bundle/materialize work
+- raw `copy_asset_file` is not the only issue:
+  - cross-volume copy is real
+  - stale-neighbor lookup is still repeated many times
+  - future-local identity reuse still has a "first copy, later reuse" gap
+- remaining probe cost is now concentrated in:
+  - old top-level `image`
+  - a handful of `file/video` negative terminal chains
+
+### Important report caveats from the current audit
+
+- top-level `pages_scanned` is still misleading for `history_full_bulk`
+  - top-level report currently shows `0`
+  - but `provider.fast_tail_bulk` and `history_page_breakdown` both show `65`
+- `app.write_bundle` still wraps several different costs into one stage:
+  - data-file write
+  - bundle materialize
+  - staged/final path swap
+  - manifest write
+- `provider.fast_tail_bulk` is still a plugin-side black box
+  - current report does not expose plugin internal:
+    - fetch rounds
+    - anchor chase rounds
+    - reply/reference parse counts
+    - native/history API call counts
+
+## [2026-03-24] Full-History Scan Route Was Still On The Old Per-Page Path Until This Pass
+
+- user-side `@final_content @earliest_content` broad exports were still reporting:
+  - `scanning full history pages=71 ... elapsed~=28s`
+- root cause:
+  - `fetch_full_snapshot()` had never been switched to fast bulk
+  - only tail-oriented paths were using `/history-tail-bulk`
+  - full-history broad exports were still doing `71` front-end page fetches through `_fetch_history_page(...)`
+- this pass changes full-history to `fast_full_bulk` first, with per-page retry only as fallback
+- direct maintainer live benchmark on group `922065597` after the change:
+  - `messages=12593`
+  - `pages_scanned=71`
+  - `bulk_chunks=7`
+  - `provider.fast_full_bulk = 9.1365s`
+  - `provider.finalize_snapshot = 20.2898s`
+  - `provider.fetch_full_snapshot = 29.4657s`
+- interpretation:
+  - full-history page scanning itself did drop materially:
+    - from `~28s` broad front-end scan time
+    - to `~9.1s` bulk fetch time
+  - the new dominant cost inside `fetch_full_snapshot()` is now `provider.finalize_snapshot`
+    - mainly forward/detail enrichment
+    - not raw page acquisition
+
+### Stage breakdown from the latest full-export report
+
+- `app.write_bundle`: `61.281s`
+- `bundle.materialize_snapshot_media`: `61.0207s`
+- `app.fetch_snapshot`: `47.9287s`
+- `provider.fetch_snapshot_tail`: `47.9247s`
+- `provider.fast_tail_bulk`: `8.9044s`
+- `provider.finalize_snapshot`: `3.5612s`
+
+### Scan/fetch findings
+
+- `tail_scan` total elapsed: `47.9247s`
+- embedded `forward_hydrate_s`: `35.4273s`
+- `bulk_chunks`: `7`
+- `pages_scanned`: `71`
+
+### Forward enrichment findings
+
+- `forward_expand_summary` showed:
+  - `total_forwards=36`
+  - `processed_forwards=36`
+  - `resolved_forwards=5`
+  - `history_retry_calls=62`
+  - `history_retry_hits=0`
+  - `get_forward_msg_calls=31`
+  - `get_forward_msg_hits=0`
+- interpretation:
+  - forward/history enrichment is currently expensive
+  - the hit rate in that audited run was effectively zero
+  - this is now a first-class perf target, not just a correctness curiosity
+
+### Materialize findings from the latest report
+
+- aggregate materialize time still dominates
+- top individual materialize steps were no longer timeout-scale:
+  - slowest recorded asset step in the report snapshot was `~458ms`
+  - many top remote/placeholder image substeps were in the `60-170ms` range
+- interpretation:
+  - current materialize slowness is now more aggregate-volume driven than "one asset stalls for 20s"
+  - the next optimization target should be route-plan batching and repeated cheap-but-many remote/image work
+
+## Report Completeness Requirements
+
+The original perf report was useful but incomplete for operator review.
+
+New minimum report fields now required:
+
+- `total_elapsed_s`
+- `fetch_stage_breakdown`
+- `history_page_breakdown`
+  - must include fast-bulk `tail_scan` pages, not just explicit `history_page_done`
+- `scan_phase_breakdown`
+- `materialize_stage_breakdown`
+- `materialize_asset_breakdown`
+
+The intent is:
+
+- fetch/page-scan costs are readable without hand-parsing raw trace JSONL
+- materialize costs are split between:
+  - per-substep cost
+  - per-asset-family/result cost
+  - top slow individual assets
+
+## Execution Tracks
+
+### Track 1. Report Completeness And Replay
+
+- [x] add report-level `fetch_stage_breakdown`
+- [x] add report-level `scan_phase_breakdown`
+- [x] make `history_page_breakdown` include bulk `tail_scan` rows
+- [ ] rerun one full live export with the improved report schema
+- [ ] confirm the new report directly answers:
+  - where fetch time went
+  - where page-scan time went
+  - where materialize time went
+
+### Track 2. Forward Enrichment Cost Reduction
+
+- [ ] quantify per-forward cost surface from the improved report/traces
+- [ ] separate:
+  - `forward_hydrate_s`
+  - `history_retry_calls/hits`
+  - `get_forward_msg_calls/hits`
+- [x] add a fast-plugin exporter route for forward detail hydration so Python no longer has to rely on `history_retry + get_forward_msg` as the first broad-path enrichment route
+- [ ] after a real NapCat restart, rerun one live export and compare:
+  - `fast_plugin_calls/hits`
+  - `history_retry_calls/hits`
+  - `get_forward_msg_calls/hits`
+  against the current full-export regression/perf baseline
+- [ ] reduce work on zero-yield forward enrichment paths
+- [ ] verify any reduction does not regress `forward_detail_count`
+
+### Track 3. Materialize Aggregate Cost Reduction
+
+- [ ] bucket materialize time by:
+  - asset family
+  - resolver
+  - missing class
+- [ ] add byte-level materialize/copy buckets by:
+  - asset family
+  - same-volume vs cross-volume
+  - size bucket
+  - source root kind
+- [ ] identify top repeated cheap-but-high-volume substeps
+- [ ] identify whether remote image resolution is now dominated by:
+  - public-token remote URL probes
+  - forward remote URL downloads
+  - stale placeholder classification
+- [ ] optimize the dominant repeated path first, not just the slowest single asset
+
+### Track 5. Asset Copy / Bundle I/O Deep Dive
+
+- [x] add `copy_io_breakdown` to perf report
+- [x] record:
+  - `source_drive`
+  - `target_drive`
+  - `same_volume`
+  - `bytes_total`
+  - size bucket
+- [x] add bounded buffered cross-volume copy
+  - prefer sequential disk writes
+  - keep memory bounded instead of whole-file RAM caching
+- [ ] validate on full export whether cross-volume buffered copy beats plain `copyfile`
+- [ ] consider first-writer promotion for `bundle_future_local_identity_evidence`
+- [ ] consider preallocated canonical rel-paths for same-identity asset groups
+
+### Track 6. Old Image / File Probe-Cost Reduction
+
+- [x] top-level image terminal evidence now runs before `context_hydration`
+- [x] `second_pass_public_retry` now short-circuits on request-state terminal evidence
+- [x] `forward image` metadata payload now classifies terminal missing before remote/public retry
+- [ ] keep shrinking top-level stale-local image `context_hydration` count
+- [ ] revisit top-level `file/video` blank direct-file-id payload classification against live traces
+- [ ] verify the remaining `missing_after_napcat` samples are truly missing and not late-recoverable
+
+### Track 7. Plugin-Side Fetch Telemetry And Page-Scan Reduction
+
+- [ ] expose plugin route-level stats in report:
+  - call count
+  - total ms
+  - avg ms
+  - max ms
+- [ ] evaluate plugin-side double-sort removal for bulk fetch
+- [ ] evaluate slimmer full-bulk payload shape for full-history scanning
+- [ ] split `full` vs `tail` fetch strategy instead of one global bulk strategy
+
+### Track 5. Asset Copy / Bundle I/O Deep Dive
+
+- [ ] split `app.write_bundle` into independent timed stages:
+  - `bundle.write_data_file`
+  - `bundle.replace_data_file`
+  - `bundle.swap_assets_dir`
+  - `bundle.write_manifest`
+- [ ] add `write_data(...)` timing and bytes metadata:
+  - `record_count`
+  - `bytes_written`
+  - `avg_bytes_per_record`
+  - `jsonl_buffer_flush` cost
+- [ ] add `copy_asset_file` report metadata:
+  - `copied_bytes`
+  - `source_drive`
+  - `target_drive`
+  - `same_volume`
+  - `size_bucket`
+- [ ] preallocate export target paths by stable asset identity in `media_bundle.py`
+- [ ] promote same-identity first-writer reuse earlier so follower assets do not reach their own copy branch
+- [ ] evaluate whether target-exists-and-size-match can skip duplicate copy work safely for repeated identities
+
+### Track 6. Old Image / File Probe-Cost Reduction
+
+- [ ] add evidence-first terminal closeout for `file/video` assets that already have:
+  - no local path
+  - negative `context_hydration`
+  - negative `direct_file_id_get_file`
+  - no live remote URL
+- [ ] prevent those `file/video` assets from falling into `second_pass_public_retry` once terminal evidence already exists
+- [ ] tighten `context_hydration` entry conditions for top-level stale-local `image`
+  - especially `relative /gchatpic_new/...` with no live downloadable handle
+- [ ] feed `forward_context_metadata` payload into terminal missing classification instead of treating it as advisory only
+- [ ] break down `missing_after_napcat` into finer evidence families in the perf report:
+  - `top_level_stale_local_no_live_remote`
+  - `file_direct_id_negative`
+  - `forward_metadata_no_live_remote`
+
+### Track 7. Plugin-Side Fetch Telemetry And Page-Scan Reduction
+
+- [ ] add plugin debug stats for `history_full_bulk`:
+  - `plugin_fetch_rounds`
+  - `anchor_chase_rounds`
+  - `raw_message_count`
+  - `reply_lookup_count`
+  - `parse_reply_count`
+  - `parse_forward_count`
+  - `native_history_calls`
+- [ ] fix report top-level `pages_scanned` so bulk/full-bulk values are reflected consistently
+- [ ] continue reducing zero-yield `tail_forward_hydrate` windows after the current sparse-history pass
+- [ ] compare next live run against the current `30.786s` snapshot after telemetry lands
+
+### Track 4. Baseline Comparison Guard
+
+- [x] compare the latest 13000 full export against the last actionable-zero baseline
+- [x] record the regression shape in evidence-first TODOs
+- [ ] once performance work is done, rerun the same 13000 full export and compare against both:
+  - actionable-zero baseline
+  - regression/perf-audit run
+- [ ] release gate:
+  - no correctness regression
+  - no unexplained benchmark regression
+
+## Required Artifacts For The Next Full Validation
+
+- full export JSONL
+- full export manifest
+- raw trace JSONL
+- report JSON
+- one short written comparison against:
+  - last actionable-zero baseline
+  - latest performance-audit regression run
+
+## Exit Criteria
+
+- improved report schema is exercised by a real full export
+- fetch/page-scan/materialize costs are readable directly from the report
+- next broad run keeps `actionable_missing=0`
+- at least one of the two big cost surfaces is materially reduced:
+  - fetch/page-scan
+  - materialize aggregate

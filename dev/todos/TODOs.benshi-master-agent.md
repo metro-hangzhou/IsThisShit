@@ -245,7 +245,7 @@ But it is now earlier than:
 - [x] Run first cluster-aware multimodal `medium` test with representative images.
 - [x] Produce dedicated `shi_review` artifact for manual review.
 - [ ] Expand from concentrated dump baseline to non-concentrated real group windows.
-- [ ] Add component-distribution output across multiple windows.
+- [x] Add component-distribution output across multiple windows.
 
 ## P11. Future Distillation Path
 

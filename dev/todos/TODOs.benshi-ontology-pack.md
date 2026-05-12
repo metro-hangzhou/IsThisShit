@@ -17,7 +17,7 @@ Spec baseline: 2026-03-19
 ## P0. 文档与知识底稿
 
 - [x] 将 `Q群群友史.docx` 的核心定义固化为可维护 markdown 底稿
-- [x] 维护 `dev/documents/benshi_local_ontology.md`
+- [x] 维护 `dev/reports/analysis/reference/benshi_local_ontology.md`
 - [x] 标注 hard guidance / soft guidance / anti-patterns
 
 ## P1. 程序模型

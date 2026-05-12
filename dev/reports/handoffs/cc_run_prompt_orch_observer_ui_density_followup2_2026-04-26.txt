@@ -1,0 +1,26 @@
+继续同一个项目，不要 fork 新会话。
+
+Codex 审查了你刚才的二次修复，还有两个小范围问题需要修：
+
+1. Prompt 分支不能被 `packetViewModels` 抢走。
+   - 在 `LlmSessionPage.vue` 中，`entry.type === 'prompt'` 现在仍然优先 `v-if="packetViewModels.get(entry.key)"` 渲染 `LlmSessionChatPacketCard`。
+   - 这会导致 prompt 看起来像普通卡片，无法展开看 `promptPreviewSections()`。
+   - 请改成：prompt 类型优先渲染 `<details class="prompt-block">`，展示 body、System/User 指令预览和 Raw。
+   - 不要把 prompt 交给 `LlmSessionChatPacketCard`，除非没有任何 prompt preview 且你明确保留 Raw 入口。
+
+2. Packet 外层已有 section label 后，不要重复显示内部 eyebrow。
+   - `entry.type === 'packet'` 外面已经显示 `.section-label`。
+   - `LlmSessionChatPacketCard` 内部还显示 `model.eyebrow`，视觉会重复“审阅材料”。
+   - 请给 `LlmSessionChatPacketCard` 增加一个 prop，例如 `hideEyebrow?: boolean`，在 packet 分支传入 `hide-eyebrow`。
+   - Tool result compact 仍然可以显示 `工具返回的 QQ 原文`，不要隐藏。
+
+3. 顺手优化 compact foot 文案间隔。
+   - 当前可能显示成 `8 条 · 1 人查看 8 条原文 →`。
+   - 改成有分隔：`8 条 · 1 人 · 查看原文 →` 或直接按钮式 hint。
+
+只改上述范围。改完运行：
+
+- cd apps/review-editor && npx vitest run
+- cd apps/review-editor && npx vue-tsc --noEmit
+
+最终回复列出修改和测试结果。

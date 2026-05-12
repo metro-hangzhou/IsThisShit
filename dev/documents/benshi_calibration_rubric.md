@@ -1,53 +1,18 @@
-# Benshi Calibration Rubric
+# Redirect Note
 
-## Evidence Tiers
+Legacy path:
 
-### Direct Observed Evidence
-- Examples: visible text, reply structure, forward nesting, share/system markers, materialized media references
-- Default confidence guidance: high
-- Weighting rule: may support stable downstream schema candidates
+- `dev/documents/benshi_calibration_rubric.md`
 
-### Context-Only Inference
-- Examples: likely interpretation supported by surrounding text, repeated reactions, or bounded-window context
-- Default confidence guidance: medium to low
-- Weighting rule: keep separate from direct observations and require explicit uncertainty wording
+Canonical path:
 
-### Unknown / Missing-Media Gaps
-- Examples: missing image/video/file semantics, unavailable sticker detail, absent speech payload meaning
-- Default confidence guidance: unknown
-- Weighting rule: do not convert into pseudo-observed facts; preserve as uncertainty or deferred follow-up
+- [dev/reports/analysis/calibration/benshi_calibration_rubric.md](/d:/Coding_Project/IsThisShit/dev/reports/analysis/calibration/benshi_calibration_rubric.md)
 
-## Calibration Questions
-- Is the cue grounded in direct evidence or only context?
-- Would the claim remain true if the missing media turned out to contradict the surrounding text?
-- Does the current report separate observation from interpretation clearly enough?
+Archive snapshot:
 
-## Future Weighting Guidance
-- Weight direct observed evidence above context-only inference
-- Weight context-only inference above pure unknowns only when text/context support is repeated and coherent
-- Assign the lowest weight to missing-media hypotheses unless later multimodal recovery supplies direct evidence
+- [documents analysis slice archive](/d:/Coding_Project/IsThisShit/dev/archive/system_refactor_20260327/documents_analysis_slice_20260327/source_snapshot/benshi_calibration_rubric.md)
 
-## Current Stable Observation Dimensions
-- `interaction_density`
-- `information_density`
-- `content_provenance`
-- `narrative_coherence`
-- `media_dependence`
-- `uncertainty_load`
-- `topic_type`
-- `followup_value`
+Migration note:
 
-## Current Soft Role Labels
-- `narrative_carrier`
-- `relay_forwarder`
-- `topic_initiator`
-- `noise_broadcaster`
-- `question_probe`
-- `reaction_echoer`
-- `resource_dropper`
-
-## Guardrails
-- Do not freeze a final low-level taxonomy from one pilot
-- Do not merge inferred media meaning into direct evidence fields
-- Do not hide uncertainty just because a report sounds plausible
-- When `InferredItems = 0`, do not convert missing-media adjacency into causal explanation
+- This file is restored as a compatibility entry.
+- The canonical calibration rubric now lives under `dev/reports/analysis/calibration/`.

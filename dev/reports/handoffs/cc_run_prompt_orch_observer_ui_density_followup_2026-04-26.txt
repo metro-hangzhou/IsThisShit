@@ -1,0 +1,29 @@
+继续同一个项目，不要 fork 新会话。
+
+你刚才完成了 `cc_orch_observer_ui_density_task_2026-04-26`，但 Codex 审查发现一个关键偏差：tool-result compact 变体现在隐藏了 `summaryLines`，导致工具返回的 QQ 原文只剩标题和计数，看不到返回内容本身。这不符合需求。
+
+请只做小范围修正：
+
+1. `variant="tool-result"` 仍然要高密度，但必须显示最多 1-2 条 QQ 原文预览。
+   - 不能像大 forward 卡那样占空间。
+   - 应该是紧凑两行以内，例如：
+     - `user_xxx：文本...`
+     - `user_yyy：文本...`
+   - 溢出单行省略。
+   - 保持 `查看原文 →` 入口。
+
+2. 不要在同一个元素上混用 `v-if` 和 `v-for`。
+   - 当前 `p v-if="props.variant !== 'tool-result'" v-for=...` 风格需要清理成 template 或 computed 条件，避免 Vue 风格问题。
+
+3. 检查 `审阅材料` 外层层级是否真的解决。
+   - 如果现在仍只是 `packet-card__eyebrow` 里的小字，请调整为卡片外/组件外可读标题，或者至少在组件内变成明确 section label，而不是小灰字。
+   - 不要大改，只做最小可验收修复。
+
+4. Prompt 可展开也请再确认 template 上确实能展开并显示 `promptPreviewSections()` 的内容。若现在某个分支因为 `packetViewModels` 拦截导致只显示卡片不可展开，请修。
+
+改完运行：
+
+- cd apps/review-editor && npx vitest run
+- cd apps/review-editor && npx vue-tsc --noEmit
+
+最终回复列出具体修改和测试结果。

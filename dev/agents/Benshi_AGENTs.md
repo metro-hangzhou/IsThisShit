@@ -84,9 +84,15 @@ The fourth is culture interpretation.
 
 The fifth is a capability probe, not the primary truth layer.
 
+Additional rule:
+
+- adversarial, hostile, or motive-level readings are allowed in this project
+- but they must remain explicitly separated from direct evidence
+- they belong to a hypothesis layer, not to the direct observed layer
+
 ## Cultural Baseline
 
-This agent must align with repository-local benshi reference documents under `dev/documents/`.
+This agent must align with repository-local benshi reference/report materials under `dev/reports/analysis/`.
 
 Current stable cultural signals already present in those docs include:
 
@@ -204,12 +210,21 @@ Suggested fields:
 - `evidence_summary`
 - `direct_observations`
 - `context_inferences`
+- `adversarial_hypotheses`
 - `missing_media_gaps`
 - `transport_pattern`
 - `participant_roles`
 - `shi_presence`
 - `shi_type_candidates`
 - `confidence`
+
+For `adversarial_hypotheses`, recommended fields:
+
+- `claim`
+- `confidence`
+- `basis`
+- `counter_evidence`
+- `why_not_direct_fact`
 
 ### 2. Shi Component Analysis Layer
 
@@ -395,8 +410,35 @@ The evaluation target is:
 ### Calibration competence
 
 - does it keep missing-media claims bounded
-- does it avoid motive inflation
+- does it avoid motive inflation when evidence is weak
+- does it allow hostile/motive hypotheses when evidence is genuinely strong enough
 - does it avoid treating adjacency as explanation
+
+### ORCH Model-Led Guardrail
+
+The current ORCH model-led loop must not let weak binding evidence name or upgrade
+a non-boundary `shi` result.
+
+Weak binding includes:
+
+- plain time adjacency
+- a normal follow-up question or answer with no confirmed reply chain
+- an empty or failed reply-chain/tool lookup
+- a relation placed in `boundary_edges`, `rejected_edges`, or `open_questions`
+
+Required behavior:
+
+- Direct QQ text/media on the same message can support a result.
+- Confirmed relation edges can support a result only when they carry QQ message evidence.
+- Weak binding can only appear as `boundary`, `audit_risks`, `remaining_limits`, or an open question.
+- A later unconfirmed explanation must not rename an already auditable image-caption joke.
+- This rule must stay generic. Do not add sample-specific prompt lines such as "do not upgrade this exact meme"; use evidence-strength rules instead.
+
+Runtime enforcement:
+
+- `src/qq_data_analysis/orch/model_prompt_contract.py` tells the model the rule.
+- `src/qq_data_analysis/orch/model_result_guardrails.py` applies a semantic post-parse guardrail before observer/report materialization.
+- `tests/test_chat_orchestrator_runtime.py::test_model_result_guardrail_rewrites_weak_adjacent_explanation_to_boundary` covers the failure mode with synthetic data, not the live AMD sample.
 
 ## Delivery Strategy
 

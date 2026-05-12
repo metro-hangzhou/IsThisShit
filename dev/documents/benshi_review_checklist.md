@@ -1,58 +1,18 @@
-# Benshi Report Review Checklist
+# Redirect Note
 
-## Run Metadata
-- Report path:
-- Analysis pack path:
-- Prompt version:
-- Dataset slice:
-- Time window:
+Legacy path:
 
-## What The Report Noticed Correctly
-- Stable themes with direct evidence:
-- Stable interaction patterns:
-- Stable participant roles:
+- `dev/documents/benshi_review_checklist.md`
 
-## Overgeneralizations Or Weak Claims
-- Claims that relied on sparse text only:
-- Claims weakened by missing media:
-- Claims that should stay observational, not conclusive:
+Canonical path:
 
-## Missed Dimensions
-- Text/context signals the report underused:
-- Reply / forward structure the report missed:
-- Share / system / media-gap cues the report missed:
+- [dev/reports/analysis/reviews/benshi_review_checklist.md](/d:/Coding_Project/IsThisShit/dev/reports/analysis/reviews/benshi_review_checklist.md)
 
-## Evidence Quality Check
-- Direct observed evidence:
-- Context-only inference:
-- Unknown or missing-media gaps:
-- Any place where evidence and confidence looked mismatched:
+Archive snapshot:
 
-## Future Schema Candidates
-- Candidate dimensions stable enough for later structuring:
-- Candidate dimensions still too fuzzy / premature:
-- Suggested next-step analyzers or prompt refinements:
+- [documents analysis slice archive](/d:/Coding_Project/IsThisShit/dev/archive/system_refactor_20260327/documents_analysis_slice_20260327/source_snapshot/benshi_review_checklist.md)
 
-## Stable Soft Labels Check
-- Which participant roles appeared clearly:
-  - `narrative_carrier`
-  - `relay_forwarder`
-  - `topic_initiator`
-  - `noise_broadcaster`
-  - `question_probe`
-  - `reaction_echoer`
-  - `resource_dropper`
-- Which stable dimensions were usable:
-  - `interaction_density`
-  - `information_density`
-  - `content_provenance`
-  - `narrative_coherence`
-  - `media_dependence`
-  - `uncertainty_load`
-  - `topic_type`
-  - `followup_value`
+Migration note:
 
-## Reviewer Decision
-- Keep as stable signal:
-- Re-test with more slices:
-- Defer until multimodal evidence exists:
+- This file is restored as a compatibility entry.
+- The canonical review checklist now lives under `dev/reports/analysis/reviews/`.

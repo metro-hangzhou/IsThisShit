@@ -211,6 +211,39 @@ Recent field failures showed that the project has two separate but related stabi
   - route-unavailable / mixed-route deployment states
   - batch-prefetch pressure and executor-level behavior
 
+### [2026-03-22][015] Summary-first simulator coverage is now part of exporter review discipline
+
+- Problem:
+  - raw matrix dumps are too noisy for broad developer review
+- the real missing insight is often:
+    - which suites are covered
+    - which age buckets are expensive
+
+### [2026-03-24][016] Full-export actionable regression after instrumentation pass
+
+- observed regression:
+  - previous full-export baseline on `922065597` had `actionable_missing=0`
+  - current instrumented full export regressed to `actionable_missing=6`
+- lesson:
+  - observability changes are not automatically release-safe
+  - they must still be compared against the last actionable-zero baseline
+- required guardrail:
+  - keep an explicit baseline artifact set
+  - run targeted regression comparison and convergence before any release sync
+
+## Current Fix / Guardrail Tasks
+
+- [ ] establish the last actionable-zero full export as an explicit release comparison artifact
+- [ ] block release sync when a current run exceeds that baseline
+    - which cost overruns still exist
+- Current fix:
+  - simulator now emits:
+    - forward timeout summary
+    - resolution summary
+    - resolution coverage catalog
+- Remaining gap:
+  - add batch/shared-cache poisoning simulations and prefetch-pressure suites
+
 ## Current Fix / Guardrail Tasks
 
 - [ ] Keep CLI launcher policy explicit in regression review:
@@ -240,6 +273,7 @@ Recent field failures showed that the project has two separate but related stabi
 - [ ] Record friend-machine failures into perf/forensics docs when new logs arrive
 - [ ] Keep quick-login path covered by regression tests so QR fallback remains intact
 - [ ] Keep the asset-state simulator matrix in sync with any new asset family or recovery heuristic
+- [ ] Extend the asset-state simulator toward batch/shared-cache and executor-pressure coverage, not just single-request resolution
 - [ ] Keep `app.py login` and REPL `/login` behavior-compatible in regression coverage
 - [ ] Keep local live validation scripts/operator notes aligned with the fixed local account `3956020260`
 - [ ] Keep local live/export validation matrix aligned with the fixed test targets:
@@ -520,12 +554,44 @@ Recent field failures showed that the project has two separate but related stabi
   - current fix:
     - very old forward `video/file/speech` now share one expensive-route breaker bucket across months
     - slow `forward_context_materialize` attempts that still miss now count toward the breaker
+- [x] Expand the local asset simulator from hand-picked samples to bounded exhaustive old-forward audits
+  - current simulator suites now explicitly cover:
+    - `exhaustive_old_forward_terminal`
+    - `exhaustive_sticker_forward_parent`
+    - `exhaustive_local_path_states`
+    - `exhaustive_old_forward_direct_file_id`
+  - this round exposed and fixed two real logic holes:
+    - non-image `source_path` was not short-circuiting to local materialization
+    - old forward `video/file` could still spill from failed `direct_file_id_get_file` into targeted materialize
+- [ ] Add a stateful cache/breaker simulator pass instead of only single-scenario resolution checks
+  - current simulator is now much broader, but it is still mostly:
+    - one request -> one resolution result
+  - remaining high-value gap:
+    - cache reuse across repeated assets
+    - timeout-storm opening thresholds
+    - in-flight coalescing / duplicate concurrent requests
+- [ ] Add bounded compatibility coverage for NapCat public-token shape drift
+  - still missing from simulator:
+    - `file=<token>` vs `file_id=<token>` compatibility branches
+    - mixed blank payload vs remote URL vs local path return shapes under the same token family
+- [x] Ship evidence-first provider / bundle hardening as one release bundle and verify it does not reintroduce actionable missing
+  - bundle scope:
+    - `src/qq_data_integrations/napcat/provider.py`
+    - `src/qq_data_core/media_bundle.py`
+    - simulator / boundary / reuse tests
+    - `dev/todos/TODOs.evidence-first-exporter.md`
+  - current maintainer full export validation:
+    - `export-history group 922065597 --limit 20000 --format jsonl`
+    - `records=12593`
+    - `actionable_missing=0`
+    - `background_missing=1207`
+    - `history_source=napcat_fast_history_bulk`
 
 ## Related Files
 
-- [technical-roadmap.md](../documents/technical-roadmap.md)
-- [branch-sync-incidents.md](../documents/branch-sync-incidents.md)
-- [git_branching_plan.md](../documents/git_branching_plan.md)
+- [branch_sync_incidents.md](../reports/branching/branch_sync_incidents.md)
+- [git_branching_plan.md](../reports/branching/git_branching_plan.md)
+- [technical_roadmap.md](../reports/repo/technical_roadmap.md)
 - [GitBranch_AGENTs.md](../agents/GitBranch_AGENTs.md)
 - [TODOs.export-performance.md](TODOs.export-performance.md)
 - [TODOs.export-optimization.md](TODOs.export-optimization.md)
