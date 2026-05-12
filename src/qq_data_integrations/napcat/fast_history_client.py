@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from threading import RLock
 from time import monotonic
 from typing import Any, Literal
 from urllib.parse import urlparse, urlunparse
 
 import httpx
+
+from .models import normalize_chat_type
 
 FAST_HISTORY_PLUGIN_ID = "napcat-plugin-qq-data-fast"
 FAST_HISTORY_MAX_PAGE_SIZE = 200
@@ -27,18 +31,25 @@ class NapCatFastHistoryTimeoutError(NapCatFastHistoryError):
     pass
 
 
+class NapCatFastHistoryResponseError(NapCatFastHistoryError):
+    pass
+
+
 class NapCatFastHistoryClient:
     def __init__(
         self,
         base_url: str,
         *,
         headers: dict[str, str] | None = None,
+        headers_provider: Callable[[], dict[str, str] | None] | None = None,
         use_system_proxy: bool = False,
         timeout: float = 60.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._headers = dict(headers or {})
+        self._headers_provider = headers_provider
+        self._headers_lock = RLock()
         self._client = httpx.Client(
             base_url=self._base_url,
             timeout=timeout,
@@ -52,12 +63,12 @@ class NapCatFastHistoryClient:
 
     def health(self) -> dict[str, Any]:
         response = self._get("/health")
-        data = self._extract_data(response)
+        data = self._extract_data(response, require_code=False)
         return data if isinstance(data, dict) else {}
 
     def capabilities(self) -> dict[str, Any]:
         response = self._get("/capabilities")
-        data = self._extract_data(response)
+        data = self._extract_data(response, require_code=False)
         return data if isinstance(data, dict) else {}
 
     def probe_route(
@@ -98,12 +109,13 @@ class NapCatFastHistoryClient:
         if started is not None:
             elapsed_ms = int(round((monotonic() - started) * 1000))
         status_code = int(response.status_code)
+        reachable = response.is_success
         return {
             "path": path,
             "method": method,
-            "reachable": status_code != 404,
+            "reachable": reachable,
             "status_code": status_code,
-            "detail": None if status_code != 404 else "route_not_found",
+            "detail": None if reachable else f"http_{status_code}",
             "timed_out": False,
             "connect_error": False,
             "elapsed_ms": elapsed_ms,
@@ -120,7 +132,7 @@ class NapCatFastHistoryClient:
         timeout: float | httpx.Timeout | None = None,
     ) -> Any:
         payload: dict[str, Any] = {
-            "chat_type": "group" if chat_type == "group" else "private",
+            "chat_type": normalize_chat_type(chat_type),
             "chat_id": str(chat_id),
             "count": count,
         }
@@ -138,17 +150,50 @@ class NapCatFastHistoryClient:
         data_count: int,
         page_size: int = FAST_HISTORY_MAX_PAGE_SIZE,
         anchor_message_id: str | None = None,
+        anchor_message_seq: str | None = None,
+        history_fetch_strategy: str | None = None,
+        include_debug_stats: bool = False,
         timeout: float | httpx.Timeout | None = None,
     ) -> Any:
         payload: dict[str, Any] = {
-            "chat_type": "group" if chat_type == "group" else "private",
+            "chat_type": normalize_chat_type(chat_type),
             "chat_id": str(chat_id),
             "data_count": int(data_count),
             "page_size": int(page_size),
         }
         if anchor_message_id not in {None, "", "0", 0}:
             payload["anchor_message_id"] = str(anchor_message_id)
+        if anchor_message_seq not in {None, "", "0", 0}:
+            payload["anchor_message_seq"] = str(anchor_message_seq)
+        if history_fetch_strategy:
+            payload["history_fetch_strategy"] = str(history_fetch_strategy)
+        if include_debug_stats:
+            payload["include_debug_stats"] = True
         response = self._post("/history-tail-bulk", json=payload, timeout=timeout)
+        return self._extract_data(response)
+
+    def get_history_full_bulk(
+        self,
+        chat_type: str,
+        chat_id: str,
+        *,
+        data_count: int,
+        page_size: int = FAST_HISTORY_MAX_PAGE_SIZE,
+        history_fetch_strategy: str | None = None,
+        include_debug_stats: bool = False,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "chat_type": normalize_chat_type(chat_type),
+            "chat_id": str(chat_id),
+            "data_count": int(data_count),
+            "page_size": int(page_size),
+        }
+        if history_fetch_strategy:
+            payload["history_fetch_strategy"] = str(history_fetch_strategy)
+        if include_debug_stats:
+            payload["include_debug_stats"] = True
+        response = self._post("/history-full-bulk", json=payload, timeout=timeout)
         return self._extract_data(response)
 
     def hydrate_media(
@@ -226,14 +271,63 @@ class NapCatFastHistoryClient:
         response = self._post("/hydrate-forward-media", json=payload, timeout=timeout)
         return self._extract_data(response)
 
-    def _extract_data(self, response: httpx.Response) -> Any:
+    def hydrate_forward_detail(
+        self,
+        *,
+        message_id_raw: str,
+        element_id: str,
+        peer_uid: str,
+        chat_type_raw: int | str,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> Any:
+        payload = {
+            "message_id_raw": str(message_id_raw),
+            "element_id": str(element_id),
+            "peer_uid": str(peer_uid),
+            "chat_type_raw": int(chat_type_raw),
+        }
+        response = self._post("/hydrate-forward-detail", json=payload, timeout=timeout)
+        return self._extract_data(response)
+
+    def hydrate_forward_detail_batch(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        timeout: float | httpx.Timeout | None = None,
+    ) -> Any:
+        response = self._post(
+            "/hydrate-forward-detail-batch",
+            json={"items": items},
+            timeout=timeout,
+        )
+        return self._extract_data(response)
+
+    def _extract_data(self, response: httpx.Response, *, require_code: bool = True) -> Any:
         if response.status_code in {404, 503}:
             raise NapCatFastHistoryUnavailable(
                 f"NapCat fast history plugin is unavailable at {self._base_url} (status={response.status_code})."
             )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise NapCatFastHistoryResponseError(
+                f"NapCat fast history plugin returned HTTP {response.status_code}."
+            ) from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise NapCatFastHistoryResponseError(
+                "NapCat fast history plugin returned non-JSON response."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise NapCatFastHistoryResponseError(
+                "NapCat fast history plugin returned unexpected JSON payload."
+            )
         code = payload.get("code")
+        if require_code and "code" not in payload:
+            raise NapCatFastHistoryResponseError(
+                "NapCat fast history plugin returned JSON without a response code."
+            )
         if code not in {None, 0}:
             raise NapCatFastHistoryError(
                 str(payload.get("message") or payload.get("msg") or "NapCat fast history request failed")
@@ -247,8 +341,9 @@ class NapCatFastHistoryClient:
         timeout: float | httpx.Timeout | None = None,
         **kwargs,
     ) -> httpx.Response:
+        self._ensure_headers()
         try:
-            return self._client.post(path, timeout=timeout, **kwargs)
+            response = self._client.post(path, timeout=timeout, **kwargs)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             raise NapCatFastHistoryConnectError(
                 "Cannot connect to NapCat fast history plugin at "
@@ -258,6 +353,9 @@ class NapCatFastHistoryClient:
             raise NapCatFastHistoryTimeoutError(
                 f"NapCat fast history plugin timed out waiting for {path} at {self._base_url}"
             ) from exc
+        if response.status_code in {401, 403} and self._ensure_headers(force_refresh=True):
+            response = self._client.post(path, timeout=timeout, **kwargs)
+        return response
 
     def _get(
         self,
@@ -266,8 +364,9 @@ class NapCatFastHistoryClient:
         timeout: float | httpx.Timeout | None = None,
         **kwargs,
     ) -> httpx.Response:
+        self._ensure_headers()
         try:
-            return self._client.get(path, timeout=timeout, **kwargs)
+            response = self._client.get(path, timeout=timeout, **kwargs)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             raise NapCatFastHistoryConnectError(
                 "Cannot connect to NapCat fast history plugin at "
@@ -277,6 +376,23 @@ class NapCatFastHistoryClient:
             raise NapCatFastHistoryTimeoutError(
                 f"NapCat fast history plugin timed out waiting for {path} at {self._base_url}"
             ) from exc
+        if response.status_code in {401, 403} and self._ensure_headers(force_refresh=True):
+            response = self._client.get(path, timeout=timeout, **kwargs)
+        return response
+
+    def _ensure_headers(self, *, force_refresh: bool = False) -> bool:
+        if self._headers_provider is None:
+            return False
+        with self._headers_lock:
+            if not force_refresh and self._headers.get("Authorization"):
+                return False
+            provided = self._headers_provider() or {}
+            authorization = str(provided.get("Authorization") or "").strip()
+            if not authorization:
+                return False
+            self._headers["Authorization"] = authorization
+            self._client.headers["Authorization"] = authorization
+            return True
 
 
 def derive_fast_history_url(

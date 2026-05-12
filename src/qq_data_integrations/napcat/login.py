@@ -29,11 +29,27 @@ class NapCatQrLoginService:
     def get_login_info(self) -> NapCatLoginInfo:
         return self._client.get_login_info()
 
+    def get_ready_login_info(self) -> NapCatLoginInfo | None:
+        info = self.get_login_info()
+        if info.is_usable_session():
+            return info
+        return None
+
     def get_quick_login_candidates(self) -> list[NapCatQuickLoginAccount]:
         return self._client.get_quick_login_list()
 
     def get_default_quick_login_uin(self) -> str | None:
         return self._client.get_quick_login_uin()
+
+    def resolve_desired_quick_login_uin(self, *, preferred_uin: str | None = None) -> str | None:
+        candidates = self.get_quick_login_candidates()
+        if not candidates:
+            return None
+        return _choose_quick_login_uin(
+            preferred_uin=preferred_uin,
+            default_uin=self.get_default_quick_login_uin(),
+            candidates=candidates,
+        )
 
     def try_quick_login(
         self,
@@ -45,17 +61,9 @@ class NapCatQrLoginService:
     ) -> NapCatLoginInfo | None:
         status = self._client.check_login_status()
         if status.effectively_logged_in():
-            return self._client.get_login_info()
+            return self.get_ready_login_info()
 
-        candidates = self.get_quick_login_candidates()
-        if not candidates:
-            return None
-
-        chosen_uin = _choose_quick_login_uin(
-            preferred_uin=preferred_uin,
-            default_uin=self.get_default_quick_login_uin(),
-            candidates=candidates,
-        )
+        chosen_uin = self.resolve_desired_quick_login_uin(preferred_uin=preferred_uin)
         if chosen_uin is None:
             return None
 
@@ -69,7 +77,9 @@ class NapCatQrLoginService:
             if on_status:
                 on_status(status)
             if status.effectively_logged_in():
-                return self._client.get_login_info()
+                info = self.get_ready_login_info()
+                if info is not None:
+                    return info
             if status.login_error and "快速登录" in status.login_error:
                 return None
         return None
@@ -85,7 +95,9 @@ class NapCatQrLoginService:
     ) -> NapCatLoginInfo:
         status = self._client.check_login_status()
         if status.effectively_logged_in():
-            return self._client.get_login_info()
+            ready_info = self.get_ready_login_info()
+            if ready_info is not None:
+                return ready_info
 
         if refresh or not status.qrcode_url:
             self._client.refresh_qrcode()
@@ -105,7 +117,9 @@ class NapCatQrLoginService:
             self._sleep(poll_interval)
             status = self._client.check_login_status()
             if status.effectively_logged_in():
-                return self._client.get_login_info()
+                ready_info = self.get_ready_login_info()
+                if ready_info is not None:
+                    return ready_info
 
             next_error = status.login_error or ""
             if next_error != last_error:
@@ -124,6 +138,32 @@ class NapCatQrLoginService:
                     on_qrcode(next_qrcode)
 
         raise TimeoutError("Timed out waiting for QQ QR login confirmation")
+
+
+def build_session_mismatch_message(*, current_uin: str, requested_uin: str) -> str:
+    return (
+        "QQ session mismatch. "
+        f"current_uin={current_uin} requested_uin={requested_uin}. "
+        "Close the current NapCat/QQ session or switch the QQ account, then retry /login."
+    )
+
+
+def detect_session_mismatch(
+    service: NapCatQrLoginService,
+    *,
+    expected_uin: str | None,
+) -> str | None:
+    desired = str(expected_uin or "").strip()
+    if not desired:
+        return None
+    info = service.get_ready_login_info()
+    current_uin = str(getattr(info, "uin", "") or "").strip() if info is not None else ""
+    if not current_uin or current_uin == desired:
+        return None
+    return build_session_mismatch_message(
+        current_uin=current_uin,
+        requested_uin=desired,
+    )
 
 
 def _choose_quick_login_uin(

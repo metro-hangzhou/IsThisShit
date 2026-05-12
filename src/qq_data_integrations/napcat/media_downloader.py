@@ -2229,6 +2229,23 @@ class NapCatMediaDownloader:
             and self._fast_plugin_supports_forward_parent_metadata()
         )
         substep = "forward_context_materialize" if materialize else "forward_context_metadata"
+        if materialize and self._should_skip_forward_parent_expensive_timeout(
+            request,
+            route=substep,
+        ):
+            self._emit_asset_substep_trace(
+                trace_callback,
+                request,
+                stage="done",
+                substep=substep,
+                timeout_s=timeout_s,
+                status="cached_skip",
+                elapsed_s=0.0,
+                detail="skipped repeated forward expensive materialize after prior same-parent timeout",
+            )
+            self._prefetched_forward_media[key] = (None, None)
+            self._prefetched_forward_media_payloads[key] = None
+            return None
         if self._should_skip_forward_timeout_storm(
             request,
             route=substep,
@@ -2331,6 +2348,11 @@ class NapCatMediaDownloader:
             if timeout_cache_key is not None:
                 self._forward_context_timeout_cache.add(timeout_cache_key)
                 self._forward_context_payload_cache.pop(timeout_cache_key, None)
+            if materialize:
+                self._note_forward_parent_expensive_timeout(
+                    request,
+                    route=substep,
+                )
             self._note_forward_timeout_storm(
                 request,
                 route=substep,
@@ -2352,6 +2374,11 @@ class NapCatMediaDownloader:
             if timeout_cache_key is not None:
                 self._forward_context_error_cache.add(timeout_cache_key)
                 self._forward_context_payload_cache.pop(timeout_cache_key, None)
+            if materialize:
+                self._note_forward_parent_expensive_timeout_success(
+                    request,
+                    route=substep,
+                )
             self._note_remote_substep_progress(substep=substep, status="error")
             self._prefetched_forward_media[key] = (None, None)
             self._prefetched_forward_media_payloads[key] = None
@@ -2383,6 +2410,11 @@ class NapCatMediaDownloader:
                     self._forward_context_payload_cache[timeout_cache_key] = payload
                 else:
                     self._forward_context_payload_cache.pop(timeout_cache_key, None)
+        if materialize:
+            self._note_forward_parent_expensive_timeout_success(
+                request,
+                route=substep,
+            )
         assets = payload.get("assets") if isinstance(payload, dict) else None
         assets_list = assets if isinstance(assets, list) else []
         if not assets_list:
@@ -2786,6 +2818,10 @@ class NapCatMediaDownloader:
             request,
             action=normalized_action,
         )
+        parent_expensive_timeout_key = self._forward_parent_expensive_timeout_key(
+            request,
+            route=f"public_token_{normalized_action}",
+        )
         if (
             request_timeout_scope_key is not None
             and request_timeout_scope_key in self._request_scoped_public_action_timeout_cache
@@ -2816,6 +2852,22 @@ class NapCatMediaDownloader:
                     status="cached_skip",
                     elapsed_s=0.0,
                     detail="skipped repeated forward public token retry after prior same-parent timeout",
+                )
+            return None
+        if (
+            parent_expensive_timeout_key is not None
+            and parent_expensive_timeout_key in self._forward_parent_public_action_timeout_cache
+        ):
+            if request is not None:
+                self._emit_asset_substep_trace(
+                    trace_callback,
+                    request,
+                    stage="done",
+                    substep=f"public_token_{normalized_action}",
+                    timeout_s=self.PUBLIC_TOKEN_ACTION_TIMEOUT_S,
+                    status="cached_skip",
+                    elapsed_s=0.0,
+                    detail="skipped repeated forward expensive retry after prior same-parent timeout",
                 )
             return None
         known_bad_token = self._known_bad_public_tokens.get((normalized_action, token))
@@ -2918,6 +2970,11 @@ class NapCatMediaDownloader:
                 self._request_scoped_public_action_timeout_cache.add(request_timeout_scope_key)
             if parent_timeout_scope_key is not None:
                 self._forward_parent_public_action_timeout_cache.add(parent_timeout_scope_key)
+            if parent_expensive_timeout_key is not None:
+                self._note_forward_parent_expensive_timeout(
+                    request,
+                    route=primary_substep,
+                )
             self._public_token_action_outcomes[cache_key] = None
             self._note_forward_timeout_storm(
                 request,
@@ -2959,6 +3016,11 @@ class NapCatMediaDownloader:
                 self._public_token_action_outcomes[cache_key] = payload
                 if parent_timeout_scope_key is not None:
                     self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
+                if parent_expensive_timeout_key is not None:
+                    self._note_forward_parent_expensive_timeout_success(
+                        request,
+                        route=primary_substep,
+                    )
                 return payload
             payload = None
         else:
@@ -2990,6 +3052,11 @@ class NapCatMediaDownloader:
             self._public_token_action_outcomes[cache_key] = payload
             if parent_timeout_scope_key is not None:
                 self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
+            if parent_expensive_timeout_key is not None:
+                self._note_forward_parent_expensive_timeout_success(
+                    request,
+                    route=primary_substep,
+                )
             return payload
 
         # Compatibility fallback for runtimes that still expect `file_id`.
@@ -3037,6 +3104,11 @@ class NapCatMediaDownloader:
                 self._request_scoped_public_action_timeout_cache.add(request_timeout_scope_key)
             if parent_timeout_scope_key is not None:
                 self._forward_parent_public_action_timeout_cache.add(parent_timeout_scope_key)
+            if parent_expensive_timeout_key is not None:
+                self._note_forward_parent_expensive_timeout(
+                    request,
+                    route=primary_substep,
+                )
             self._public_token_action_outcomes[cache_key] = None
             return None
         except NapCatApiError as exc:
@@ -3074,6 +3146,11 @@ class NapCatMediaDownloader:
                 self._public_token_action_outcomes[cache_key] = payload
                 if parent_timeout_scope_key is not None:
                     self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
+                if parent_expensive_timeout_key is not None:
+                    self._note_forward_parent_expensive_timeout_success(
+                        request,
+                        route=primary_substep,
+                    )
                 self._note_forward_timeout_storm_success(
                     request,
                     route=primary_substep,
@@ -3082,6 +3159,11 @@ class NapCatMediaDownloader:
             self._public_token_action_outcomes[cache_key] = None
             if parent_timeout_scope_key is not None:
                 self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
+            if parent_expensive_timeout_key is not None:
+                self._note_forward_parent_expensive_timeout_success(
+                    request,
+                    route=primary_substep,
+                )
             self._note_forward_timeout_storm_success(
                 request,
                 route=primary_substep,
@@ -3115,6 +3197,11 @@ class NapCatMediaDownloader:
         self._public_token_action_outcomes[cache_key] = payload
         if parent_timeout_scope_key is not None:
             self._forward_parent_public_action_timeout_cache.discard(parent_timeout_scope_key)
+        if parent_expensive_timeout_key is not None:
+            self._note_forward_parent_expensive_timeout_success(
+                request,
+                route=primary_substep,
+            )
         self._note_forward_timeout_storm_success(
             request,
             route=primary_substep,
@@ -5495,6 +5582,39 @@ class NapCatMediaDownloader:
         self._forward_timeout_storm_counts.pop(storm_key, None)
         self._forward_timeout_storm_open.discard(storm_key)
 
+    def _should_skip_forward_parent_expensive_timeout(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> bool:
+        parent_key = self._forward_parent_expensive_timeout_key(request, route=route)
+        if parent_key is None:
+            return False
+        return parent_key in self._forward_parent_public_action_timeout_cache
+
+    def _note_forward_parent_expensive_timeout(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> None:
+        parent_key = self._forward_parent_expensive_timeout_key(request, route=route)
+        if parent_key is None:
+            return
+        self._forward_parent_public_action_timeout_cache.add(parent_key)
+
+    def _note_forward_parent_expensive_timeout_success(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> None:
+        parent_key = self._forward_parent_expensive_timeout_key(request, route=route)
+        if parent_key is None:
+            return
+        self._forward_parent_public_action_timeout_cache.discard(parent_key)
+
     def _forward_timeout_storm_key(
         self,
         request: dict[str, Any] | None,
@@ -5554,6 +5674,46 @@ class NapCatMediaDownloader:
             if normalized == "forward_context_metadata":
                 return "forward_meta"
         return normalized
+
+    def _forward_parent_expensive_timeout_key(
+        self,
+        request: dict[str, Any] | None,
+        *,
+        route: str,
+    ) -> tuple[str, ...] | None:
+        if not isinstance(request, dict):
+            return None
+        normalized_route = str(route or "").strip().lower()
+        if normalized_route not in {"public_token_get_file", "forward_context_materialize"}:
+            return None
+        hint = self._request_hint(request)
+        if not self._has_forward_parent_hint(hint):
+            return None
+        asset_type = str(request.get("asset_type") or "").strip().lower()
+        if asset_type not in {"video", "file"}:
+            return None
+        raw_timestamp = request.get("timestamp_ms")
+        if not isinstance(raw_timestamp, (int, float)):
+            return None
+        try:
+            asset_dt = datetime.fromtimestamp(float(raw_timestamp) / 1000.0, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+        if datetime.now(timezone.utc) - asset_dt < timedelta(
+            days=self.FORWARD_TIMEOUT_STORM_MIN_AGE_DAYS
+        ):
+            return None
+        parent = hint.get("_forward_parent")
+        assert isinstance(parent, dict)
+        return (
+            "forward_parent_expensive_timeout",
+            str(parent.get("message_id_raw") or "").strip(),
+            str(parent.get("element_id") or "").strip(),
+            str(parent.get("peer_uid") or "").strip(),
+            str(parent.get("chat_type_raw") or "").strip(),
+            asset_type,
+            str(request.get("asset_role") or "").strip().lower(),
+        )
 
     def _classify_forward_missing(
         self,

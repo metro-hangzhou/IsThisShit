@@ -104,8 +104,8 @@ class NapCatBootstrapper:
                         + _napcat_log_hint(result.napcat_log_path or webui_result.napcat_log_path)
                     ),
                 )
-            login_info = client.get_login_info()
-            if not login_info.is_usable_session():
+            login_info = _get_login_info_if_available(client)
+            if login_info is not None and not login_info.is_usable_session():
                 return NapCatStartResult(
                     endpoint=endpoint,
                     attempted_start=result.attempted_start or webui_result.attempted_start,
@@ -201,6 +201,13 @@ def _default_webui_client_factory(settings: NapCatSettings) -> NapCatWebUiClient
 
 def _default_probe(name: str, url: str, timeout: float):
     return probe_endpoint(name, url, timeout=timeout)
+
+
+def _get_login_info_if_available(client: Any):
+    get_login_info = getattr(client, "get_login_info", None)
+    if not callable(get_login_info):
+        return None
+    return get_login_info()
 
 
 def _endpoint_url(settings: NapCatSettings, endpoint: EndpointName) -> str:

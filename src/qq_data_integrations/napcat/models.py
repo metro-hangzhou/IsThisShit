@@ -87,6 +87,13 @@ class NapCatLoginInfo(BaseModel):
     online: bool | None = None
     avatar_url: str | None = None
 
+    def is_usable_session(self) -> bool:
+        return bool(
+            (self.uin or "").strip()
+            or (self.nick or "").strip()
+            or self.online is True
+        )
+
 
 class NapCatQuickLoginAccount(BaseModel):
     uin: str
