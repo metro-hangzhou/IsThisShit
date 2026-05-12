@@ -29,14 +29,10 @@
 /licensing-drafts/
 /review_editor_human_feedback_list/
 /runtime_site_packages/
-/NapCat/config.json
-/NapCat/napcat/cache/
-/NapCat/napcat/config/
-/NapCat/napcat/config/webui.json
-/NapCat/napcat/config/onebot11_*.json
-/NapCat/napcat/config/napcat_protocol_*.json
-/NapCat/napcat/config/napcat_*.json
-/NapCat/napcat/static/assets/
+# Local NapCat runtime worktree. The parent repository references upstream
+# runtime through the NapCatQQ submodule and keeps our fast plugin under
+# /plugins/napcat-plugin-qq-data-fast instead of tracking runtime binaries.
+/NapCat/
 /apps/*/node_modules/
 /apps/*/dist/
 /apps/*/state/

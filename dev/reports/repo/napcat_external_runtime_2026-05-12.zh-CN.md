@@ -17,23 +17,25 @@ Parent repo reference:
 
 - `NapCatQQ` is now registered in `.gitmodules` as a submodule.
 - Root `.gitignore` no longer ignores `/NapCatQQ/`, because Git must be able to track the submodule gitlink.
+- Root `.gitignore` now ignores `/NapCat/`; this path is reserved as a local runtime workdir.
+- Existing parent-repo tracked `NapCat/` runtime files were removed from the parent Git index with `git rm --cached`.
 - The project-owned fast history plugin has been copied out of the runtime tree into:
   - `plugins/napcat-plugin-qq-data-fast/`
 
 ## What did not change
 
-- Existing tracked `NapCat/` runtime files were not deleted, moved, or removed from Git index.
+- Existing local `NapCat/` runtime files were not physically deleted or moved.
 - Existing local dirty changes inside `NapCatQQ` were not modified.
 - Existing local runtime config/cache files were not touched.
 
 ## Follow-up migration
 
-The next safe migration step is separate and requires explicit approval:
+The next safe migration steps are separate:
 
-1. Decide whether `NapCat/` should remain as a local ignored runtime workdir or be replaced by `NapCatQQ` directly.
-2. If replacing/removing tracked `NapCat/` runtime files, use Git index operations and native shell commands only after approval.
-3. Update launcher/bootstrap docs and scripts to install or sync `plugins/napcat-plugin-qq-data-fast/` into the active NapCat runtime plugin directory.
-4. Validate with a live NapCat restart because plugin route changes are not hot-loaded.
+1. Keep `NapCat/` as a local ignored runtime workdir unless a release task explicitly replaces it.
+2. Update launcher/bootstrap docs and scripts to install or sync `plugins/napcat-plugin-qq-data-fast/` into the active NapCat runtime plugin directory.
+3. Validate with a live NapCat restart because plugin route changes are not hot-loaded.
+4. If runtime files ever need to be removed from disk, ask for explicit approval first.
 
 ## Known caveat
 
