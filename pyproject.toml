@@ -67,3 +67,21 @@ explicit = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+addopts = "--basetemp=state/test_tmp/pytest"
+testpaths = ["tests"]
+norecursedirs = [
+    ".git",
+    ".venv",
+    ".tmp",
+    ".tmp*",
+    "tmp*",
+    "pytest-cache-files-*",
+    "python_runtime",
+    "runtime_site_packages",
+    "state",
+    "dev/archive",
+    "subrepos",
+    "NapCat",
+    "NapCatQQ",
+    "apps",
+]

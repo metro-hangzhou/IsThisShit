@@ -29,6 +29,7 @@
 /licensing-drafts/
 /review_editor_human_feedback_list/
 /runtime_site_packages/
+/python_runtime/
 # Local NapCat runtime worktree. The parent repository references upstream
 # runtime through the NapCatQQ submodule and keeps our fast plugin under
 # /plugins/napcat-plugin-qq-data-fast instead of tracking runtime binaries.
@@ -43,6 +44,72 @@
 /apps/*/coverage/
 /apps/**/*.bak-*
 /apps/*/src-tauri/target/
+
+# Local ORCH/Agent implementation worktree. The tracked standalone app now
+# lives in /subrepos/orch-agent; the parent repo only keeps exporter/runtime
+# code plus submodule references.
+/src/qq_data_analysis/
+/src/qq_data_process/
+/src/surfaces/
+
+# ORCH/Agent scripts and tests live in /subrepos/orch-agent. Keep local copies
+# usable during migration, but do not stage them into the exporter parent repo.
+/scripts/build_benshi_*.py
+/scripts/build_judgment_policy_slice.py
+/scripts/domains/
+/scripts/finalize_benshi_review_run.py
+/scripts/ingest_judgment_policy_patch.py
+/scripts/init_judgment_policy_state.py
+/scripts/inspect_review_candidate_forward.py
+/scripts/inspect_review_candidate_llm_reasoning.py
+/scripts/llm_multimodal_smoke.py
+/scripts/materialize_batch_review_feedback_list.py
+/scripts/materialize_chat_orchestrator_review_packets.py
+/scripts/parse_benshi_review_packets.py
+/scripts/preview_rag.py
+/scripts/profile_logic_test_buckets.py
+/scripts/promote_judgment_policy_state.py
+/scripts/run_analysis.py
+/scripts/run_benshi_*.py
+/scripts/run_chat_orchestrator.py
+/scripts/run_corpus_batch_suite.py
+/scripts/run_llm_analysis.py
+/scripts/run_llm_window_analysis.py
+/scripts/run_local_corpus_analysis_smoke.py
+/scripts/run_openai_compatible_live_benchmark.py
+/scripts/run_orch_calibration_suite.py
+/scripts/run_preprocess.py
+/scripts/run_rag_query.py
+/scripts/run_review_editor_server.py
+/scripts/run_review_editor_static_server.py
+/scripts/start_mock_llm_session.py
+/scripts/update_benshi_posterior.py
+
+/tests/domains/
+/tests/test_analysis_*.py
+/tests/test_benshi_*.py
+/tests/test_chat_orchestrator_*.py
+/tests/test_chunk_policies.py
+/tests/test_corpus_batch_suite.py
+/tests/test_diagnostics.py
+/tests/test_embedding_*.py
+/tests/test_final_report_view.py
+/tests/test_full_chain_profile_warnings.py
+/tests/test_judgment_policy.py
+/tests/test_llm_*.py
+/tests/test_llm_session_*.py
+/tests/test_local_corpora*.py
+/tests/test_local_corpus_*.py
+/tests/test_local_testdata_corpora.py
+/tests/test_orch_*.py
+/tests/test_preprocess_*.py
+/tests/test_program_workbench_contract.py
+/tests/test_rag_retrieval.py
+/tests/test_relation_graph_assets.py
+/tests/test_review_*.py
+/tests/test_run_chat_orchestrator_script.py
+/tests/test_run_review_editor_server.py
+/tests/test_runtime_control.py
 /src/qq_data_cli/exports/
 /src/qq_data_cli/state/
 /src/**/*.egg-info/
