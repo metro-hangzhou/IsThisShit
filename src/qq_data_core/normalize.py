@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 from datetime import datetime
@@ -31,6 +32,7 @@ FORWARD_ELEMENT = 16
 FORWARD_TOKEN = "[forward message]"
 XML_TAG_RE = re.compile(r"<[^>]+>")
 HEX_MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+NON_DIGIT_RE = re.compile(r"\D+")
 
 
 def _safe_mapping(value: Any) -> dict[str, Any]:
@@ -51,24 +53,33 @@ def _message_sender(payload: dict[str, Any]) -> dict[str, Any]:
     return _safe_mapping(payload.get("sender"))
 
 
-def _parse_timestamp(payload: dict[str, Any]) -> datetime:
+def _parse_timestamp(
+    payload: dict[str, Any],
+    *,
+    fallback_timestamp: datetime | None = None,
+) -> datetime:
     raw_message = _message_raw(payload)
     timestamp = payload.get("timestamp")
     if isinstance(timestamp, str):
-        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(
-            EXPORT_TIMEZONE
-        )
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=EXPORT_TIMEZONE)
+        return parsed.astimezone(EXPORT_TIMEZONE)
     epoch_seconds = (
         payload.get("time")
         or raw_message.get("msgTime")
     )
     if epoch_seconds is None:
-        return datetime.now(EXPORT_TIMEZONE)
+        return fallback_timestamp or datetime.now(EXPORT_TIMEZONE)
     return datetime.fromtimestamp(int(epoch_seconds), tz=EXPORT_TIMEZONE)
 
 
 def _clean_text(value: str | None) -> str:
     return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _clean_numeric_id(value: Any) -> str:
+    return NON_DIGIT_RE.sub("", _clean_text(str(value or "")).strip())
 
 
 def _infer_md5(*values: Any) -> str | None:
@@ -101,6 +112,13 @@ def _truncate_preview(value: str | None, *, max_length: int = 280) -> str:
     if len(text) <= max_length:
         return text
     return text[: max_length - 1].rstrip() + "…"
+
+
+def _build_qq_avatar_url(uin: Any) -> str | None:
+    numeric_id = _clean_numeric_id(uin)
+    if not numeric_id:
+        return None
+    return f"https://q.qlogo.cn/headimg_dl?dst_uin={numeric_id}&spec=0&img_type=jpg"
 
 
 def _build_marketface_remote(emoji_id: str | None) -> tuple[str | None, str | None]:
@@ -350,79 +368,214 @@ def _merge_parent_context(
     }
 
 
+def _forward_node_timestamp_iso(
+    raw_node: dict[str, Any],
+    raw_nested_message: dict[str, Any],
+) -> str | None:
+    raw_timestamp = raw_node.get("timestamp")
+    if isinstance(raw_timestamp, str):
+        try:
+            return datetime.fromisoformat(
+                raw_timestamp.replace("Z", "+00:00")
+            ).astimezone(EXPORT_TIMEZONE).isoformat()
+        except ValueError:
+            pass
+    epoch_seconds = raw_node.get("time") or raw_nested_message.get("msgTime")
+    if epoch_seconds in {None, ""}:
+        return None
+    try:
+        return datetime.fromtimestamp(int(epoch_seconds), tz=EXPORT_TIMEZONE).isoformat()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _forward_node_identity(
+    *,
+    raw_node: dict[str, Any],
+    data: dict[str, Any],
+    sender: dict[str, Any],
+    raw_nested_message: dict[str, Any],
+) -> dict[str, Any]:
+    sender_id = _clean_text(
+        data.get("user_id")
+        or data.get("sender_id")
+        or data.get("uin")
+        or raw_node.get("user_id")
+        or raw_node.get("sender_id")
+        or sender.get("user_id")
+        or sender.get("uin")
+    ).strip()
+    sender_name = (
+        _clean_text(
+            data.get("nickname")
+            or data.get("name")
+            or sender.get("nickname")
+            or sender.get("card")
+            or raw_node.get("nickname")
+            or raw_node.get("sender_name")
+        ).strip()
+        or None
+    )
+
+    raw_sender_id = (
+        _clean_text(raw_nested_message.get("senderUin")).strip()
+        or sender_id
+        or None
+    )
+    raw_sender_name = (
+        _clean_text(
+            raw_nested_message.get("sendMemberName")
+            or raw_nested_message.get("sendRemarkName")
+            or raw_nested_message.get("sendNickName")
+        ).strip()
+        or sender_name
+    )
+    avatar_url = (
+        _clean_text(
+            raw_node.get("avatar_url")
+            or raw_node.get("avatarUrl")
+            or raw_node.get("headUrl")
+            or raw_node.get("head_url")
+            or raw_node.get("avatar")
+            or sender.get("avatar_url")
+            or sender.get("avatarUrl")
+            or sender.get("headUrl")
+            or sender.get("head_url")
+            or sender.get("avatar")
+            or raw_nested_message.get("avatar")
+            or raw_nested_message.get("headUrl")
+        ).strip()
+        or _build_qq_avatar_url(raw_sender_id or sender_id)
+    )
+    alias_sender_id = sender_id if sender_id and sender_id != raw_sender_id else None
+    alias_sender_name = (
+        sender_name if sender_name and sender_name != raw_sender_name else None
+    )
+    return {
+        "sender_id": sender_id or raw_sender_id or None,
+        "sender_name": sender_name or raw_sender_name,
+        "raw_sender_id": raw_sender_id,
+        "raw_sender_name": raw_sender_name,
+        "alias_sender_id": alias_sender_id,
+        "alias_sender_name": alias_sender_name,
+        "avatar_url": avatar_url or None,
+    }
+
+
 def _normalize_forward_nodes(
     raw_nodes: Any,
     *,
     inherited_parent_context: dict[str, Any] | None = None,
-) -> tuple[list[dict[str, Any]], str, int, int]:
+) -> tuple[list[dict[str, Any]], str, str, int, int]:
     if not isinstance(raw_nodes, list):
-        return [], "", 0, 0
+        return [], "", "", 0, 0
 
     normalized_nodes: list[dict[str, Any]] = []
-    text_parts: list[str] = []
+    content_detail_parts: list[str] = []
+    text_detail_parts: list[str] = []
     for raw_node in raw_nodes:
         if not isinstance(raw_node, dict):
             continue
         if raw_node.get("type") == "node":
             data = raw_node.get("data") or {}
+            raw_nested_message = _message_raw(data)
             nested_message = {
                 "message": data.get("message") or data.get("content") or [],
             }
-            sender_id = _clean_text(
-                data.get("user_id") or data.get("sender_id") or data.get("uin")
+            (
+                segments,
+                image_file_names,
+                uploaded_file_names,
+                emoji_tokens,
+                content_parts,
+                text_content,
+                _reply_to,
+            ) = _normalize_onebot_segments(
+                nested_message,
+                inherited_parent_context=inherited_parent_context,
             )
-            sender_name = _clean_text(data.get("nickname") or data.get("name")) or None
+            sender_identity = _forward_node_identity(
+                raw_node=raw_node,
+                data=data,
+                sender={},
+                raw_nested_message=raw_nested_message,
+            )
         else:
             data = raw_node
             sender = raw_node.get("sender") or {}
-            nested_message = {"message": raw_node.get("message") or []}
-            sender_id = _clean_text(
-                raw_node.get("user_id")
-                or raw_node.get("sender_id")
-                or sender.get("user_id")
-                or sender.get("uin")
-            )
-            sender_name = (
-                _clean_text(
-                    sender.get("nickname")
-                    or sender.get("card")
-                    or raw_node.get("nickname")
-                    or raw_node.get("sender_name")
+            raw_nested_message = _message_raw(raw_node)
+            if raw_nested_message:
+                nested_message = {
+                    "raw_message": raw_nested_message,
+                    "message_id": raw_node.get("message_id"),
+                    "message_seq": raw_node.get("message_seq"),
+                    "user_id": raw_node.get("user_id"),
+                    "sender": raw_node.get("sender"),
+                }
+                (
+                    segments,
+                    image_file_names,
+                    uploaded_file_names,
+                    emoji_tokens,
+                    content_parts,
+                    text_content,
+                    _reply_to,
+                ) = _normalize_exporter_elements(nested_message)
+            else:
+                nested_message = {"message": raw_node.get("message") or []}
+                (
+                    segments,
+                    image_file_names,
+                    uploaded_file_names,
+                    emoji_tokens,
+                    content_parts,
+                    text_content,
+                    _reply_to,
+                ) = _normalize_onebot_segments(
+                    nested_message,
+                    inherited_parent_context=inherited_parent_context,
                 )
-                or None
+            sender_identity = _forward_node_identity(
+                raw_node=raw_node,
+                data=data,
+                sender=sender,
+                raw_nested_message=raw_nested_message,
             )
-        (
-            segments,
-            image_file_names,
-            uploaded_file_names,
-            emoji_tokens,
-            content_parts,
-            text_content,
-            _reply_to,
-        ) = _normalize_onebot_segments(
-            nested_message,
-            inherited_parent_context=inherited_parent_context,
-        )
         content = " ".join(part for part in content_parts if part).strip()
-        node_text = content or text_content
         normalized_node = {
-            "sender_id": sender_id or None,
-            "sender_name": sender_name,
+            "sender_id": sender_identity.get("sender_id"),
+            "sender_name": sender_identity.get("sender_name"),
+            "raw_sender_id": sender_identity.get("raw_sender_id"),
+            "raw_sender_name": sender_identity.get("raw_sender_name"),
+            "alias_sender_id": sender_identity.get("alias_sender_id"),
+            "alias_sender_name": sender_identity.get("alias_sender_name"),
+            "avatar_url": sender_identity.get("avatar_url"),
             "content": content,
-            "text_content": node_text,
+            "text_content": text_content,
+            "timestamp_iso": _forward_node_timestamp_iso(raw_node, raw_nested_message),
             "image_file_names": image_file_names,
             "uploaded_file_names": uploaded_file_names,
             "emoji_tokens": emoji_tokens,
             "segments": [_segment_dump(segment) for segment in segments],
+            "reply_to": _reply_to.model_dump(mode="json") if _reply_to is not None else None,
         }
         normalized_nodes.append(normalized_node)
-        if node_text:
-            prefix = sender_name or sender_id
-            text_parts.append(f"{prefix}: {node_text}" if prefix else node_text)
+        prefix = (
+            normalized_node.get("raw_sender_name")
+            or normalized_node.get("sender_name")
+            or normalized_node.get("raw_sender_id")
+            or normalized_node.get("sender_id")
+        )
+        if content:
+            content_detail_parts.append(f"{prefix}: {content}" if prefix else content)
+        if text_content:
+            text_detail_parts.append(f"{prefix}: {text_content}" if prefix else text_content)
 
-    flattened_text = "\n".join(part for part in text_parts if part).strip()
+    flattened_content = "\n".join(part for part in content_detail_parts if part).strip()
+    flattened_text = "\n".join(part for part in text_detail_parts if part).strip()
     return (
         normalized_nodes,
+        flattened_content,
         flattened_text,
         len(normalized_nodes),
         _forward_detail_depth(normalized_nodes),
@@ -442,6 +595,21 @@ def _extract_onebot_segments(message: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(payload, list):
         return payload
     return []
+
+
+def _onebot_segments_have_expanded_forward_content(message: dict[str, Any]) -> bool:
+    for segment in _extract_onebot_segments(message):
+        if not isinstance(segment, dict):
+            continue
+        segment_type = str(segment.get("type") or "").strip().lower()
+        data = _safe_mapping(segment.get("data"))
+        if segment_type == "node":
+            if isinstance(data.get("message") or data.get("content"), list):
+                return True
+        if segment_type == "forward":
+            if isinstance(data.get("content") or data.get("message"), list):
+                return True
+    return False
 
 
 def _extract_onebot_parent_context(message: dict[str, Any]) -> dict[str, Any]:
@@ -684,12 +852,14 @@ def _normalize_exporter_elements(
             preview_text = parsed_forward["preview_text"]
             (
                 forward_messages,
+                detailed_content,
                 detailed_text,
                 forwarded_count,
                 forward_depth,
             ) = _normalize_forward_nodes(
                 forward.get("messages") or forward.get("content") or []
             )
+            forward_content = detailed_content or preview_text
             forward_text = detailed_text or preview_text
             segments.append(
                 NormalizedSegment(
@@ -712,14 +882,16 @@ def _normalize_exporter_elements(
                         or forwarded_count
                         or None,
                         "forward_messages": forward_messages,
+                        "detailed_content": detailed_content or None,
                         "detailed_text": detailed_text or None,
                         "forward_depth": forward_depth,
                     },
                 )
             )
             content_parts.append(FORWARD_TOKEN)
+            if forward_content:
+                content_parts.append(forward_content)
             if forward_text:
-                content_parts.append(forward_text)
                 text_parts.append(forward_text)
             continue
 
@@ -801,16 +973,24 @@ def _normalize_exporter_elements(
 
         if element_type == REPLY_ELEMENT:
             reply = element.get("replyElement", {})
+            reply_text = _clean_text(
+                reply.get("content") or reply.get("summary") or reply.get("text")
+            )
             segments.append(
                 NormalizedSegment(
                     type="reply",
+                    text=reply_text or None,
                     extra={
                         "sender_uid": reply.get("senderUid"),
                         "reply_msg_time": reply.get("replyMsgTime"),
                         "reply_msg_id": reply.get("replayMsgId"),
+                        "reply_text": reply_text or None,
                     },
                 )
             )
+            if reply_text:
+                content_parts.append(reply_text)
+                text_parts.append(reply_text)
             if reply_to is None:
                 reply_to = _build_reply_ref(message, reply)
             continue
@@ -825,7 +1005,7 @@ def _normalize_exporter_elements(
         content_parts.append(f"[unsupported:{element_type}]")
 
     content = " ".join(part for part in content_parts if part).strip()
-    text_content = "".join(text_parts).strip()
+    text_content = " ".join(part for part in text_parts if part).strip()
     return (
         segments,
         image_file_names,
@@ -872,6 +1052,7 @@ def _normalize_onebot_segments(
         if segment_type == "node":
             (
                 forward_messages,
+                detailed_content,
                 detailed_text,
                 forwarded_count,
                 forward_depth,
@@ -890,6 +1071,7 @@ def _normalize_onebot_segments(
                         "peer_uid": parent_peer_uid,
                         "chat_type_raw": parent_chat_type_raw,
                         "forward_messages": forward_messages,
+                        "detailed_content": detailed_content or None,
                         "detailed_text": detailed_text or None,
                         "forwarded_count": forwarded_count or None,
                         "forward_depth": forward_depth,
@@ -897,8 +1079,9 @@ def _normalize_onebot_segments(
                 )
             )
             content_parts.append(FORWARD_TOKEN)
+            if detailed_content:
+                content_parts.append(detailed_content)
             if detailed_text:
-                content_parts.append(detailed_text)
                 text_parts.append(detailed_text)
             continue
 
@@ -962,9 +1145,11 @@ def _normalize_onebot_segments(
                     token=token,
                     file_name=file_name,
                     path=data.get("path"),
+                    md5=_infer_md5(data.get("md5"), data.get("file"), file_name),
                     extra={
                         "url": data.get("url"),
                         "file_id": data.get("file_id"),
+                        "file_biz_id": data.get("file_biz_id") or data.get("fileBizId"),
                         "message_id_raw": parent_message_id_raw,
                         "element_id": parent_forward_element_id,
                         "peer_uid": parent_peer_uid,
@@ -1035,6 +1220,7 @@ def _normalize_onebot_segments(
             )
             (
                 forward_messages,
+                detailed_content,
                 detailed_text,
                 forwarded_count,
                 forward_depth,
@@ -1042,6 +1228,7 @@ def _normalize_onebot_segments(
                 data.get("content") or [],
                 inherited_parent_context=parent_context,
             )
+            forward_content = detailed_content or preview_text
             forward_text = detailed_text or preview_text
             segments.append(
                 NormalizedSegment(
@@ -1056,6 +1243,7 @@ def _normalize_onebot_segments(
                         "forward_id": data.get("id") or data.get("resid"),
                         "preview_text": preview_text or None,
                         "forward_messages": forward_messages,
+                        "detailed_content": detailed_content or None,
                         "detailed_text": detailed_text or None,
                         "forwarded_count": forwarded_count or None,
                         "forward_depth": forward_depth,
@@ -1063,8 +1251,9 @@ def _normalize_onebot_segments(
                 )
             )
             content_parts.append(FORWARD_TOKEN)
+            if forward_content:
+                content_parts.append(forward_content)
             if forward_text:
-                content_parts.append(forward_text)
                 text_parts.append(forward_text)
             continue
 
@@ -1164,16 +1353,24 @@ def _normalize_onebot_segments(
             summary = _safe_summary(data.get("summary")) or "sticker"
             emoji_id = str(data.get("emoji_id") or "")
             package_id = data.get("emoji_package_id")
+            remote_url, remote_file_name = _build_marketface_remote(emoji_id)
             token = f"[sticker:summary={summary},emoji_id={emoji_id},package_id={package_id}]"
             emoji_tokens.append(token)
             segments.append(
                 NormalizedSegment(
                     type="sticker",
                     token=token,
+                    path=data.get("path") or data.get("file"),
                     emoji_id=emoji_id,
                     emoji_package_id=package_id,
                     summary=summary,
-                    extra={"key": data.get("key")},
+                    extra={
+                        "key": data.get("key"),
+                        "static_path": data.get("static_path"),
+                        "dynamic_path": data.get("dynamic_path"),
+                        "remote_url": data.get("remote_url") or remote_url,
+                        "remote_file_name": data.get("remote_file_name") or remote_file_name,
+                    },
                 )
             )
             content_parts.append(token)
@@ -1196,7 +1393,7 @@ def _normalize_onebot_segments(
         content_parts.append(f"[unsupported:{segment_type}]")
 
     content = " ".join(part for part in content_parts if part).strip()
-    text_content = "".join(text_parts).strip()
+    text_content = " ".join(part for part in text_parts if part).strip()
     return (
         segments,
         image_file_names,
@@ -1215,9 +1412,30 @@ def normalize_message(
     chat_id: str,
     chat_name: str | None = None,
     include_raw: bool = False,
+    fallback_timestamp: datetime | None = None,
 ) -> NormalizedMessage:
-    timestamp = _parse_timestamp(message)
-    if _extract_onebot_segments(message):
+    timestamp = _parse_timestamp(message, fallback_timestamp=fallback_timestamp)
+    if _onebot_segments_have_expanded_forward_content(message):
+        (
+            segments,
+            image_file_names,
+            uploaded_file_names,
+            emoji_tokens,
+            content_parts,
+            text_content,
+            reply_to,
+        ) = _normalize_onebot_segments(message)
+    elif _extract_exporter_elements(message):
+        (
+            segments,
+            image_file_names,
+            uploaded_file_names,
+            emoji_tokens,
+            content_parts,
+            text_content,
+            reply_to,
+        ) = _normalize_exporter_elements(message)
+    elif _extract_onebot_segments(message):
         (
             segments,
             image_file_names,
@@ -1290,7 +1508,9 @@ def normalize_message(
         segments=segments,
         reply_to=reply_to,
         extra=extra,
-        raw_message=message if include_raw else None,
+        # Keep a detached debug snapshot so later in-process mutation of the
+        # source payload cannot rewrite previously captured forensic/raw views.
+        raw_message=deepcopy(message) if include_raw else None,
     )
 
 
@@ -1299,6 +1519,7 @@ def normalize_snapshot(
     *,
     include_raw: bool = False,
 ) -> NormalizedSnapshot:
+    fallback_timestamp = snapshot.exported_at.astimezone(EXPORT_TIMEZONE)
     messages = [
         normalize_message(
             message,
@@ -1306,6 +1527,7 @@ def normalize_snapshot(
             chat_id=snapshot.chat_id,
             chat_name=snapshot.chat_name,
             include_raw=include_raw,
+            fallback_timestamp=fallback_timestamp,
         )
         for message in snapshot.messages
     ]
@@ -1314,6 +1536,6 @@ def normalize_snapshot(
         chat_id=snapshot.chat_id,
         chat_name=snapshot.chat_name,
         exported_at=snapshot.exported_at,
-        metadata=snapshot.metadata,
+        metadata=deepcopy(snapshot.metadata),
         messages=messages,
     )

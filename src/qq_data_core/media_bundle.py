@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PureWindowsPath
 from time import monotonic
 from typing import Any, Callable, Iterable, Literal
+from urllib.parse import urlparse
 
 import orjson
 
@@ -20,8 +21,10 @@ from .export_forensics import (
     ForensicsRecordResult,
 )
 from .models import ExportBundleResult, MaterializedAsset, NormalizedMessage, NormalizedSegment, NormalizedSnapshot
+from .paths import atomic_write_bytes, build_timestamp_token
 
 MATERIALIZE_SLOW_STEP_WARN_S = 5.0
+BUFFERED_COPY_CHUNK_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,8 @@ def write_export_bundle(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     forensics_collector: ExportForensicsCollector | None = None,
 ) -> ExportBundleResult:
+    stage_token = build_timestamp_token(include_pid=True)
+    staged_data_path = data_path.with_name(f".{data_path.name}.{stage_token}.tmp")
     if progress_callback is not None:
         progress_callback(
             {
@@ -69,61 +74,145 @@ def write_export_bundle(
                 "target_path": str(data_path),
             }
         )
-    written_data_path = write_data(snapshot, data_path)
-    if progress_callback is not None:
-        progress_callback(
+    staged_assets_dir = data_path.parent / f".{data_path.stem}_assets.{stage_token}.tmp"
+    manifest_path = data_path.with_suffix(".manifest.json")
+    final_assets_dir = data_path.parent / f"{data_path.stem}_assets"
+    try:
+        write_started = monotonic()
+        written_data_path = write_data(snapshot, staged_data_path)
+        write_elapsed_s = monotonic() - write_started
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "write_data_file",
+                    "stage": "done",
+                    "elapsed_s": round(write_elapsed_s, 4),
+                    "record_count": len(snapshot.messages),
+                    "target_path": str(data_path),
+                    "staged_path": str(written_data_path),
+                    "bytes_written": _safe_file_size(written_data_path),
+                }
+            )
+        materialize_started = monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.materialize_snapshot_media",
+                    "status": "start",
+                    "candidate_hint": len(snapshot.messages),
+                }
+            )
+        assets = materialize_snapshot_media(
+            snapshot,
+            staged_assets_dir,
+            media_resolution_mode=media_resolution_mode,
+            media_search_roots=media_search_roots,
+            media_cache_dir=media_cache_dir,
+            media_download_callback=media_download_callback,
+            media_download_manager=media_download_manager,
+            progress_callback=progress_callback,
+            forensics_collector=forensics_collector,
+        )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.materialize_snapshot_media",
+                    "status": "done",
+                    "elapsed_s": round(monotonic() - materialize_started, 4),
+                    "materialized_asset_count": len(assets),
+                }
+            )
+        summary = _summarize_assets(assets)
+        finalize_started = monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.finalize_output_files",
+                    "status": "start",
+                    "data_path": str(data_path),
+                    "assets_dir": str(final_assets_dir),
+                }
+            )
+        if data_path.exists():
+            data_path.unlink()
+        written_data_path.replace(data_path)
+        if final_assets_dir.exists():
+            shutil.rmtree(final_assets_dir)
+        if staged_assets_dir.exists():
+            shutil.move(str(staged_assets_dir), str(final_assets_dir))
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.finalize_output_files",
+                    "status": "done",
+                    "elapsed_s": round(monotonic() - finalize_started, 4),
+                    "data_path": str(data_path),
+                    "assets_dir": str(final_assets_dir),
+                    "materialized_asset_count": len(assets),
+                }
+            )
+        manifest_started = monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.write_manifest",
+                    "status": "start",
+                    "manifest_path": str(manifest_path),
+                }
+            )
+        _write_manifest_json(
+            manifest_path,
             {
-                "phase": "write_data_file",
-                "stage": "done",
+                "schema_version": 1,
+                "chat_type": snapshot.chat_type,
+                "chat_id": snapshot.chat_id,
+                "chat_name": snapshot.chat_name,
+                "exported_at": snapshot.exported_at.isoformat(),
                 "record_count": len(snapshot.messages),
-                "target_path": str(written_data_path),
-            }
-    )
-    assets_dir = written_data_path.parent / f"{written_data_path.stem}_assets"
-    manifest_path = written_data_path.with_suffix(".manifest.json")
-    assets = materialize_snapshot_media(
-        snapshot,
-        assets_dir,
-        media_resolution_mode=media_resolution_mode,
-        media_search_roots=media_search_roots,
-        media_cache_dir=media_cache_dir,
-        media_download_callback=media_download_callback,
-        media_download_manager=media_download_manager,
-        progress_callback=progress_callback,
-        forensics_collector=forensics_collector,
-    )
-    summary = _summarize_assets(assets)
-    _write_manifest_json(
-        manifest_path,
-        {
-        "schema_version": 1,
-        "chat_type": snapshot.chat_type,
-        "chat_id": snapshot.chat_id,
-        "chat_name": snapshot.chat_name,
-        "exported_at": snapshot.exported_at.isoformat(),
-        "record_count": len(snapshot.messages),
-        "metadata": snapshot.metadata,
-        "data_file": written_data_path.name,
-        "assets_dir": assets_dir.name,
-        "asset_summary": summary,
-        "missing_breakdown": _summarize_missing_breakdown(assets),
-        },
-        assets=assets,
-    )
-    return ExportBundleResult(
-        data_path=written_data_path,
-        manifest_path=manifest_path,
-        assets_dir=assets_dir,
-        record_count=len(snapshot.messages),
-        copied_asset_count=summary["copied"],
-        reused_asset_count=summary["reused"],
-        missing_asset_count=summary["missing"],
-        error_asset_count=summary["error"],
-        forensic_run_dir=forensics_collector.run_dir if forensics_collector is not None else None,
-        forensic_summary_path=forensics_collector.summary_path if forensics_collector is not None else None,
-        forensic_incident_count=forensics_collector.incident_count if forensics_collector is not None else 0,
-        assets=assets,
-    )
+                "metadata": snapshot.metadata,
+                "data_file": data_path.name,
+                "assets_dir": final_assets_dir.name,
+                "asset_summary": summary,
+                "missing_breakdown": _summarize_missing_breakdown(assets),
+            },
+            assets=assets,
+        )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "phase": "pipeline_stage",
+                    "stage": "bundle.write_manifest",
+                    "status": "done",
+                    "elapsed_s": round(monotonic() - manifest_started, 4),
+                    "manifest_path": str(manifest_path),
+                    "materialized_asset_count": len(assets),
+                }
+            )
+        return ExportBundleResult(
+            data_path=data_path,
+            manifest_path=manifest_path,
+            assets_dir=final_assets_dir,
+            record_count=len(snapshot.messages),
+            copied_asset_count=summary["copied"],
+            reused_asset_count=summary["reused"],
+            missing_asset_count=summary["missing"],
+            error_asset_count=summary["error"],
+            forensic_run_dir=forensics_collector.run_dir if forensics_collector is not None else None,
+            forensic_summary_path=forensics_collector.summary_path if forensics_collector is not None else None,
+            forensic_incident_count=forensics_collector.incident_count if forensics_collector is not None else 0,
+            assets=assets,
+        )
+    finally:
+        with suppress(OSError):
+            staged_data_path.unlink(missing_ok=True)
+        if staged_assets_dir.exists():
+            with suppress(OSError):
+                shutil.rmtree(staged_assets_dir)
 
 
 def materialize_snapshot_media(
@@ -143,6 +232,18 @@ def materialize_snapshot_media(
     for message in snapshot.messages:
         for candidate in _iter_asset_candidates(message):
             candidate_entries.append((message, candidate))
+    download_requests = [
+        {
+            "asset_type": candidate.asset_type,
+            "asset_role": candidate.asset_role,
+            "file_name": candidate.file_name,
+            "source_path": candidate.source_path,
+            "md5": candidate.md5,
+            "timestamp_ms": candidate.timestamp_ms,
+            "download_hint": candidate.download_hint,
+        }
+        for _message, candidate in candidate_entries
+    ]
     search_context: _MediaSearchContext | None = None
     if media_resolution_mode != "napcat_only":
         candidates = [candidate for _message, candidate in candidate_entries]
@@ -211,11 +312,11 @@ def materialize_snapshot_media(
                     }
                 )
     copied_map: dict[str, str] = {}
-    copied_content_map: dict[tuple[str, int, str], list[tuple[str, str]]] = {}
-    export_path_payloads: dict[str, tuple[Any, ...]] = {}
-    content_key_cache: dict[str, tuple[str, int, str] | None] = {}
-    content_match_cache: dict[tuple[str, str], bool] = {}
+    recent_identity_reuse_map: dict[tuple[Any, ...], tuple[str, str | None, str | None]] = {}
+    future_local_identity_map = _build_future_local_identity_resolution_map(candidate_entries)
+    occupied_export_paths: dict[str, str] = {}
     resolution_cache: dict[tuple[Any, ...], tuple[Path | None, str]] = {}
+    created_export_dirs: set[str] = set()
     assets: list[MaterializedAsset] = []
     second_pass_candidates: list[tuple[MaterializedAsset, _AssetCandidate]] = []
     copied_count = 0
@@ -232,7 +333,13 @@ def materialize_snapshot_media(
 
         def _candidate_trace_callback(payload: dict[str, Any]) -> None:
             if str(payload.get("phase") or "") == "materialize_asset_substep":
-                route_attempts.append(dict(payload))
+                enriched_payload = dict(payload)
+                enriched_payload.setdefault("current", current_index)
+                enriched_payload.setdefault("total", total_candidates)
+                route_attempts.append(enriched_payload)
+                if progress_callback is not None:
+                    progress_callback(enriched_payload)
+                return
             if progress_callback is not None:
                 progress_callback(payload)
 
@@ -243,6 +350,59 @@ def materialize_snapshot_media(
             total=total_candidates,
             candidate=candidate,
         )
+        identity_reuse = _lookup_recent_identity_reuse(
+            candidate,
+            recent_identity_reuse_map,
+        )
+        if identity_reuse is not None:
+            exported_rel_path, resolved_source_path, reused_resolver = identity_reuse
+            asset = MaterializedAsset(
+                message_id=message.message_id,
+                message_seq=message.message_seq,
+                sender_id=message.sender_id,
+                timestamp_iso=message.timestamp_iso,
+                asset_type=str(candidate.asset_type),
+                asset_role=candidate.asset_role,
+                file_name=candidate.file_name,
+                source_path=candidate.source_path,
+                resolved_source_path=resolved_source_path,
+                resolver=reused_resolver or "bundle_identity_reuse",
+                extra={
+                    "chat_id": message.chat_id,
+                    "chat_type": message.chat_type,
+                    "sender_name": message.sender_name,
+                },
+            )
+            asset.status = "reused"
+            asset.exported_rel_path = exported_rel_path
+            assets.append(asset)
+            reused_count += 1
+            step_elapsed_s = round(monotonic() - step_started, 4)
+            _emit_materialization_step_trace(
+                progress_callback,
+                stage="done",
+                current=len(assets),
+                total=total_candidates,
+                candidate=candidate,
+                status=asset.status,
+                resolver=asset.resolver,
+                resolved_source_path=asset.resolved_source_path,
+                step_elapsed_s=step_elapsed_s,
+            )
+            _emit_materialization_progress(
+                progress_callback,
+                current=len(assets),
+                total=total_candidates,
+                candidate=candidate,
+                copied=copied_count,
+                reused=reused_count,
+                missing=missing_count,
+                error=error_count,
+                status=asset.status,
+                resolver=asset.resolver,
+                step_elapsed_s=step_elapsed_s,
+            )
+            continue
         cache_key = _asset_resolution_cache_key(candidate)
         cached_resolution = resolution_cache.get(cache_key)
         if cached_resolution is None:
@@ -258,7 +418,14 @@ def materialize_snapshot_media(
                     file_name=candidate.file_name,
                     source_path=candidate.source_path,
                 )
-            if media_resolution_mode == "napcat_only":
+            future_local_identity = _lookup_future_local_identity_resolution(
+                candidate,
+                current_index=current_index,
+                future_identity_map=future_local_identity_map,
+            )
+            if future_local_identity is not None:
+                resolved_path, resolver = future_local_identity
+            elif media_resolution_mode == "napcat_only":
                 resolved_path, resolver = _resolve_candidate_path_napcat_only(
                     candidate,
                     media_download_manager=media_download_manager,
@@ -333,8 +500,7 @@ def materialize_snapshot_media(
             if (
                 media_resolution_mode == "napcat_only"
                 and media_download_manager is not None
-                and candidate.asset_type == "image"
-                and resolver == "missing_after_napcat"
+                and _candidate_has_second_pass_public_retry_evidence(candidate)
                 and hasattr(media_download_manager, "resolve_via_public_token_route")
             ):
                 second_pass_candidates.append((asset, candidate))
@@ -370,6 +536,12 @@ def materialize_snapshot_media(
         if dedupe_key in copied_map:
             asset.status = "reused"
             asset.exported_rel_path = copied_map[dedupe_key]
+            for identity_key in _asset_recent_identity_keys(candidate):
+                recent_identity_reuse_map[identity_key] = (
+                    asset.exported_rel_path,
+                    asset.resolved_source_path,
+                    asset.resolver,
+                )
             assets.append(asset)
             reused_count += 1
             step_elapsed_s = round(monotonic() - step_started, 4)
@@ -399,73 +571,62 @@ def materialize_snapshot_media(
             )
             continue
 
-        content_key = _content_dedupe_key(
+        allocate_started = monotonic()
+        rel_path = _allocate_export_rel_path(
             candidate,
             resolved_path,
-            cache=content_key_cache,
+            dedupe_key=dedupe_key,
+            occupied_export_paths=occupied_export_paths,
         )
-        # Content-level dedupe intentionally reuses the first successful export
-        # path for a payload, even if later references come from different local
-        # files or nominal names.
-        matched_rel_path = _matching_export_rel_path_for_content_key(
-            content_key=content_key,
-            resolved_path=resolved_path,
-            copied_content_map=copied_content_map,
-            compare_cache=content_match_cache,
-        )
-        if matched_rel_path is not None:
-            asset.status = "reused"
-            asset.exported_rel_path = matched_rel_path
-            copied_map[dedupe_key] = asset.exported_rel_path
-            assets.append(asset)
-            reused_count += 1
-            step_elapsed_s = round(monotonic() - step_started, 4)
-            _emit_materialization_step_trace(
-                progress_callback,
-                stage="done",
-                current=len(assets),
-                total=total_candidates,
-                candidate=candidate,
-                status=asset.status,
-                resolver=asset.resolver,
-                resolved_source_path=asset.resolved_source_path,
-                step_elapsed_s=step_elapsed_s,
-            )
-            _emit_materialization_progress(
-                progress_callback,
-                current=len(assets),
-                total=total_candidates,
-                candidate=candidate,
-                copied=copied_count,
-                reused=reused_count,
-                missing=missing_count,
-                error=error_count,
-                status=asset.status,
-                resolver=asset.resolver,
-                step_elapsed_s=step_elapsed_s,
-            )
-            continue
-
-        rel_path = _build_export_rel_path(candidate, resolved_path)
-        reuse_content_marker = content_key is not None and matched_rel_path is None and content_key not in copied_content_map
-        payload_marker = _payload_marker(
-            content_key=content_key if reuse_content_marker else None,
-            resolved_path_key=dedupe_key,
-        )
-        rel_path = _allocate_export_rel_path(
-            rel_path,
-            payload_marker=payload_marker,
-            used_payloads=export_path_payloads,
+        _emit_materialization_substep_trace(
+            progress_callback,
+            substep="allocate_export_path",
+            candidate=candidate,
+            elapsed_s=monotonic() - allocate_started,
+            source_path=str(resolved_path),
+            target_path=str(assets_dir / rel_path),
+            source_size_bytes=_safe_file_size(resolved_path),
         )
         target_path = assets_dir / rel_path
-        target_path.parent.mkdir(parents=True, exist_ok=True)
+        mkdir_started = monotonic()
+        _ensure_export_parent(target_path.parent, created_export_dirs)
+        _emit_materialization_substep_trace(
+            progress_callback,
+            substep="ensure_export_parent",
+            candidate=candidate,
+            elapsed_s=monotonic() - mkdir_started,
+            source_path=str(resolved_path),
+            target_path=str(target_path),
+        )
         try:
-            shutil.copy2(resolved_path, target_path)
+            copy_started = monotonic()
+            copy_stats = _copy_asset_file_fast(resolved_path, target_path)
+            copy_elapsed_s = monotonic() - copy_started
+            _emit_materialization_substep_trace(
+                progress_callback,
+                substep="copy_asset_file",
+                candidate=candidate,
+                elapsed_s=copy_elapsed_s,
+                source_path=str(resolved_path),
+                target_path=str(target_path),
+                source_size_bytes=_safe_file_size(resolved_path),
+                target_size_bytes=_safe_file_size(target_path),
+                resolver=asset.resolver,
+                copy_stats=copy_stats,
+            )
         except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
-            _release_allocated_export_rel_path(
-                rel_path,
-                payload_marker=payload_marker,
-                used_payloads=export_path_payloads,
+            _emit_materialization_substep_trace(
+                progress_callback,
+                substep="copy_asset_file",
+                candidate=candidate,
+                elapsed_s=monotonic() - copy_started,
+                status="error",
+                detail=str(exc),
+                source_path=str(resolved_path),
+                target_path=str(target_path),
+                source_size_bytes=_safe_file_size(resolved_path),
+                target_size_bytes=_safe_file_size(target_path),
+                resolver=asset.resolver,
             )
             asset.status = "error"
             asset.note = str(exc)
@@ -497,14 +658,27 @@ def materialize_snapshot_media(
                 resolver=asset.resolver,
                 step_elapsed_s=step_elapsed_s,
             )
+            if media_download_manager is not None:
+                snapshot = media_download_manager.export_download_progress_snapshot()
+                signature = tuple(sorted(snapshot.items()))
+                if signature != last_download_signature:
+                    _emit_download_queue_progress(
+                        progress_callback,
+                        stage="progress",
+                        snapshot=snapshot,
+                    )
+                    last_download_signature = signature
             continue
 
         asset.status = "copied"
         asset.exported_rel_path = rel_path.as_posix()
         copied_map[dedupe_key] = asset.exported_rel_path
-        if content_key is not None:
-            copied_content_map.setdefault(content_key, []).append(
-                (str(resolved_path.resolve()).lower(), asset.exported_rel_path)
+        occupied_export_paths[asset.exported_rel_path.casefold()] = dedupe_key
+        for identity_key in _asset_recent_identity_keys(candidate):
+            recent_identity_reuse_map[identity_key] = (
+                asset.exported_rel_path,
+                asset.resolved_source_path,
+                asset.resolver,
             )
         assets.append(asset)
         copied_count += 1
@@ -533,6 +707,16 @@ def materialize_snapshot_media(
             resolver=asset.resolver,
             step_elapsed_s=step_elapsed_s,
         )
+        if media_download_manager is not None:
+            snapshot = media_download_manager.export_download_progress_snapshot()
+            signature = tuple(sorted(snapshot.items()))
+            if signature != last_download_signature:
+                _emit_download_queue_progress(
+                    progress_callback,
+                    stage="progress",
+                    snapshot=snapshot,
+                )
+                last_download_signature = signature
 
     if second_pass_candidates:
         if progress_callback is not None:
@@ -545,6 +729,38 @@ def materialize_snapshot_media(
             )
         recovered_count = 0
         for asset, candidate in second_pass_candidates:
+            retry_started = monotonic()
+            identity_reuse = _lookup_recent_identity_reuse(
+                candidate,
+                recent_identity_reuse_map,
+            )
+            if identity_reuse is not None:
+                exported_rel_path, resolved_source_path, reused_resolver = identity_reuse
+                asset.resolved_source_path = resolved_source_path
+                asset.resolver = reused_resolver or "bundle_identity_reuse"
+                asset.missing_kind = None
+                asset.note = None
+                asset.status = "reused"
+                asset.exported_rel_path = exported_rel_path
+                missing_count -= 1
+                reused_count += 1
+                recovered_count += 1
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_identity_reuse",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - retry_started,
+                    source_path=resolved_source_path,
+                    target_path=exported_rel_path,
+                    resolver=asset.resolver,
+                )
+                continue
+            if asset.status != "missing":
+                continue
+            if not _asset_missing_kind_allows_second_pass_public_retry(asset.missing_kind):
+                continue
+            if not _candidate_has_second_pass_public_retry_evidence(candidate):
+                continue
             request_payload = {
                 "asset_type": candidate.asset_type,
                 "asset_role": candidate.asset_role,
@@ -554,15 +770,39 @@ def materialize_snapshot_media(
                 "timestamp_ms": candidate.timestamp_ms,
                 "download_hint": candidate.download_hint,
             }
+            if (
+                hasattr(media_download_manager, "should_attempt_second_pass_public_retry")
+                and not media_download_manager.should_attempt_second_pass_public_retry(request_payload)
+            ):
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_public_retry",
+                    candidate=candidate,
+                    elapsed_s=0.0,
+                    status="skip_no_new_evidence",
+                    detail="skipped repeated public token retry without pending prefetch result",
+                )
+                continue
             with suppress(Exception):
+                public_retry_started = monotonic()
                 resolved_path, resolver = media_download_manager.resolve_via_public_token_route(
                     request_payload
+                )
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_public_retry",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - public_retry_started,
+                    status="ok" if resolved_path is not None else "miss",
+                    source_path=str(resolved_path) if resolved_path is not None else None,
+                    resolver=resolver,
                 )
                 if resolved_path is None:
                     continue
                 dedupe_key = str(resolved_path).lower()
                 asset.resolved_source_path = str(resolved_path)
                 asset.resolver = resolver
+                asset.missing_kind = None
                 asset.note = None
                 if dedupe_key in copied_map:
                     asset.status = "reused"
@@ -570,59 +810,83 @@ def materialize_snapshot_media(
                     missing_count -= 1
                     reused_count += 1
                     recovered_count += 1
+                    _emit_materialization_substep_trace(
+                        progress_callback,
+                        substep="second_pass_reuse_copied_asset",
+                        candidate=candidate,
+                        elapsed_s=monotonic() - retry_started,
+                        source_path=str(resolved_path),
+                        target_path=asset.exported_rel_path,
+                        resolver=asset.resolver,
+                    )
                     continue
-                content_key = _content_dedupe_key(
+                allocate_started = monotonic()
+                rel_path = _allocate_export_rel_path(
                     candidate,
                     resolved_path,
-                    cache=content_key_cache,
+                    dedupe_key=dedupe_key,
+                    occupied_export_paths=occupied_export_paths,
                 )
-                matched_rel_path = _matching_export_rel_path_for_content_key(
-                    content_key=content_key,
-                    resolved_path=resolved_path,
-                    copied_content_map=copied_content_map,
-                    compare_cache=content_match_cache,
-                )
-                if matched_rel_path is not None:
-                    asset.status = "reused"
-                    asset.exported_rel_path = matched_rel_path
-                    copied_map[dedupe_key] = asset.exported_rel_path
-                    missing_count -= 1
-                    reused_count += 1
-                    recovered_count += 1
-                    continue
-                rel_path = _build_export_rel_path(candidate, resolved_path)
-                reuse_content_marker = content_key is not None and matched_rel_path is None and content_key not in copied_content_map
-                payload_marker = _payload_marker(
-                    content_key=content_key if reuse_content_marker else None,
-                    resolved_path_key=dedupe_key,
-                )
-                rel_path = _allocate_export_rel_path(
-                    rel_path,
-                    payload_marker=payload_marker,
-                    used_payloads=export_path_payloads,
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_allocate_export_path",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - allocate_started,
+                    source_path=str(resolved_path),
+                    target_path=str(assets_dir / rel_path),
+                    source_size_bytes=_safe_file_size(resolved_path),
+                    resolver=asset.resolver,
                 )
                 target_path = assets_dir / rel_path
-                target_path.parent.mkdir(parents=True, exist_ok=True)
+                mkdir_started = monotonic()
+                _ensure_export_parent(target_path.parent, created_export_dirs)
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_ensure_export_parent",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - mkdir_started,
+                    source_path=str(resolved_path),
+                    target_path=str(target_path),
+                    resolver=asset.resolver,
+                )
                 try:
-                    shutil.copy2(resolved_path, target_path)
+                    copy_started = monotonic()
+                    copy_stats = _copy_asset_file_fast(resolved_path, target_path)
                 except Exception as exc:  # pragma: no cover - hard to force all OS copy failures
-                    _release_allocated_export_rel_path(
-                        rel_path,
-                        payload_marker=payload_marker,
-                        used_payloads=export_path_payloads,
+                    _emit_materialization_substep_trace(
+                        progress_callback,
+                        substep="second_pass_copy_asset_file",
+                        candidate=candidate,
+                        elapsed_s=monotonic() - copy_started,
+                        status="error",
+                        detail=str(exc),
+                        source_path=str(resolved_path),
+                        target_path=str(target_path),
+                        source_size_bytes=_safe_file_size(resolved_path),
+                        target_size_bytes=_safe_file_size(target_path),
+                        resolver=asset.resolver,
                     )
                     asset.status = "error"
                     asset.note = str(exc)
                     missing_count -= 1
                     error_count += 1
                     continue
+                _emit_materialization_substep_trace(
+                    progress_callback,
+                    substep="second_pass_copy_asset_file",
+                    candidate=candidate,
+                    elapsed_s=monotonic() - copy_started,
+                    source_path=str(resolved_path),
+                    target_path=str(target_path),
+                    source_size_bytes=_safe_file_size(resolved_path),
+                    target_size_bytes=_safe_file_size(target_path),
+                    resolver=asset.resolver,
+                    copy_stats=copy_stats,
+                )
                 asset.status = "copied"
                 asset.exported_rel_path = rel_path.as_posix()
                 copied_map[dedupe_key] = asset.exported_rel_path
-                if content_key is not None:
-                    copied_content_map.setdefault(content_key, []).append(
-                        (str(resolved_path.resolve()).lower(), asset.exported_rel_path)
-                    )
+                occupied_export_paths[asset.exported_rel_path.casefold()] = dedupe_key
                 missing_count -= 1
                 copied_count += 1
                 recovered_count += 1
@@ -636,6 +900,12 @@ def materialize_snapshot_media(
                 }
             )
 
+    if media_download_manager is not None:
+        _emit_download_queue_progress(
+            progress_callback,
+            stage="done",
+            snapshot=media_download_manager.settle_export_download_progress(),
+        )
     return assets
 
 
@@ -657,6 +927,180 @@ def _asset_resolution_cache_key(candidate: _AssetCandidate) -> tuple[Any, ...]:
         _normalize_identity_string(hint.get("emoji_id")),
         _normalize_identity_string(hint.get("emoji_package_id")),
     )
+
+
+def _asset_recent_identity_keys(candidate: _AssetCandidate) -> tuple[tuple[Any, ...], ...]:
+    hint = candidate.download_hint if isinstance(candidate.download_hint, dict) else {}
+    asset_type = _normalize_identity_string(candidate.asset_type)
+    asset_scope = asset_type
+    file_name = _normalize_identity_string(candidate.file_name)
+    md5 = _normalize_identity_string(candidate.md5)
+    source_leaf = ""
+    if candidate.source_path:
+        source_leaf = _normalize_identity_string(PureWindowsPath(candidate.source_path).name)
+    file_id = _normalize_identity_string(hint.get("file_id"))
+    public_token = _normalize_identity_string(hint.get("public_file_token"))
+    public_action = _normalize_identity_string(hint.get("public_action"))
+    remote_url = _normalize_identity_string(
+        _normalized_match_url(hint.get("remote_url") or hint.get("url"))
+    )
+    preferred_names = tuple(
+        name
+        for name in (file_name, source_leaf)
+        if name
+    )
+    keys: list[tuple[Any, ...]] = []
+    if public_token and public_action:
+        keys.append(("public_token", asset_scope, public_action, public_token))
+    if file_id:
+        keys.append(("file_id", asset_scope, file_id))
+    if remote_url:
+        keys.append(("remote_url", asset_scope, remote_url))
+    if md5:
+        for preferred_name in preferred_names:
+            keys.append(("md5_named", asset_scope, preferred_name, md5))
+        if asset_type == "image":
+            keys.append(("image_md5_only", asset_scope, md5))
+    deduped_keys: list[tuple[Any, ...]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_keys.append(key)
+    return tuple(deduped_keys)
+
+
+def _lookup_recent_identity_reuse(
+    candidate: _AssetCandidate,
+    reuse_map: dict[tuple[Any, ...], tuple[str, str | None, str | None]],
+) -> tuple[str, str | None, str | None] | None:
+    for identity_key in _asset_recent_identity_keys(candidate):
+        reused = reuse_map.get(identity_key)
+        if reused is not None:
+            return reused
+    return None
+
+
+def _build_future_local_identity_resolution_map(
+    candidate_entries: list[tuple[NormalizedMessage, _AssetCandidate]],
+) -> dict[tuple[Any, ...], list[tuple[int, Path, str]]]:
+    future_identity_map: dict[tuple[Any, ...], list[tuple[int, Path, str]]] = {}
+    for index, (_message, candidate) in enumerate(candidate_entries, start=1):
+        if candidate.asset_type != "image":
+            continue
+        resolved_path = _existing_path(candidate.source_path)
+        if resolved_path is None:
+            continue
+        for identity_key in _asset_recent_identity_keys(candidate):
+            future_identity_map.setdefault(identity_key, []).append(
+                (index, resolved_path, "bundle_future_local_identity_evidence")
+            )
+    return future_identity_map
+
+
+def _ensure_export_parent(
+    parent: Path,
+    created_export_dirs: set[str],
+) -> None:
+    cache_key = str(parent).casefold()
+    if cache_key in created_export_dirs:
+        return
+    parent.mkdir(parents=True, exist_ok=True)
+    created_export_dirs.add(cache_key)
+
+
+def _copy_asset_file_fast(source_path: Path, target_path: Path) -> dict[str, Any]:
+    source_anchor = str(source_path.anchor or "").strip().casefold()
+    target_anchor = str(target_path.anchor or "").strip().casefold()
+    source_size_bytes = _safe_file_size(source_path)
+    if source_anchor and target_anchor and source_anchor != target_anchor:
+        chunk_count = _copy_asset_file_buffered(source_path, target_path)
+        return {
+            "copy_mode": "buffered_cross_volume",
+            "copy_chunk_count": chunk_count,
+            "copy_buffer_bytes": BUFFERED_COPY_CHUNK_BYTES,
+            "copy_bytes_total": source_size_bytes,
+        }
+    shutil.copyfile(source_path, target_path)
+    return {
+        "copy_mode": "copyfile_same_volume",
+        "copy_chunk_count": 1,
+        "copy_buffer_bytes": 0,
+        "copy_bytes_total": source_size_bytes,
+    }
+
+
+def _copy_asset_file_buffered(
+    source_path: Path,
+    target_path: Path,
+    *,
+    chunk_bytes: int = BUFFERED_COPY_CHUNK_BYTES,
+) -> int:
+    buffer = bytearray(max(64 * 1024, int(chunk_bytes)))
+    view = memoryview(buffer)
+    chunk_count = 0
+    with source_path.open("rb", buffering=0) as source_handle, target_path.open("wb", buffering=0) as target_handle:
+        while True:
+            bytes_read = source_handle.readinto(buffer)
+            if not bytes_read:
+                break
+            target_handle.write(view[:bytes_read])
+            chunk_count += 1
+    return chunk_count
+
+
+def _lookup_future_local_identity_resolution(
+    candidate: _AssetCandidate,
+    *,
+    current_index: int,
+    future_identity_map: dict[tuple[Any, ...], list[tuple[int, Path, str]]],
+) -> tuple[Path, str] | None:
+    if candidate.asset_type != "image":
+        return None
+    for identity_key in _asset_recent_identity_keys(candidate):
+        candidates = future_identity_map.get(identity_key)
+        if not candidates:
+            continue
+        for evidence_index, resolved_path, resolver in candidates:
+            if evidence_index > current_index:
+                return resolved_path, resolver
+    return None
+
+
+def _candidate_has_second_pass_public_retry_evidence(candidate: _AssetCandidate) -> bool:
+    if candidate.asset_type not in {"image", "video", "file", "speech"}:
+        return False
+    hint = candidate.download_hint if isinstance(candidate.download_hint, dict) else {}
+    forward_parent = hint.get("_forward_parent") if isinstance(hint.get("_forward_parent"), dict) else {}
+    has_context_hint = any(
+        _normalize_identity_string(hint.get(key))
+        for key in ("message_id_raw", "element_id", "peer_uid", "chat_type_raw")
+    ) or any(
+        _normalize_identity_string(forward_parent.get(key))
+        for key in ("message_id_raw", "element_id", "peer_uid", "chat_type_raw")
+    )
+    if not has_context_hint:
+        return False
+    has_locator_evidence = any(
+        [
+            _normalize_identity_string(candidate.file_name),
+            _normalize_identity_string(candidate.md5),
+            _normalize_identity_string(candidate.source_path),
+            _normalize_identity_string(hint.get("file_id")),
+            _normalize_identity_string(hint.get("public_file_token")),
+            _normalize_identity_string(hint.get("public_action")),
+            _normalize_identity_string(_normalized_match_url(hint.get("remote_url") or hint.get("url"))),
+        ]
+    )
+    return has_locator_evidence
+
+
+def _asset_missing_kind_allows_second_pass_public_retry(missing_kind: str | None) -> bool:
+    normalized = str(missing_kind or "").strip().lower()
+    if not normalized:
+        return True
+    return normalized in {"missing", "missing_after_napcat"}
 
 
 def _record_forensic_incident(
@@ -750,6 +1194,20 @@ def _normalize_identity_string(value: Any) -> str:
     return str(value).strip().lower()
 
 
+def _normalized_match_url(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        return parsed._replace(
+            scheme=parsed.scheme.lower(),
+            netloc=parsed.netloc.lower(),
+            fragment="",
+        ).geturl()
+    return text.lower()
+
+
 def _emit_materialization_progress(
     progress_callback: Callable[[dict[str, Any]], None] | None,
     *,
@@ -790,6 +1248,37 @@ def _emit_materialization_progress(
     progress_callback(payload)
 
 
+def _emit_download_queue_progress(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    stage: str,
+    snapshot: dict[str, Any],
+) -> None:
+    if progress_callback is None:
+        return
+    payload = {
+        "phase": "download_assets",
+        "stage": stage,
+        "candidate_total": int(snapshot.get("candidate_total") or 0),
+        "eager_remote_candidates": int(snapshot.get("eager_remote_candidates") or 0),
+        "public_token_candidates": int(snapshot.get("public_token_candidates") or 0),
+        "context_candidates": int(snapshot.get("context_candidates") or 0),
+        "queued": int(snapshot.get("queued") or 0),
+        "active": int(snapshot.get("active") or 0),
+        "completed": int(snapshot.get("completed") or 0),
+        "failed": int(snapshot.get("failed") or 0),
+        "cached": int(snapshot.get("cached") or 0),
+        "timeout_count": int(snapshot.get("timeout_count") or 0),
+        "forward_context_timeout_count": int(snapshot.get("forward_context_timeout_count") or 0),
+        "forward_context_empty_count": int(snapshot.get("forward_context_empty_count") or 0),
+        "forward_context_error_count": int(snapshot.get("forward_context_error_count") or 0),
+        "last_asset_type": snapshot.get("last_asset_type"),
+        "last_file_name": snapshot.get("last_file_name"),
+        "last_status": snapshot.get("last_status"),
+    }
+    progress_callback(payload)
+
+
 def _emit_materialization_step_trace(
     progress_callback: Callable[[dict[str, Any]], None] | None,
     *,
@@ -824,6 +1313,10 @@ def _emit_materialization_step_trace(
         "hint_url": hint.get("url"),
         "forward_parent_message_id_raw": forward_parent.get("message_id_raw"),
         "forward_parent_element_id": forward_parent.get("element_id"),
+        "timestamp_ms": candidate.timestamp_ms,
+        "timestamp_iso": _timestamp_iso_from_ms(candidate.timestamp_ms),
+        "source_path_kind": _bundle_asset_location_kind(candidate.source_path),
+        "hint_url_kind": _bundle_asset_location_kind(hint.get("remote_url") or hint.get("url")),
     }
     if status:
         payload["status"] = status
@@ -841,6 +1334,107 @@ def _emit_materialization_step_trace(
         if step_elapsed_s >= MATERIALIZE_SLOW_STEP_WARN_S:
             payload["slow_step"] = True
     progress_callback(payload)
+
+
+def _emit_materialization_substep_trace(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    *,
+    substep: str,
+    candidate: _AssetCandidate,
+    elapsed_s: float,
+    status: str = "done",
+    detail: str | None = None,
+    source_path: str | None = None,
+    target_path: str | None = None,
+    source_size_bytes: int | None = None,
+    target_size_bytes: int | None = None,
+    resolver: str | None = None,
+    copy_stats: dict[str, Any] | None = None,
+) -> None:
+    if progress_callback is None:
+        return
+    hint = candidate.download_hint or {}
+    forward_parent = hint.get("_forward_parent") if isinstance(hint.get("_forward_parent"), dict) else {}
+    source_text = str(source_path or candidate.source_path or "").strip() or None
+    target_text = str(target_path or "").strip() or None
+    source_drive = None
+    target_drive = None
+    if source_text:
+        with suppress(Exception):
+            source_drive = str(Path(source_text).anchor or "").strip() or None
+    if target_text:
+        with suppress(Exception):
+            target_drive = str(Path(target_text).anchor or "").strip() or None
+    payload: dict[str, Any] = {
+        "phase": "materialize_asset_substep",
+        "stage": "done",
+        "substep": substep,
+        "status": status,
+        "elapsed_s": round(elapsed_s, 4),
+        "elapsed_ms": int(round(elapsed_s * 1000)),
+        "asset_type": candidate.asset_type,
+        "asset_role": candidate.asset_role,
+        "file_name": candidate.file_name,
+        "message_id_raw": hint.get("message_id_raw"),
+        "element_id": hint.get("element_id"),
+        "forward_parent_message_id_raw": forward_parent.get("message_id_raw"),
+        "timestamp_ms": candidate.timestamp_ms,
+        "timestamp_iso": _timestamp_iso_from_ms(candidate.timestamp_ms),
+        "md5": candidate.md5,
+        "hint_file_id": hint.get("file_id"),
+        "hint_url": hint.get("remote_url") or hint.get("url"),
+        "source_path": source_text,
+        "source_path_kind": _bundle_asset_location_kind(source_text),
+        "target_path": target_text,
+        "target_path_kind": _bundle_asset_location_kind(target_text),
+        "source_size_bytes": source_size_bytes,
+        "target_size_bytes": target_size_bytes,
+        "source_drive": source_drive,
+        "target_drive": target_drive,
+        "same_volume": bool(source_drive and target_drive and source_drive.casefold() == target_drive.casefold()),
+    }
+    if detail:
+        payload["detail"] = detail
+    if resolver:
+        payload["resolver"] = resolver
+    if isinstance(copy_stats, dict):
+        for key, value in copy_stats.items():
+            if value is None or value == "":
+                continue
+            payload[key] = value
+    progress_callback(payload)
+
+
+def _timestamp_iso_from_ms(timestamp_ms: int) -> str | None:
+    if timestamp_ms <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).astimezone().isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _bundle_asset_location_kind(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme and parsed.netloc:
+        host = parsed.netloc.lower()
+        if host in {"127.0.0.1:3000", "localhost:3000", "127.0.0.1:6099", "localhost:6099"}:
+            return "napcat_local_download"
+        if host.endswith("multimedia.nt.qq.com.cn"):
+            return "qq_multimedia"
+        return f"{parsed.scheme.lower()}_url"
+    path = Path(text)
+    if path.exists() and path.is_file():
+        try:
+            if path.stat().st_size > 0:
+                return "local_file"
+        except OSError:
+            return "local_path"
+        return "zero_byte_local"
+    return "missing_local"
 
 
 def _iter_asset_candidates(message: NormalizedMessage) -> Iterable[_AssetCandidate]:
@@ -932,6 +1526,8 @@ def _iter_asset_candidates_from_segment(
     if segment_type == "sticker":
         static_path = _string_or_none(extra.get("static_path"))
         dynamic_path = _string_or_none(extra.get("dynamic_path"))
+        remote_url = _string_or_none(extra.get("remote_url"))
+        remote_file_name = _string_or_none(extra.get("remote_file_name"))
         if static_path:
             yield _AssetCandidate(
                 "sticker",
@@ -958,6 +1554,16 @@ def _iter_asset_candidates_from_segment(
                 None,
                 file_name,
                 path,
+                md5,
+                timestamp_ms,
+                download_hint=extra,
+            )
+        if not static_path and not dynamic_path and not path and remote_url:
+            yield _AssetCandidate(
+                "sticker",
+                None,
+                remote_file_name or file_name,
+                None,
                 md5,
                 timestamp_ms,
                 download_hint=extra,
@@ -1031,6 +1637,8 @@ def _resolve_candidate_path_napcat_only(
 def _missing_asset_note(resolver: str | None) -> str:
     if resolver == "qq_expired_after_napcat":
         return "asset appears expired in QQ/NapCat; no local file and remote URL unavailable"
+    if resolver == "qq_not_downloaded_local_placeholder":
+        return "QQ only left zero-byte local placeholders (for example OriTemp/*.tmp); the original media was not materialized locally"
     return "source file not found"
 
 
@@ -1141,6 +1749,14 @@ def _resolve_via_roots(
                 continue
             if match.exists() and match.is_file():
                 return match.resolve()
+    return None
+
+
+def _safe_file_size(path: str | Path | None) -> int | None:
+    if not path:
+        return None
+    with suppress(OSError, ValueError):
+        return int(Path(path).stat().st_size)
     return None
 
 
@@ -1890,7 +2506,7 @@ def _write_legacy_md5_cache(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "files": rows,
     }
-    cache_path.write_bytes(orjson.dumps(payload))
+    atomic_write_bytes(cache_path, orjson.dumps(payload))
 
 
 def _legacy_md5_cache_path(directory: Path, *, cache_dir: Path) -> Path:
@@ -1913,10 +2529,43 @@ def _build_export_rel_path(candidate: _AssetCandidate, resolved_path: Path) -> P
     return Path(folder) / file_name
 
 
+def _allocate_export_rel_path(
+    candidate: _AssetCandidate,
+    resolved_path: Path,
+    *,
+    dedupe_key: str,
+    occupied_export_paths: dict[str, str],
+) -> Path:
+    preferred = _build_export_rel_path(candidate, resolved_path)
+    preferred_key = preferred.as_posix().casefold()
+    existing_owner = occupied_export_paths.get(preferred_key)
+    if existing_owner in {None, dedupe_key}:
+        return preferred
+
+    stem = preferred.stem
+    suffix = preferred.suffix
+    parent = preferred.parent
+    collision_suffix = _short_hash(str(resolved_path.resolve()))
+    candidate_path = parent / f"{stem}_{collision_suffix}{suffix}"
+    candidate_key = candidate_path.as_posix().casefold()
+    if occupied_export_paths.get(candidate_key) in {None, dedupe_key}:
+        return candidate_path
+
+    for index in range(2, 1000):
+        numbered = parent / f"{stem}_{collision_suffix}_{index}{suffix}"
+        numbered_key = numbered.as_posix().casefold()
+        if occupied_export_paths.get(numbered_key) in {None, dedupe_key}:
+            return numbered
+    return candidate_path
+
+
 def _normalize_file_name(name: str, *, resolved_path: Path, asset_type: str) -> str:
     clean = "".join(char if char not in '<>:"/\\|?*' else "_" for char in name).strip() or f"{asset_type}_{_short_hash(str(resolved_path))}"
-    guessed = _guess_extension(resolved_path)
     suffix = Path(clean).suffix.lower()
+    if suffix:
+        if _has_trusted_media_suffix(asset_type=asset_type, suffix=suffix):
+            return clean
+    guessed = _guess_extension(resolved_path)
     if suffix:
         if _should_replace_suffix(asset_type=asset_type, current_suffix=suffix, guessed_suffix=guessed):
             return Path(clean).with_suffix(guessed).name
@@ -1939,9 +2588,23 @@ def _should_replace_suffix(*, asset_type: str, current_suffix: str, guessed_suff
     return True
 
 
+def _has_trusted_media_suffix(*, asset_type: str, suffix: str) -> bool:
+    normalized = suffix.lower()
+    trusted_suffixes = {
+        "image": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"},
+        "sticker": {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"},
+        "video": {".mp4", ".mov", ".avi", ".mkv", ".webm"},
+        "speech": {".amr", ".silk", ".ogg", ".wav", ".mp3", ".m4a"},
+    }.get(asset_type)
+    if not trusted_suffixes:
+        return False
+    return normalized in trusted_suffixes
+
+
 def _guess_extension(path: Path) -> str:
     try:
-        header = path.read_bytes()[:16]
+        with path.open("rb") as handle:
+            header = handle.read(16)
     except Exception:
         return path.suffix
     if header.startswith(b"\xff\xd8\xff"):
@@ -2001,182 +2664,6 @@ def _looks_like_local_path(value: str) -> bool:
 
 def _short_hash(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
-
-
-def _content_dedupe_key(
-    candidate: _AssetCandidate,
-    resolved_path: Path,
-    *,
-    cache: dict[str, tuple[str, int, str] | None],
-) -> tuple[str, int, str] | None:
-    path_key = str(resolved_path.resolve()).lower()
-    if path_key in cache:
-        return cache[path_key]
-    try:
-        size = resolved_path.stat().st_size
-    except OSError:
-        cache[path_key] = None
-        return None
-
-    digest = _content_signature(resolved_path, size=size)
-    if not digest:
-        cache[path_key] = None
-        return None
-    key = (candidate.asset_type, size, digest)
-    cache[path_key] = key
-    return key
-
-
-def _content_signature(path: Path, *, size: int) -> str | None:
-    try:
-        with path.open("rb") as handle:
-            if size <= 256 * 1024:
-                digest = hashlib.blake2b(digest_size=16)
-                digest.update(handle.read())
-                return f"full:{digest.hexdigest()}"
-
-            sample_size = 64 * 1024
-            window = min(sample_size, size)
-            positions = [0]
-            middle = max(0, (size // 2) - (window // 2))
-            tail = max(0, size - window)
-            for position in (middle, tail):
-                if position not in positions:
-                    positions.append(position)
-
-            digest = hashlib.blake2b(digest_size=16)
-            digest.update(str(size).encode("ascii"))
-            for position in positions:
-                handle.seek(position)
-                chunk = handle.read(window)
-                digest.update(str(position).encode("ascii"))
-                digest.update(chunk)
-            return f"sample:{digest.hexdigest()}"
-    except OSError:
-        return None
-
-
-def _matching_export_rel_path_for_content_key(
-    *,
-    content_key: tuple[str, int, str] | None,
-    resolved_path: Path,
-    copied_content_map: dict[tuple[str, int, str], list[tuple[str, str]]],
-    compare_cache: dict[tuple[str, str], bool],
-) -> str | None:
-    if content_key is None:
-        return None
-    entries = copied_content_map.get(content_key)
-    if not entries:
-        return None
-    resolved_key = str(resolved_path.resolve()).lower()
-    for existing_source_key, exported_rel_path in entries:
-        if existing_source_key == resolved_key:
-            return exported_rel_path
-        if _file_contents_equal(
-            Path(existing_source_key),
-            resolved_path,
-            cache=compare_cache,
-        ):
-            return exported_rel_path
-    return None
-
-
-def _file_contents_equal(
-    left: Path,
-    right: Path,
-    *,
-    cache: dict[tuple[str, str], bool],
-) -> bool:
-    left_key = str(left.resolve()).lower()
-    right_key = str(right.resolve()).lower()
-    pair = tuple(sorted((left_key, right_key)))
-    if pair in cache:
-        return cache[pair]
-    try:
-        left_stat = left.stat()
-        right_stat = right.stat()
-    except OSError:
-        cache[pair] = False
-        return False
-    if left_stat.st_size != right_stat.st_size:
-        cache[pair] = False
-        return False
-    chunk_size = 1024 * 1024
-    try:
-        with left.open("rb") as left_handle, right.open("rb") as right_handle:
-            while True:
-                left_chunk = left_handle.read(chunk_size)
-                right_chunk = right_handle.read(chunk_size)
-                if left_chunk != right_chunk:
-                    cache[pair] = False
-                    return False
-                if not left_chunk:
-                    cache[pair] = True
-                    return True
-    except OSError:
-        cache[pair] = False
-        return False
-
-
-def _payload_marker(
-    *,
-    content_key: tuple[str, int, str] | None,
-    resolved_path_key: str,
-) -> tuple[Any, ...]:
-    if content_key is not None:
-        return ("content", *content_key)
-    return ("source_path", resolved_path_key)
-
-
-def _allocate_export_rel_path(
-    rel_path: Path,
-    *,
-    payload_marker: tuple[Any, ...],
-    used_payloads: dict[str, tuple[Any, ...]],
-) -> Path:
-    rel_key = rel_path.as_posix().lower()
-    existing = used_payloads.get(rel_key)
-    if existing is None or existing == payload_marker:
-        used_payloads[rel_key] = payload_marker
-        return rel_path
-
-    stem = rel_path.stem
-    suffix = rel_path.suffix
-    parent = rel_path.parent
-    marker_token = _payload_marker_token(payload_marker)
-    candidate = parent / f"{stem}_{marker_token}{suffix}"
-    candidate_key = candidate.as_posix().lower()
-    if candidate_key not in used_payloads or used_payloads[candidate_key] == payload_marker:
-        used_payloads[candidate_key] = payload_marker
-        return candidate
-
-    counter = 2
-    while True:
-        numbered = parent / f"{stem}_{marker_token}_{counter}{suffix}"
-        numbered_key = numbered.as_posix().lower()
-        if numbered_key not in used_payloads or used_payloads[numbered_key] == payload_marker:
-            used_payloads[numbered_key] = payload_marker
-            return numbered
-        counter += 1
-
-
-def _release_allocated_export_rel_path(
-    rel_path: Path,
-    *,
-    payload_marker: tuple[Any, ...],
-    used_payloads: dict[str, tuple[Any, ...]],
-) -> None:
-    rel_key = rel_path.as_posix().lower()
-    if used_payloads.get(rel_key) == payload_marker:
-        used_payloads.pop(rel_key, None)
-
-
-def _payload_marker_token(payload_marker: tuple[Any, ...]) -> str:
-    if payload_marker and payload_marker[0] == "content" and len(payload_marker) >= 4:
-        return str(payload_marker[-1])[:8]
-    if len(payload_marker) >= 2:
-        return _short_hash(str(payload_marker[1]))
-    return _short_hash(repr(payload_marker))
 
 
 def _summarize_assets(assets: list[MaterializedAsset]) -> dict[str, int]:

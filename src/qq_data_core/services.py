@@ -9,6 +9,17 @@ from .media_bundle import write_export_bundle
 from .models import ExportBundleResult, NormalizedSnapshot, SourceChatSnapshot
 from .normalize import normalize_snapshot
 
+SUPPORTED_EXPORT_FORMATS = frozenset({"jsonl", "txt"})
+
+
+def normalize_export_format(fmt: str) -> str:
+    normalized = str(fmt or "").strip().lower()
+    if normalized not in SUPPORTED_EXPORT_FORMATS:
+        raise ValueError(
+            f"Unsupported export format {fmt!r}. Expected one of: {', '.join(sorted(SUPPORTED_EXPORT_FORMATS))}."
+        )
+    return normalized
+
 
 class ChatExportService:
     def build_snapshot(
@@ -39,8 +50,9 @@ class ChatExportService:
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
         forensics_collector: ExportForensicsCollector | None = None,
     ) -> ExportBundleResult:
+        normalized_fmt = normalize_export_format(fmt)
         writer: Callable[[NormalizedSnapshot, Path], Path]
-        if fmt == "txt":
+        if normalized_fmt == "txt":
             writer = write_txt
         else:
             writer = write_jsonl
